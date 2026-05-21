@@ -1,0 +1,59 @@
+{% extends "base.html" %}
+
+{% block title %}{{ tool.title }} - Victor PDF Tools Box{% endblock %}
+
+{% block content %}
+  <section class="tool-panel">
+    <a class="back-link" href="{{ url_for('index') }}">返回工具箱</a>
+    <h1>{{ tool.title }}</h1>
+    <p>{{ tool.description }}</p>
+
+    <form class="upload-form" method="post" enctype="multipart/form-data">
+      <label>
+        <span>{{ tool.file_label }}</span>
+        <input
+          type="file"
+          name="files"
+          {% if tool.multiple %}multiple{% endif %}
+          {% if tool.accepts_images %}accept="image/*"{% else %}accept="application/pdf,.pdf"{% endif %}
+          required
+        >
+      </label>
+
+      {% if tool.slug in ["merge", "split", "extract", "delete", "rotate", "decrypt", "compress", "extract_text", "info"] %}
+        <label>
+          <span>原 PDF 密碼（如適用）</span>
+          <input type="password" name="password" autocomplete="off">
+        </label>
+      {% endif %}
+
+      {% if tool.slug in ["extract", "delete", "rotate"] %}
+        <label>
+          <span>頁碼 / 範圍</span>
+          <input type="text" name="pages" placeholder="{% if tool.slug == 'rotate' %}留空代表全部頁面；例如 1,3,5-8{% else %}例如 1,3,5-8{% endif %}">
+        </label>
+      {% endif %}
+
+      {% if tool.slug == "rotate" %}
+        <label>
+          <span>旋轉角度</span>
+          <select name="angle">
+            <option value="90">90 度</option>
+            <option value="180">180 度</option>
+            <option value="270">270 度</option>
+          </select>
+        </label>
+      {% endif %}
+
+      {% if tool.slug == "encrypt" %}
+        <label>
+          <span>新密碼</span>
+          <input type="password" name="new_password" autocomplete="new-password" required>
+        </label>
+      {% endif %}
+
+      <button class="primary-button" type="submit">處理並下載</button>
+      <p class="hint">單次上傳上限 {{ max_upload_mb }}MB。輸出檔會存放於本機暫存資料夾，可在首頁清理。</p>
+    </form>
+  </section>
+{% endblock %}

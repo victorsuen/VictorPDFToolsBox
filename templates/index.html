@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+
+{% block content %}
+  <section class="intro">
+    <p class="eyebrow">公司內部 PDF 工具箱</p>
+    <h1>批量處理財務、審計和合併報表 PDF 文件</h1>
+    <p>
+      文件只在本機處理，不會上傳到 Adobe、CleverPDF 或其他外部網站。
+      適合處理上市公司財務資料、董事會文件、銀行確認、invoice 和 audit supporting。
+    </p>
+  </section>
+
+  <section class="tool-grid" aria-label="PDF tools">
+    {% for tool in tools %}
+      <a class="tool-card" href="{{ url_for('tool', slug=tool.slug) }}">
+        <h2>{{ tool.title }}</h2>
+        <p>{{ tool.description }}</p>
+        <span>開啟工具</span>
+      </a>
+    {% endfor %}
+  </section>
+
+  <section class="notice">
+    <h2>合規提示</h2>
+    <p>
+      本工具是自家內部工具，功能類型接近常見 PDF 軟件，但不複製任何第三方網站的程式碼、
+      商標、介面或文案。處理個人資料或未公告財務資料時，請按公司資料保密和 PDPO 流程操作。
+    </p>
+  </section>
+{% endblock %}

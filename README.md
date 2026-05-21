@@ -1,0 +1,79 @@
+# Victor PDF Tools Box
+
+公司內部本機 PDF 工具箱，目標是提供接近常見 PDF 軟件的日常功能，同時避免把上市公司財務資料、審計文件或個人資料上傳到外部服務。
+
+## 已有功能
+
+- 合併 PDF
+- 逐頁拆分 PDF
+- 抽取指定頁碼
+- 刪除指定頁碼
+- 旋轉頁面
+- PDF 加密
+- 已知密碼 PDF 解密
+- 基礎壓縮
+- 抽取 PDF 文字
+- 圖片轉 PDF
+- PDF 頁數及 metadata 資訊
+
+## 桌面 EXE 版
+
+如想用獨立視窗介面，可先直接啟動桌面版：
+
+```powershell
+start_desktop_app.bat
+```
+
+桌面版支援：
+
+- 直接把 PDF / 圖片檔拖入清單
+- 加入 PDF 後展開成每一頁
+- 切換「大圖示模式」查看每頁縮圖
+- 在大圖示模式直接拖拉縮圖重排頁面
+- 拖曳頁面調整順序
+- 用「上移 / 下移」微調頁面
+- 移除指定頁面
+- 按清單次序匯出新 PDF
+- 文字標註 / 覆蓋修改：預覽頁面、點擊位置、加文字或白底覆蓋後另存
+- 常用工具頁內拖曳/上下載入順序處理合併、抽頁、刪頁、旋轉、加密、解密、壓縮、抽文字、圖片轉 PDF
+- 第二階段工具：加頁碼 / Footer、加水印 / 印章、刪除空白頁、清理 Metadata
+
+打包成 EXE：
+
+```powershell
+build_exe.bat
+```
+
+完成後 EXE 會在：
+
+```text
+C:\tmp\victor_pdf_dist\VictorPDFToolsBox\VictorPDFToolsBox.exe
+```
+
+請保留整個 `C:\tmp\victor_pdf_dist\VictorPDFToolsBox` 資料夾一起移動，因為 `_internal`
+內含 EXE 所需的 Python/Tkinter/PDF library。這種 onedir 模式較適合公司 Windows
+安全策略；單檔 EXE 在部分電腦會被防毒或受控資料夾阻止生成。
+
+## 本地網頁版啟動
+
+```powershell
+python -m pip install -r requirements.txt
+python app.py
+```
+
+然後開啟：
+
+```text
+http://127.0.0.1:5055
+```
+
+## 合規及授權注意
+
+本工具不使用 Adobe DC、CleverPDF 或其他第三方服務的程式碼、商標、版面或文案。第一版核心功能使用 `pypdf` 和 `Pillow`，兩者授權較適合內部工具使用。若日後加入 OCR、PDF 轉 Word、電子簽名或高階壓縮，應先檢查相關第三方程式庫或商業 API 的授權條款。
+
+## 資料保護建議
+
+- 建議只在公司電腦或公司內網運行。
+- 不要把 `workspace/uploads` 或 `workspace/outputs` 同步到外部雲端。
+- 處理未公告業績、董事會文件、薪酬、人事或銀行資料後，使用首頁「清理暫存檔」。
+- 如要多人共用，建議加 Windows AD / SSO、權限分組、audit log 和自動清理排程。
