@@ -368,6 +368,8 @@ class VictorPdfToolsApp(BaseTk):
         self.thumbnail_cards: dict[int, tk.Frame] = {}
         self.thumbnail_cache: dict[tuple[str, int], Image.Image] = {}
         self.preview_mode = tk.BooleanVar(value=False)
+        self.page_stats_var = tk.StringVar(value="總頁數：0　已選取：0")
+        self.extract_pages_var = tk.StringVar()
         self.annotation_pdf_path: Path | None = None
         self.annotation_preview_photo: ImageTk.PhotoImage | None = None
         self.annotation_preview_size: tuple[int, int] = (0, 0)
@@ -428,7 +430,10 @@ class VictorPdfToolsApp(BaseTk):
             text="大圖示模式",
             variable=self.preview_mode,
             command=self.toggle_preview_mode,
-        ).pack(side=LEFT)
+        ).pack(side=LEFT, padx=(0, 12))
+        ttk.Button(controls, text="選取左轉", command=lambda: self.rotate_selected_pages(270)).pack(side=LEFT, padx=(0, 8))
+        ttk.Button(controls, text="選取右轉", command=lambda: self.rotate_selected_pages(90)).pack(side=LEFT, padx=(0, 12))
+        ttk.Label(controls, textvariable=self.page_stats_var, style="Muted.TLabel").pack(side=LEFT)
 
         self.page_area = ttk.Frame(left)
         self.page_area.pack(side=LEFT, fill=BOTH, expand=True)
@@ -466,16 +471,16 @@ class VictorPdfToolsApp(BaseTk):
         right.pack(side=RIGHT, fill=Y)
         ttk.Label(right, text="頁面排序").pack(anchor="w", pady=(0, 8))
         ttk.Button(right, text="上移", command=lambda: self.move_selected_page(-1)).pack(fill=X, pady=(0, 8))
-        ttk.Button(right, text="下移", command=lambda: self.move_selected_page(1)).pack(fill=X, pady=(0, 12))
-        ttk.Label(right, text="頁面旋轉").pack(anchor="w", pady=(0, 8))
-        ttk.Button(right, text="選取頁左轉", command=lambda: self.rotate_selected_pages(270)).pack(fill=X, pady=(0, 8))
-        ttk.Button(right, text="選取頁右轉", command=lambda: self.rotate_selected_pages(90)).pack(fill=X, pady=(0, 18))
+        ttk.Button(right, text="下移", command=lambda: self.move_selected_page(1)).pack(fill=X, pady=(0, 18))
         ttk.Button(right, text="儲存最新版 PDF", style="Primary.TButton", command=self.export_arranged_pdf).pack(fill=X, pady=(0, 10))
-        ttk.Button(right, text="擷取選取 - 合併", command=self.extract_selected_merged).pack(fill=X, pady=(0, 8))
-        ttk.Button(right, text="擷取選取 - 單獨", command=self.extract_selected_separate).pack(fill=X, pady=(0, 18))
+        ttk.Label(right, text="擷取頁碼範圍").pack(anchor="w", pady=(6, 4))
+        ttk.Entry(right, textvariable=self.extract_pages_var, width=28).pack(fill=X)
+        ttk.Label(right, text="例：1-12,15-18；留空則用選取頁", style="Muted.TLabel", wraplength=210).pack(anchor="w", pady=(2, 10))
+        ttk.Button(right, text="擷取 - 合併", command=self.extract_selected_merged).pack(fill=X, pady=(0, 8))
+        ttk.Button(right, text="擷取 - 單獨", command=self.extract_selected_separate).pack(fill=X, pady=(0, 18))
         ttk.Label(
             right,
-            text="提示：Ctrl+點擊可多選縮圖。縮圖上的左轉/右轉可直接旋轉該頁，儲存最新版 PDF 會套用排列和旋轉。",
+            text="提示：Ctrl+點擊可多選縮圖。上方顯示總頁數及已選取頁數；旋轉和擷取會套用目前排列。",
             style="Muted.TLabel",
             wraplength=210,
         ).pack(anchor="w", pady=(16, 0))
@@ -769,6 +774,7 @@ class VictorPdfToolsApp(BaseTk):
         for item in self.page_items:
             self.page_list.insert(END, page_item_label(item))
         self.sync_page_list_selection()
+        self.update_page_stats()
 
     def refresh_thumbnails(self) -> None:
         for child in self.thumbnail_frame.winfo_children():
@@ -776,6 +782,7 @@ class VictorPdfToolsApp(BaseTk):
         self.thumbnail_refs.clear()
         self.thumbnail_cards.clear()
         if not self.page_items:
+            self.update_page_stats()
             return
 
         for index, item in enumerate(self.page_items):
@@ -812,29 +819,11 @@ class VictorPdfToolsApp(BaseTk):
             )
             label.thumbnail_index = index
             label.pack(pady=(6, 0))
-            rotate_bar = tk.Frame(card, background=card["background"])
-            rotate_bar.thumbnail_index = index
-            rotate_bar.pack(fill=X, pady=(6, 0))
-            left_button = tk.Button(
-                rotate_bar,
-                text="左轉",
-                width=6,
-                command=lambda selected=index: self.rotate_page_at(selected, 270),
-            )
-            right_button = tk.Button(
-                rotate_bar,
-                text="右轉",
-                width=6,
-                command=lambda selected=index: self.rotate_page_at(selected, 90),
-            )
-            left_button.thumbnail_index = index
-            right_button.thumbnail_index = index
-            left_button.pack(side=LEFT, padx=(0, 4))
-            right_button.pack(side=LEFT)
-            for widget in (card, button, label, rotate_bar):
+            for widget in (card, button, label):
                 widget.bind("<ButtonPress-1>", lambda event, selected=index: self.start_thumbnail_drag(event, selected))
                 widget.bind("<B1-Motion>", self.track_thumbnail_drag)
                 widget.bind("<ButtonRelease-1>", self.finish_thumbnail_drag)
+        self.update_page_stats()
 
     def thumbnail_for_page(self, item: PageItem, index: int) -> Image.Image:
         cache_key = (str(item.pdf_path), item.page_index, item.rotation)
@@ -884,6 +873,10 @@ class VictorPdfToolsApp(BaseTk):
                     child.configure(background=background)
                 except tk.TclError:
                     pass
+        self.update_page_stats()
+
+    def update_page_stats(self) -> None:
+        self.page_stats_var.set(f"總頁數：{len(self.page_items)}　已選取：{len(self.get_selected_page_indexes())}")
 
     def placeholder_thumbnail(self, index: int) -> Image.Image:
         image = Image.new("RGB", (THUMB_WIDTH, THUMB_HEIGHT), "#ffffff")
@@ -905,6 +898,7 @@ class VictorPdfToolsApp(BaseTk):
             self.thumbnail_scroll.pack_forget()
             self.page_list.pack(side=LEFT, fill=BOTH, expand=True)
             self.page_scroll.pack(side=RIGHT, fill=Y)
+        self.update_page_stats()
 
     def on_page_list_select(self, _event=None) -> None:
         selected = list(self.page_list.curselection())
@@ -1029,6 +1023,9 @@ class VictorPdfToolsApp(BaseTk):
 
     def remove_selected_pages(self) -> None:
         selected = self.get_selected_page_indexes()
+        if not selected:
+            self.set_status("請先選取要移除的頁面。")
+            return
         for index in reversed(selected):
             self.page_items.pop(index)
         self.selected_page_indexes.clear()
@@ -1049,6 +1046,12 @@ class VictorPdfToolsApp(BaseTk):
             return sorted(index for index in self.selected_page_indexes if index < len(self.page_items))
         return list(self.page_list.curselection())
 
+    def get_extract_page_indexes(self) -> list[int]:
+        spec = self.extract_pages_var.get().strip()
+        if spec:
+            return parse_pages(spec, len(self.page_items))
+        return self.get_selected_page_indexes()
+
     def export_arranged_pdf(self) -> None:
         if not self.page_items:
             self.set_status("請先加入 PDF 頁面。")
@@ -1067,9 +1070,13 @@ class VictorPdfToolsApp(BaseTk):
         write_page_items_merged(self.page_items, list(range(len(self.page_items))), target, self.password_var.get())
 
     def extract_selected_merged(self) -> None:
-        indexes = self.get_selected_page_indexes()
+        try:
+            indexes = self.get_extract_page_indexes()
+        except Exception as exc:
+            self.show_error(exc)
+            return
         if not indexes:
-            self.set_status("請先選取要擷取的頁面。")
+            self.set_status("請先選取要擷取的頁面，或輸入頁碼範圍。")
             return
         target = filedialog.asksaveasfilename(
             title="擷取選取頁面並合併",
@@ -1085,9 +1092,13 @@ class VictorPdfToolsApp(BaseTk):
         )
 
     def extract_selected_separate(self) -> None:
-        indexes = self.get_selected_page_indexes()
+        try:
+            indexes = self.get_extract_page_indexes()
+        except Exception as exc:
+            self.show_error(exc)
+            return
         if not indexes:
-            self.set_status("請先選取要擷取的頁面。")
+            self.set_status("請先選取要擷取的頁面，或輸入頁碼範圍。")
             return
         folder = filedialog.askdirectory(title="選擇單獨匯出資料夾")
         if not folder:
