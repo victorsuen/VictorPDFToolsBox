@@ -22,6 +22,7 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMessageBox,
     QPushButton,
+    QScrollArea,
     QSizePolicy,
     QStatusBar,
     QTabWidget,
@@ -41,8 +42,8 @@ from pdf_core import (
 )
 
 
-THUMB_SIZE = QSize(170, 260)
-ICON_SIZE = QSize(150, 200)
+THUMB_SIZE = QSize(195, 292)
+ICON_SIZE = QSize(165, 215)
 
 
 class PageGrid(QListWidget):
@@ -54,17 +55,17 @@ class PageGrid(QListWidget):
         self.drag_start_position: QPoint | None = None
         self.drag_source_rows: list[int] = []
         self.setAcceptDrops(True)
-        self.setDragEnabled(False)
+        self.setDragEnabled(True)
         self.setDropIndicatorShown(True)
         self.setDefaultDropAction(Qt.MoveAction)
-        self.setDragDropMode(QListWidget.DropOnly)
+        self.setDragDropMode(QListWidget.DragDrop)
         self.setDragDropOverwriteMode(False)
         self.setSelectionMode(QListWidget.ExtendedSelection)
         self.setViewMode(QListWidget.IconMode)
         self.setMovement(QListWidget.Static)
         self.setResizeMode(QListWidget.Adjust)
         self.setWrapping(True)
-        self.setSpacing(14)
+        self.setSpacing(24)
         self.setIconSize(ICON_SIZE)
         self.setGridSize(THUMB_SIZE)
         self.setUniformItemSizes(True)
@@ -73,13 +74,14 @@ class PageGrid(QListWidget):
             QListWidget {
                 border: 1px solid #c8c5bd;
                 background: #f7f7f4;
-                padding: 12px;
+                padding: 18px;
             }
             QListWidget::item {
                 background: #ffffff;
                 border: 1px solid #d2d2d2;
                 border-radius: 8px;
-                padding: 8px;
+                padding: 10px;
+                margin: 4px;
             }
             QListWidget::item:selected {
                 background: #d9f0ea;
@@ -285,6 +287,27 @@ class MergeFilesDialog(QDialog):
         for index in range(self.source_list.count()):
             items.extend(self.source_list.item(index).data(Qt.UserRole))
         return items
+
+
+class PagePreviewDialog(QDialog):
+    def __init__(self, parent: "VictorPdfToolsQt", item: PageItem, title: str) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(title)
+        self.resize(980, 820)
+
+        layout = QVBoxLayout(self)
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        label = QLabel()
+        label.setAlignment(Qt.AlignCenter)
+        image = parent.render_page_preview(item)
+        label.setPixmap(QPixmap.fromImage(ImageQt(image)))
+        scroll.setWidget(label)
+        layout.addWidget(scroll, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
 
 
 class VictorPdfToolsQt(QMainWindow):
@@ -502,6 +525,7 @@ class VictorPdfToolsQt(QMainWindow):
         grid.filesDropped.connect(self.add_files_from_paths)
         grid.reorderRequested.connect(lambda rows, target, page_grid=grid: self.reorder_pages(rows, target, page_grid))
         grid.itemSelectionChanged.connect(self.update_stats)
+        grid.itemDoubleClicked.connect(lambda list_item, page_grid=grid: self.preview_page_item(page_grid, list_item))
         self.workspaces[grid] = {"items": [], "cache": {}, "pending": [], "generation": 0, "undo": []}
         self.document_tabs.addTab(grid, title)
         self.document_tabs.setCurrentWidget(grid)
@@ -675,6 +699,11 @@ class VictorPdfToolsQt(QMainWindow):
             grid.item(index).setIcon(icon)
         if workspace["pending"]:
             QTimer.singleShot(1, lambda page_grid=grid, token=generation: self.render_next_thumbnails(page_grid, token))
+
+    def preview_page_item(self, grid: PageGrid, list_item: QListWidgetItem) -> None:
+        item = list_item.data(Qt.UserRole)
+        index = grid.row(list_item)
+        PagePreviewDialog(self, item, f"Page {index + 1} - {item.pdf_path.name}").exec()
 
     def reorder_pages(self, source_rows: list[int], target_row: int, grid: PageGrid | None = None) -> None:
         grid = grid or self.current_grid()
@@ -894,19 +923,21 @@ class VictorPdfToolsQt(QMainWindow):
         return (str(item.pdf_path), item.page_index, item.rotation)
 
     def render_page_thumbnail(self, item: PageItem) -> Image.Image:
+        return self.render_page_image(item, scale=0.34, max_size=(ICON_SIZE.width() - 12, ICON_SIZE.height() - 12))
+
+    def render_page_preview(self, item: PageItem) -> Image.Image:
+        return self.render_page_image(item, scale=1.45, max_size=(900, 1200))
+
+    def render_page_image(self, item: PageItem, scale: float, max_size: tuple[int, int]) -> Image.Image:
         if PDF_RENDER_AVAILABLE and pdfium is not None:
             try:
                 document = pdfium.PdfDocument(str(item.pdf_path), password=self.password_input.text() or None)
                 page = document.get_page(item.page_index)
                 try:
-                    bitmap = page.render(scale=0.34, rotation=item.rotation)
+                    bitmap = page.render(scale=scale, rotation=item.rotation)
                     image = bitmap.to_pil().convert("RGB")
-                    image.thumbnail((ICON_SIZE.width(), ICON_SIZE.height()), Image.Resampling.LANCZOS)
-                    canvas = Image.new("RGB", (ICON_SIZE.width(), ICON_SIZE.height()), "white")
-                    x = (canvas.width - image.width) // 2
-                    y = (canvas.height - image.height) // 2
-                    canvas.paste(image, (x, y))
-                    return canvas
+                    image.thumbnail(max_size, Image.Resampling.LANCZOS)
+                    return self.page_canvas(image, max_size)
                 finally:
                     page.close()
                     document.close()
@@ -914,10 +945,22 @@ class VictorPdfToolsQt(QMainWindow):
                 pass
         return self.placeholder_thumbnail(item)
 
+    def page_canvas(self, page_image: Image.Image, max_size: tuple[int, int]) -> Image.Image:
+        width, height = max_size
+        canvas = Image.new("RGB", (width + 12, height + 12), "#f2f2f2")
+        x = (canvas.width - page_image.width) // 2
+        y = (canvas.height - page_image.height) // 2
+        shadow = Image.new("RGB", (page_image.width, page_image.height), "#d5d5d5")
+        canvas.paste(shadow, (x + 3, y + 3))
+        canvas.paste(page_image, (x, y))
+        draw = ImageDraw.Draw(canvas)
+        draw.rectangle((x, y, x + page_image.width - 1, y + page_image.height - 1), outline="#b7b7b7", width=1)
+        return canvas
+
     def placeholder_thumbnail(self, item: PageItem | None) -> Image.Image:
-        image = Image.new("RGB", (ICON_SIZE.width(), ICON_SIZE.height()), "#ffffff")
+        image = Image.new("RGB", (ICON_SIZE.width(), ICON_SIZE.height()), "#f2f2f2")
         draw = ImageDraw.Draw(image)
-        draw.rectangle((8, 8, ICON_SIZE.width() - 8, ICON_SIZE.height() - 8), outline="#d0d0d0", width=2)
+        draw.rectangle((14, 14, ICON_SIZE.width() - 14, ICON_SIZE.height() - 14), fill="#ffffff", outline="#d0d0d0", width=2)
         draw.text((22, 76), "PDF", fill="#666666")
         if item is not None:
             draw.text((22, 102), f"Page {item.page_index + 1}", fill="#666666")
