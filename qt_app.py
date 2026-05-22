@@ -46,7 +46,7 @@ ICON_SIZE = QSize(150, 200)
 
 class PageGrid(QListWidget):
     filesDropped = Signal(list)
-    orderChanged = Signal()
+    reorderRequested = Signal(list, int)
 
     def __init__(self) -> None:
         super().__init__()
@@ -54,10 +54,11 @@ class PageGrid(QListWidget):
         self.setDragEnabled(True)
         self.setDropIndicatorShown(True)
         self.setDefaultDropAction(Qt.MoveAction)
-        self.setDragDropMode(QListWidget.InternalMove)
+        self.setDragDropMode(QListWidget.DragDrop)
+        self.setDragDropOverwriteMode(False)
         self.setSelectionMode(QListWidget.ExtendedSelection)
         self.setViewMode(QListWidget.IconMode)
-        self.setMovement(QListWidget.Snap)
+        self.setMovement(QListWidget.Static)
         self.setResizeMode(QListWidget.Adjust)
         self.setWrapping(True)
         self.setSpacing(14)
@@ -103,8 +104,27 @@ class PageGrid(QListWidget):
             self.filesDropped.emit(paths)
             event.acceptProposedAction()
             return
+        if event.source() is self:
+            source_rows = sorted(self.row(item) for item in self.selectedItems())
+            if not source_rows:
+                event.ignore()
+                return
+            target_row = self.drop_target_row(event)
+            self.reorderRequested.emit(source_rows, target_row)
+            event.acceptProposedAction()
+            return
         super().dropEvent(event)
-        self.orderChanged.emit()
+
+    def drop_target_row(self, event: QDropEvent) -> int:
+        point = event.position().toPoint()
+        item = self.itemAt(point)
+        if item is None:
+            return self.count()
+        row = self.row(item)
+        rect = self.visualItemRect(item)
+        if point.y() > rect.center().y() or point.x() > rect.center().x():
+            return row + 1
+        return row
 
 
 class VictorPdfToolsQt(QMainWindow):
@@ -117,7 +137,7 @@ class VictorPdfToolsQt(QMainWindow):
 
         self.page_grid = PageGrid()
         self.page_grid.filesDropped.connect(self.add_files_from_paths)
-        self.page_grid.orderChanged.connect(self.sync_order_from_grid)
+        self.page_grid.reorderRequested.connect(self.reorder_pages)
         self.page_grid.itemSelectionChanged.connect(self.update_stats)
 
         self.stats_label = QLabel("總頁數：0　已選取：0")
@@ -304,9 +324,19 @@ class VictorPdfToolsQt(QMainWindow):
         self.page_grid.blockSignals(False)
         self.update_stats()
 
-    def sync_order_from_grid(self) -> None:
-        self.page_items = [self.page_grid.item(index).data(Qt.UserRole) for index in range(self.page_grid.count())]
-        self.update_stats()
+    def reorder_pages(self, source_rows: list[int], target_row: int) -> None:
+        source_rows = sorted(set(row for row in source_rows if 0 <= row < len(self.page_items)))
+        if not source_rows:
+            return
+        if target_row in source_rows and len(source_rows) == 1:
+            return
+        moving = [self.page_items[row] for row in source_rows]
+        remaining = [item for index, item in enumerate(self.page_items) if index not in source_rows]
+        adjusted_target = target_row - sum(1 for row in source_rows if row < target_row)
+        adjusted_target = max(0, min(adjusted_target, len(remaining)))
+        self.page_items = remaining[:adjusted_target] + moving + remaining[adjusted_target:]
+        selected = set(range(adjusted_target, adjusted_target + len(moving)))
+        self.rebuild_grid(selected)
         self.set_status("頁面順序已更新。")
 
     def selected_indexes(self) -> list[int]:

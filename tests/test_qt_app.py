@@ -47,6 +47,15 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.page_items[0].rotation, 90)
         self.assertEqual(window.stats_label.text(), "總頁數：2　已選取：1")
 
+    def test_reorder_pages_moves_selected_items_to_insert_position(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+
+        window.reorder_pages([0], 2)
+
+        self.assertEqual([item.page_index for item in window.page_items], [1, 0])
+        self.assertTrue(window.page_grid.item(1).isSelected())
+
 
 if __name__ == "__main__":
     unittest.main()
