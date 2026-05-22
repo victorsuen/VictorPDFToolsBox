@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import re
 import threading
+from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 from tkinter import END, BOTH, LEFT, RIGHT, X, Y, filedialog, messagebox
@@ -54,6 +55,7 @@ class PageItem:
     pdf_path: Path
     page_index: int
     label: str
+    rotation: int = 0
 
 
 def parse_pages(spec: str, page_count: int) -> list[int]:
@@ -102,6 +104,19 @@ def open_reader(path: Path, password: str = "") -> PdfReader:
 def write_pdf(writer: PdfWriter, path: Path) -> None:
     with path.open("wb") as stream:
         writer.write(stream)
+
+
+def page_item_label(item: PageItem) -> str:
+    if item.rotation:
+        return f"{item.label} (旋轉 {item.rotation}度)"
+    return item.label
+
+
+def page_object_for_item(reader: PdfReader, item: PageItem):
+    page = copy(reader.pages[item.page_index])
+    if item.rotation:
+        page.rotate(item.rotation)
+    return page
 
 
 def add_annotation_to_page(writer: PdfWriter, page, annotation: DictionaryObject) -> None:
@@ -295,7 +310,7 @@ def write_page_items_merged(page_items: list[PageItem], indexes: list[int], targ
         if reader is None:
             reader = open_reader(item.pdf_path, password)
             reader_cache[item.pdf_path] = reader
-        writer.add_page(reader.pages[item.page_index])
+        writer.add_page(page_object_for_item(reader, item))
     write_pdf(writer, target)
 
 
@@ -311,7 +326,7 @@ def write_page_items_separately(page_items: list[PageItem], indexes: list[int], 
             reader = open_reader(item.pdf_path, password)
             reader_cache[item.pdf_path] = reader
         writer = PdfWriter()
-        writer.add_page(reader.pages[item.page_index])
+        writer.add_page(page_object_for_item(reader, item))
         filename = safe_output_name(f"{output_index:03d}-{item.pdf_path.stem}-page-{item.page_index + 1}.pdf")
         write_pdf(writer, folder / filename)
     return len(indexes)
@@ -451,13 +466,16 @@ class VictorPdfToolsApp(BaseTk):
         right.pack(side=RIGHT, fill=Y)
         ttk.Label(right, text="頁面排序").pack(anchor="w", pady=(0, 8))
         ttk.Button(right, text="上移", command=lambda: self.move_selected_page(-1)).pack(fill=X, pady=(0, 8))
-        ttk.Button(right, text="下移", command=lambda: self.move_selected_page(1)).pack(fill=X, pady=(0, 18))
-        ttk.Button(right, text="匯出組合 PDF", style="Primary.TButton", command=self.export_arranged_pdf).pack(fill=X, pady=(0, 10))
+        ttk.Button(right, text="下移", command=lambda: self.move_selected_page(1)).pack(fill=X, pady=(0, 12))
+        ttk.Label(right, text="頁面旋轉").pack(anchor="w", pady=(0, 8))
+        ttk.Button(right, text="選取頁左轉", command=lambda: self.rotate_selected_pages(270)).pack(fill=X, pady=(0, 8))
+        ttk.Button(right, text="選取頁右轉", command=lambda: self.rotate_selected_pages(90)).pack(fill=X, pady=(0, 18))
+        ttk.Button(right, text="儲存最新版 PDF", style="Primary.TButton", command=self.export_arranged_pdf).pack(fill=X, pady=(0, 10))
         ttk.Button(right, text="擷取選取 - 合併", command=self.extract_selected_merged).pack(fill=X, pady=(0, 8))
         ttk.Button(right, text="擷取選取 - 單獨", command=self.extract_selected_separate).pack(fill=X, pady=(0, 18))
         ttk.Label(
             right,
-            text="提示：Ctrl+點擊可多選縮圖。可把縮圖拖到另一頁上重排，也可擷取選取頁面。",
+            text="提示：Ctrl+點擊可多選縮圖。縮圖上的左轉/右轉可直接旋轉該頁，儲存最新版 PDF 會套用排列和旋轉。",
             style="Muted.TLabel",
             wraplength=210,
         ).pack(anchor="w", pady=(16, 0))
@@ -749,7 +767,7 @@ class VictorPdfToolsApp(BaseTk):
     def refresh_page_list(self) -> None:
         self.page_list.delete(0, END)
         for item in self.page_items:
-            self.page_list.insert(END, item.label)
+            self.page_list.insert(END, page_item_label(item))
         self.sync_page_list_selection()
 
     def refresh_thumbnails(self) -> None:
@@ -786,7 +804,7 @@ class VictorPdfToolsApp(BaseTk):
             button.pack()
             label = tk.Label(
                 card,
-                text=item.label,
+                text=page_item_label(item),
                 width=22,
                 wraplength=THUMB_WIDTH,
                 justify="center",
@@ -794,13 +812,32 @@ class VictorPdfToolsApp(BaseTk):
             )
             label.thumbnail_index = index
             label.pack(pady=(6, 0))
-            for widget in (card, button, label):
+            rotate_bar = tk.Frame(card, background=card["background"])
+            rotate_bar.thumbnail_index = index
+            rotate_bar.pack(fill=X, pady=(6, 0))
+            left_button = tk.Button(
+                rotate_bar,
+                text="左轉",
+                width=6,
+                command=lambda selected=index: self.rotate_page_at(selected, 270),
+            )
+            right_button = tk.Button(
+                rotate_bar,
+                text="右轉",
+                width=6,
+                command=lambda selected=index: self.rotate_page_at(selected, 90),
+            )
+            left_button.thumbnail_index = index
+            right_button.thumbnail_index = index
+            left_button.pack(side=LEFT, padx=(0, 4))
+            right_button.pack(side=LEFT)
+            for widget in (card, button, label, rotate_bar):
                 widget.bind("<ButtonPress-1>", lambda event, selected=index: self.start_thumbnail_drag(event, selected))
                 widget.bind("<B1-Motion>", self.track_thumbnail_drag)
                 widget.bind("<ButtonRelease-1>", self.finish_thumbnail_drag)
 
     def thumbnail_for_page(self, item: PageItem, index: int) -> Image.Image:
-        cache_key = (str(item.pdf_path), item.page_index)
+        cache_key = (str(item.pdf_path), item.page_index, item.rotation)
         cached = self.thumbnail_cache.get(cache_key)
         if cached is not None:
             return cached
@@ -817,6 +854,8 @@ class VictorPdfToolsApp(BaseTk):
                 x = (THUMB_WIDTH - image.width) // 2
                 y = (THUMB_HEIGHT - image.height) // 2
                 canvas.paste(image, (x, y))
+                if item.rotation:
+                    canvas = canvas.rotate(item.rotation, expand=False, fillcolor="white")
                 self.thumbnail_cache[cache_key] = canvas
                 return canvas
             except Exception:
@@ -954,6 +993,39 @@ class VictorPdfToolsApp(BaseTk):
             return
         self.reorder_page_item(source, target)
         self.page_list.selection_set(target)
+
+    def rotate_page_at(self, index: int, angle: int) -> None:
+        if index < 0 or index >= len(self.page_items):
+            return
+        item = self.page_items[index]
+        self.page_items[index] = PageItem(
+            pdf_path=item.pdf_path,
+            page_index=item.page_index,
+            label=item.label,
+            rotation=(item.rotation + angle) % 360,
+        )
+        self.selected_page_indexes = {index}
+        self.selected_page_index = index
+        self.refresh_page_list()
+        self.refresh_thumbnails()
+        self.set_status(f"已旋轉第 {index + 1} 頁。按「儲存最新版 PDF」輸出新檔。")
+
+    def rotate_selected_pages(self, angle: int) -> None:
+        indexes = self.get_selected_page_indexes()
+        if not indexes:
+            self.set_status("請先選取要旋轉的頁面。")
+            return
+        for index in indexes:
+            item = self.page_items[index]
+            self.page_items[index] = PageItem(
+                pdf_path=item.pdf_path,
+                page_index=item.page_index,
+                label=item.label,
+                rotation=(item.rotation + angle) % 360,
+            )
+        self.refresh_page_list()
+        self.refresh_thumbnails()
+        self.set_status(f"已旋轉 {len(indexes)} 頁。按「儲存最新版 PDF」輸出新檔。")
 
     def remove_selected_pages(self) -> None:
         selected = self.get_selected_page_indexes()

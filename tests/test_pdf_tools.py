@@ -129,6 +129,19 @@ class PdfToolsTests(unittest.TestCase):
 
         self.assertEqual(len(PdfReader(str(target)).pages), 2)
 
+    def test_write_page_items_merged_applies_rotation(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        page_items = [PageItem(source, 0, "Page 1", rotation=90)]
+        write_page_items_merged(page_items, [0], target)
+
+        self.assertEqual(PdfReader(str(target)).pages[0].get("/Rotate"), 90)
+
     def test_write_page_items_separately(self):
         source = Path(self.temp_dir.name) / "source.pdf"
         folder = Path(self.temp_dir.name) / "out"
