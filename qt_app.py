@@ -125,11 +125,45 @@ class PageGrid(QListWidget):
         return row
 
 
+class PdfDropTabWidget(QTabWidget):
+    filesDropped = Signal(list)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self.has_pdf_urls(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if self.has_pdf_urls(event):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if self.has_pdf_urls(event):
+            paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
+            self.filesDropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
+    def has_pdf_urls(self, event) -> bool:
+        if not event.mimeData().hasUrls():
+            return False
+        return any(Path(url.toLocalFile()).suffix.lower() == ".pdf" for url in event.mimeData().urls())
+
+
 class VictorPdfToolsQt(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Victor PDF Tools Box")
         self.resize(1280, 820)
+        self.setAcceptDrops(True)
 
         self.workspaces: dict[PageGrid, dict] = {}
         self.page_grid: PageGrid | None = None
@@ -149,6 +183,33 @@ class VictorPdfToolsQt(QMainWindow):
         self.setStatusBar(QStatusBar())
         self.create_document_tab("未命名")
         self.set_status("把 PDF 直接拖入縮圖區；每個 PDF 會像 DC 一樣開成獨立文件 Tab。")
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self.has_pdf_urls(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if self.has_pdf_urls(event):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if self.has_pdf_urls(event):
+            self.add_files_from_paths(self.paths_from_drop_event(event))
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
+    def has_pdf_urls(self, event) -> bool:
+        if not event.mimeData().hasUrls():
+            return False
+        return any(Path(url.toLocalFile()).suffix.lower() == ".pdf" for url in event.mimeData().urls())
+
+    def paths_from_drop_event(self, event: QDropEvent) -> list[str]:
+        return [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
 
     def build_ui(self) -> None:
         self.setStyleSheet(
@@ -221,7 +282,8 @@ class VictorPdfToolsQt(QMainWindow):
         controls.addWidget(self.stats_label)
         left_layout.addLayout(controls)
 
-        self.document_tabs = QTabWidget()
+        self.document_tabs = PdfDropTabWidget()
+        self.document_tabs.filesDropped.connect(self.add_files_from_paths)
         self.document_tabs.setTabsClosable(True)
         self.document_tabs.currentChanged.connect(self.on_document_tab_changed)
         self.document_tabs.tabCloseRequested.connect(self.close_document_tab)
