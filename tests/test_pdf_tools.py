@@ -4,7 +4,16 @@ import unittest
 from pypdf import PdfReader, PdfWriter
 
 from app import copy_pages, parse_pages
-from desktop_app import add_page_numbers, add_text_overlay_annotation, add_watermark, clean_metadata, remove_blank_pages
+from desktop_app import (
+    PageItem,
+    add_page_numbers,
+    add_text_overlay_annotation,
+    add_watermark,
+    clean_metadata,
+    remove_blank_pages,
+    write_page_items_merged,
+    write_page_items_separately,
+)
 
 
 class PdfToolsTests(unittest.TestCase):
@@ -105,6 +114,35 @@ class PdfToolsTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             remove_blank_pages(source, target)
+
+    def test_write_page_items_merged(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        page_items = [PageItem(source, index, f"Page {index + 1}") for index in range(3)]
+        write_page_items_merged(page_items, [0, 2], target)
+
+        self.assertEqual(len(PdfReader(str(target)).pages), 2)
+
+    def test_write_page_items_separately(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        folder = Path(self.temp_dir.name) / "out"
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        page_items = [PageItem(source, index, f"Page {index + 1}") for index in range(3)]
+        count = write_page_items_separately(page_items, [0, 2], folder)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(len(list(folder.glob("*.pdf"))), 2)
 
     def setUp(self):
         import tempfile

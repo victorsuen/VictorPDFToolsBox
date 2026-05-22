@@ -284,6 +284,39 @@ def clean_metadata(source: Path, target: Path, password: str = "") -> None:
     write_pdf(writer, target)
 
 
+def write_page_items_merged(page_items: list[PageItem], indexes: list[int], target: Path, password: str = "") -> None:
+    if not indexes:
+        raise ValueError("請先選取要擷取的頁面。")
+    writer = PdfWriter()
+    reader_cache: dict[Path, PdfReader] = {}
+    for index in indexes:
+        item = page_items[index]
+        reader = reader_cache.get(item.pdf_path)
+        if reader is None:
+            reader = open_reader(item.pdf_path, password)
+            reader_cache[item.pdf_path] = reader
+        writer.add_page(reader.pages[item.page_index])
+    write_pdf(writer, target)
+
+
+def write_page_items_separately(page_items: list[PageItem], indexes: list[int], folder: Path, password: str = "") -> int:
+    if not indexes:
+        raise ValueError("請先選取要擷取的頁面。")
+    folder.mkdir(parents=True, exist_ok=True)
+    reader_cache: dict[Path, PdfReader] = {}
+    for output_index, page_index in enumerate(indexes, start=1):
+        item = page_items[page_index]
+        reader = reader_cache.get(item.pdf_path)
+        if reader is None:
+            reader = open_reader(item.pdf_path, password)
+            reader_cache[item.pdf_path] = reader
+        writer = PdfWriter()
+        writer.add_page(reader.pages[item.page_index])
+        filename = safe_output_name(f"{output_index:03d}-{item.pdf_path.stem}-page-{item.page_index + 1}.pdf")
+        write_pdf(writer, folder / filename)
+    return len(indexes)
+
+
 class DragListbox(tk.Listbox):
     def __init__(self, master, on_reorder, **kwargs):
         super().__init__(master, **kwargs)
@@ -314,8 +347,11 @@ class VictorPdfToolsApp(BaseTk):
         self.page_items: list[PageItem] = []
         self.file_items: list[Path] = []
         self.selected_page_index: int | None = None
+        self.selected_page_indexes: set[int] = set()
         self.thumbnail_drag_index: int | None = None
         self.thumbnail_refs: list[ImageTk.PhotoImage] = []
+        self.thumbnail_cards: dict[int, tk.Frame] = {}
+        self.thumbnail_cache: dict[tuple[str, int], Image.Image] = {}
         self.preview_mode = tk.BooleanVar(value=False)
         self.annotation_pdf_path: Path | None = None
         self.annotation_preview_photo: ImageTk.PhotoImage | None = None
@@ -416,10 +452,12 @@ class VictorPdfToolsApp(BaseTk):
         ttk.Label(right, text="頁面排序").pack(anchor="w", pady=(0, 8))
         ttk.Button(right, text="上移", command=lambda: self.move_selected_page(-1)).pack(fill=X, pady=(0, 8))
         ttk.Button(right, text="下移", command=lambda: self.move_selected_page(1)).pack(fill=X, pady=(0, 18))
-        ttk.Button(right, text="匯出組合 PDF", style="Primary.TButton", command=self.export_arranged_pdf).pack(fill=X)
+        ttk.Button(right, text="匯出組合 PDF", style="Primary.TButton", command=self.export_arranged_pdf).pack(fill=X, pady=(0, 10))
+        ttk.Button(right, text="擷取選取 - 合併", command=self.extract_selected_merged).pack(fill=X, pady=(0, 8))
+        ttk.Button(right, text="擷取選取 - 單獨", command=self.extract_selected_separate).pack(fill=X, pady=(0, 18))
         ttk.Label(
             right,
-            text="提示：把 PDF 直接拖到左邊清單或大圖示區即可展開頁面。大圖示模式可看到每頁大概樣貌。",
+            text="提示：Ctrl+點擊可多選縮圖。可把縮圖拖到另一頁上重排，也可擷取選取頁面。",
             style="Muted.TLabel",
             wraplength=210,
         ).pack(anchor="w", pady=(16, 0))
@@ -712,14 +750,13 @@ class VictorPdfToolsApp(BaseTk):
         self.page_list.delete(0, END)
         for item in self.page_items:
             self.page_list.insert(END, item.label)
-        if self.selected_page_index is not None and self.selected_page_index < len(self.page_items):
-            self.page_list.selection_set(self.selected_page_index)
-            self.page_list.see(self.selected_page_index)
+        self.sync_page_list_selection()
 
     def refresh_thumbnails(self) -> None:
         for child in self.thumbnail_frame.winfo_children():
             child.destroy()
         self.thumbnail_refs.clear()
+        self.thumbnail_cards.clear()
         if not self.page_items:
             return
 
@@ -730,7 +767,7 @@ class VictorPdfToolsApp(BaseTk):
 
             card = tk.Frame(
                 self.thumbnail_frame,
-                background="#d9eee9" if index == self.selected_page_index else "#ffffff",
+                background=self.thumbnail_background(index),
                 borderwidth=1,
                 relief="solid",
                 padx=8,
@@ -739,11 +776,11 @@ class VictorPdfToolsApp(BaseTk):
             row, col = divmod(index, THUMB_COLUMNS)
             card.thumbnail_index = index
             card.grid(row=row, column=col, padx=8, pady=8, sticky="n")
+            self.thumbnail_cards[index] = card
             button = tk.Button(
                 card,
                 image=photo,
                 relief="flat",
-                command=lambda selected=index: self.select_page(selected),
             )
             button.thumbnail_index = index
             button.pack()
@@ -763,6 +800,10 @@ class VictorPdfToolsApp(BaseTk):
                 widget.bind("<ButtonRelease-1>", self.finish_thumbnail_drag)
 
     def thumbnail_for_page(self, item: PageItem, index: int) -> Image.Image:
+        cache_key = (str(item.pdf_path), item.page_index)
+        cached = self.thumbnail_cache.get(cache_key)
+        if cached is not None:
+            return cached
         if PDF_RENDER_AVAILABLE and pdfium is not None:
             try:
                 document = pdfium.PdfDocument(str(item.pdf_path), password=self.password_var.get() or None)
@@ -776,10 +817,34 @@ class VictorPdfToolsApp(BaseTk):
                 x = (THUMB_WIDTH - image.width) // 2
                 y = (THUMB_HEIGHT - image.height) // 2
                 canvas.paste(image, (x, y))
+                self.thumbnail_cache[cache_key] = canvas
                 return canvas
             except Exception:
                 pass
-        return self.placeholder_thumbnail(index)
+        placeholder = self.placeholder_thumbnail(index)
+        self.thumbnail_cache[cache_key] = placeholder
+        return placeholder
+
+    def thumbnail_background(self, index: int) -> str:
+        return "#d9eee9" if index in self.selected_page_indexes else "#ffffff"
+
+    def sync_page_list_selection(self) -> None:
+        self.page_list.selection_clear(0, END)
+        for index in sorted(self.selected_page_indexes):
+            if index < len(self.page_items):
+                self.page_list.selection_set(index)
+        if self.selected_page_index is not None and self.selected_page_index < len(self.page_items):
+            self.page_list.see(self.selected_page_index)
+
+    def update_thumbnail_selection_display(self) -> None:
+        for index, card in self.thumbnail_cards.items():
+            background = self.thumbnail_background(index)
+            card.configure(background=background)
+            for child in card.winfo_children():
+                try:
+                    child.configure(background=background)
+                except tk.TclError:
+                    pass
 
     def placeholder_thumbnail(self, index: int) -> Image.Image:
         image = Image.new("RGB", (THUMB_WIDTH, THUMB_HEIGHT), "#ffffff")
@@ -804,18 +869,26 @@ class VictorPdfToolsApp(BaseTk):
 
     def on_page_list_select(self, _event=None) -> None:
         selected = list(self.page_list.curselection())
-        self.selected_page_index = selected[0] if len(selected) == 1 else None
+        self.selected_page_indexes = set(selected)
+        self.selected_page_index = selected[-1] if selected else None
+        self.update_thumbnail_selection_display()
 
-    def select_page(self, index: int) -> None:
+    def select_page(self, index: int, additive: bool = False) -> None:
+        if additive:
+            if index in self.selected_page_indexes:
+                self.selected_page_indexes.remove(index)
+            else:
+                self.selected_page_indexes.add(index)
+        else:
+            self.selected_page_indexes = {index}
         self.selected_page_index = index
-        self.page_list.selection_clear(0, END)
-        self.page_list.selection_set(index)
-        self.page_list.see(index)
-        self.refresh_thumbnails()
+        self.sync_page_list_selection()
+        self.update_thumbnail_selection_display()
 
-    def start_thumbnail_drag(self, _event, index: int) -> None:
+    def start_thumbnail_drag(self, event, index: int) -> None:
         self.thumbnail_drag_index = index
-        self.select_page(index)
+        additive = bool(event.state & 0x0004)
+        self.select_page(index, additive=additive)
         self.set_status(f"正在拖曳 Page {index + 1}；放到另一頁上即可重新排序。")
 
     def track_thumbnail_drag(self, event) -> None:
@@ -836,7 +909,7 @@ class VictorPdfToolsApp(BaseTk):
             self.reorder_page_item(source, target)
             self.set_status(f"已把頁面移到第 {target + 1} 位。")
         else:
-            self.select_page(source)
+            self.set_status(f"已選取 {len(self.selected_page_indexes)} 頁。")
 
     def thumbnail_index_at(self, x_root: int, y_root: int) -> int | None:
         widget = self.winfo_containing(x_root, y_root)
@@ -850,17 +923,28 @@ class VictorPdfToolsApp(BaseTk):
         return None
 
     def reorder_page_item(self, source: int, target: int) -> None:
+        selected_before = set(self.selected_page_indexes)
         item = self.page_items.pop(source)
         self.page_items.insert(target, item)
-        self.selected_page_index = target
+        remapped: set[int] = set()
+        for index in selected_before:
+            if index == source:
+                remapped.add(target)
+            elif source < target and source < index <= target:
+                remapped.add(index - 1)
+            elif target < source and target <= index < source:
+                remapped.add(index + 1)
+            else:
+                remapped.add(index)
+        self.selected_page_indexes = remapped
+        self.selected_page_index = target if source in selected_before or not remapped else sorted(remapped)[-1]
         self.refresh_page_list()
         self.refresh_thumbnails()
 
     def move_selected_page(self, direction: int) -> None:
         selected = self.selected_page_index
-        if selected is None:
-            list_selection = list(self.page_list.curselection())
-            selected = list_selection[0] if len(list_selection) == 1 else None
+        if selected is None and self.selected_page_indexes:
+            selected = sorted(self.selected_page_indexes)[-1]
         if selected is None:
             self.set_status("請選取一頁來上移或下移。")
             return
@@ -872,20 +956,26 @@ class VictorPdfToolsApp(BaseTk):
         self.page_list.selection_set(target)
 
     def remove_selected_pages(self) -> None:
-        selected = list(self.page_list.curselection())
-        if self.preview_mode.get() and self.selected_page_index is not None:
-            selected = [self.selected_page_index]
+        selected = self.get_selected_page_indexes()
         for index in reversed(selected):
             self.page_items.pop(index)
+        self.selected_page_indexes.clear()
         self.selected_page_index = None
         self.refresh_page_list()
         self.refresh_thumbnails()
 
     def clear_pages(self) -> None:
         self.page_items.clear()
+        self.selected_page_indexes.clear()
         self.selected_page_index = None
+        self.thumbnail_cache.clear()
         self.refresh_page_list()
         self.refresh_thumbnails()
+
+    def get_selected_page_indexes(self) -> list[int]:
+        if self.selected_page_indexes:
+            return sorted(index for index in self.selected_page_indexes if index < len(self.page_items))
+        return list(self.page_list.curselection())
 
     def export_arranged_pdf(self) -> None:
         if not self.page_items:
@@ -902,15 +992,38 @@ class VictorPdfToolsApp(BaseTk):
         self.run_in_thread(lambda: self._export_arranged_pdf(Path(target)), "正在匯出組合 PDF...")
 
     def _export_arranged_pdf(self, target: Path) -> None:
-        writer = PdfWriter()
-        reader_cache: dict[Path, PdfReader] = {}
-        for item in self.page_items:
-            reader = reader_cache.get(item.pdf_path)
-            if reader is None:
-                reader = open_reader(item.pdf_path, self.password_var.get())
-                reader_cache[item.pdf_path] = reader
-            writer.add_page(reader.pages[item.page_index])
-        write_pdf(writer, target)
+        write_page_items_merged(self.page_items, list(range(len(self.page_items))), target, self.password_var.get())
+
+    def extract_selected_merged(self) -> None:
+        indexes = self.get_selected_page_indexes()
+        if not indexes:
+            self.set_status("請先選取要擷取的頁面。")
+            return
+        target = filedialog.asksaveasfilename(
+            title="擷取選取頁面並合併",
+            defaultextension=".pdf",
+            initialfile="extracted-selected-pages.pdf",
+            filetypes=PDF_TYPES,
+        )
+        if not target:
+            return
+        self.run_in_thread(
+            lambda: write_page_items_merged(self.page_items, indexes, Path(target), self.password_var.get()),
+            f"正在擷取 {len(indexes)} 頁並合併...",
+        )
+
+    def extract_selected_separate(self) -> None:
+        indexes = self.get_selected_page_indexes()
+        if not indexes:
+            self.set_status("請先選取要擷取的頁面。")
+            return
+        folder = filedialog.askdirectory(title="選擇單獨匯出資料夾")
+        if not folder:
+            return
+        self.run_in_thread(
+            lambda: write_page_items_separately(self.page_items, indexes, Path(folder), self.password_var.get()),
+            f"正在擷取 {len(indexes)} 頁為獨立 PDF...",
+        )
 
     def add_pdf_files(self) -> None:
         self.add_files(PDF_TYPES)
