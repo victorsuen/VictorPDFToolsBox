@@ -86,12 +86,20 @@ class PageGrid(QListWidget):
         )
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.source() is self:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:
+        if event.source() is self:
+            event.setDropAction(Qt.MoveAction)
+            event.accept()
+            return
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
             return
@@ -312,6 +320,7 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(hint)
         self.add_button(side_layout, "擷取選取 - 合併", self.extract_pages_merged)
         self.add_button(side_layout, "擷取選取 - 單獨", self.extract_pages_separate)
+        self.add_button(side_layout, "合併全部 Tab", self.merge_all_tabs)
 
         side_layout.addSpacing(12)
         side_layout.addWidget(QLabel("加密 PDF 密碼"))
@@ -412,19 +421,27 @@ class VictorPdfToolsQt(QMainWindow):
             added_files += 1
 
             grid = self.target_grid_for_new_file(path.name)
-            workspace = self.workspaces[grid]
-            workspace["items"].clear()
-            workspace["cache"].clear()
-            for page_index in range(len(reader.pages)):
-                workspace["items"].append(PageItem(path, page_index, f"{path.name} - Page {page_index + 1}"))
-                added_pages += 1
-            self.rebuild_grid(grid=grid)
-            self.document_tabs.setTabText(self.document_tabs.indexOf(grid), path.name)
+            added_pages += self.populate_grid_from_reader(path, reader, grid)
 
         if added_pages:
             self.set_status(f"已加入 {added_files} 個 PDF，共 {added_pages} 頁。")
         elif skipped:
             self.set_status("沒有加入頁面，請確認檔案是 PDF 或密碼正確。")
+
+    def populate_grid_from_reader(self, path: Path, reader, grid: PageGrid) -> int:
+        workspace = self.workspaces[grid]
+        workspace["items"].clear()
+        workspace["cache"].clear()
+        for page_index in range(len(reader.pages)):
+            workspace["items"].append(PageItem(path, page_index, f"{path.name} - Page {page_index + 1}"))
+        self.rebuild_grid(grid=grid)
+        self.document_tabs.setTabText(self.document_tabs.indexOf(grid), path.name)
+        return len(reader.pages)
+
+    def open_pdf_as_new_tab(self, path: Path) -> None:
+        reader = open_reader(path, self.password_input.text())
+        grid = self.create_document_tab(path.name)
+        self.populate_grid_from_reader(path, reader, grid)
 
     def target_grid_for_new_file(self, title: str) -> PageGrid:
         grid = self.current_grid()
@@ -589,7 +606,31 @@ class VictorPdfToolsQt(QMainWindow):
         self.run_pdf_job(
             lambda: write_page_items_merged(self.page_items, indexes, Path(target), self.password_input.text()),
             f"已擷取並合併 {len(indexes)} 頁。",
+            on_success=lambda target_path=Path(target): self.open_pdf_as_new_tab(target_path),
         )
+
+    def merge_all_tabs(self) -> None:
+        all_items = self.all_tab_page_items()
+        if not all_items:
+            self.set_status("請先加入 PDF 頁面。")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "合併全部 Tab", "merged-all-tabs.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        self.run_pdf_job(
+            lambda: write_page_items_merged(all_items, list(range(len(all_items))), target_path, self.password_input.text()),
+            f"已合併全部 Tab，共 {len(all_items)} 頁。",
+            on_success=lambda: self.open_pdf_as_new_tab(target_path),
+        )
+
+    def all_tab_page_items(self) -> list[PageItem]:
+        items: list[PageItem] = []
+        for index in range(self.document_tabs.count()):
+            grid = self.document_tabs.widget(index)
+            if isinstance(grid, PageGrid):
+                items.extend(self.workspaces.get(grid, {}).get("items", []))
+        return items
 
     def extract_pages_separate(self) -> None:
         try:
@@ -608,13 +649,15 @@ class VictorPdfToolsQt(QMainWindow):
             f"已單獨匯出 {len(indexes)} 頁。",
         )
 
-    def run_pdf_job(self, job, success_message: str) -> None:
+    def run_pdf_job(self, job, success_message: str, on_success=None) -> None:
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             job()
         except Exception as exc:
             self.show_error(exc)
         else:
+            if on_success is not None:
+                on_success()
             self.set_status(success_message)
         finally:
             QApplication.restoreOverrideCursor()

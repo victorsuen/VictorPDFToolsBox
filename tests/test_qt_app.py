@@ -77,6 +77,26 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(len(window.page_items), 2)
         self.assertEqual(window.stats_label.text(), "總頁數：2　已選取：0")
 
+    def test_all_tab_page_items_merges_tabs_in_tab_order(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.add_files_from_paths([str(self.second_source)])
+
+        items = window.all_tab_page_items()
+
+        self.assertEqual([item.pdf_path.name for item in items], ["source.pdf", "source.pdf", "second.pdf"])
+        self.assertEqual([item.page_index for item in items], [0, 1, 0])
+
+    def test_open_pdf_as_new_tab_adds_output_document(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+
+        window.open_pdf_as_new_tab(self.second_source)
+
+        self.assertEqual(window.document_tabs.count(), 2)
+        self.assertEqual(window.document_tabs.tabText(1), "second.pdf")
+        self.assertEqual(len(window.page_items), 1)
+
 
 if __name__ == "__main__":
     unittest.main()
