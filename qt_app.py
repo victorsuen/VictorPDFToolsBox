@@ -5,8 +5,8 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QPixmap
+from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QDialog,
@@ -49,11 +49,10 @@ ICON_SIZE = QSize(165, 215)
 class PageGrid(QListWidget):
     filesDropped = Signal(list)
     reorderRequested = Signal(list, int)
+    PAGE_DRAG_MIME = "application/x-victor-pdf-pages"
 
     def __init__(self) -> None:
         super().__init__()
-        self.drag_start_position: QPoint | None = None
-        self.drag_source_rows: list[int] = []
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
         self.setDropIndicatorShown(True)
@@ -91,31 +90,36 @@ class PageGrid(QListWidget):
             """
         )
 
-    def mousePressEvent(self, event) -> None:
-        super().mousePressEvent(event)
-        if event.button() == Qt.LeftButton:
-            self.drag_start_position = event.position().toPoint()
-            self.drag_source_rows = sorted(self.row(item) for item in self.selectedItems())
-
-    def mouseReleaseEvent(self, event) -> None:
-        if (
-            event.button() == Qt.LeftButton
-            and self.drag_start_position is not None
-            and self.drag_source_rows
-            and (event.position().toPoint() - self.drag_start_position).manhattanLength()
-            >= QApplication.startDragDistance()
-        ):
-            self.reorderRequested.emit(self.drag_source_rows, self.row_from_point(event.position().toPoint()))
-            self.drag_start_position = None
-            self.drag_source_rows = []
-            event.accept()
+    def startDrag(self, supported_actions) -> None:
+        source_rows = sorted(self.row(item) for item in self.selectedItems())
+        if not source_rows:
             return
-        self.drag_start_position = None
-        self.drag_source_rows = []
-        super().mouseReleaseEvent(event)
+        drag = QDrag(self)
+        mime = QMimeData()
+        mime.setData(self.PAGE_DRAG_MIME, QByteArray(",".join(str(row) for row in source_rows).encode("ascii")))
+        drag.setMimeData(mime)
+        drag.setPixmap(self.drag_pixmap_for_rows(source_rows))
+        drag.setHotSpot(QPoint(drag.pixmap().width() // 2, drag.pixmap().height() // 2))
+        drag.exec(Qt.MoveAction)
+
+    def drag_pixmap_for_rows(self, source_rows: list[int]) -> QPixmap:
+        first_item = self.item(source_rows[0])
+        pixmap = first_item.icon().pixmap(ICON_SIZE)
+        preview = pixmap.scaled(105, 136, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        if len(source_rows) > 1:
+            stacked = QPixmap(preview.width() + 18, preview.height() + 18)
+            stacked.fill(Qt.transparent)
+            from PySide6.QtGui import QPainter
+
+            painter = QPainter(stacked)
+            painter.drawPixmap(18, 18, preview)
+            painter.drawPixmap(0, 0, preview)
+            painter.end()
+            return stacked
+        return preview
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.source() is self:
+        if event.source() is self and event.mimeData().hasFormat(self.PAGE_DRAG_MIME):
             event.setDropAction(Qt.MoveAction)
             event.accept()
             return
@@ -125,7 +129,7 @@ class PageGrid(QListWidget):
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:
-        if event.source() is self:
+        if event.source() is self and event.mimeData().hasFormat(self.PAGE_DRAG_MIME):
             event.setDropAction(Qt.MoveAction)
             event.accept()
             return
@@ -140,8 +144,9 @@ class PageGrid(QListWidget):
             self.filesDropped.emit(paths)
             event.acceptProposedAction()
             return
-        if event.source() is self:
-            source_rows = sorted(self.row(item) for item in self.selectedItems())
+        if event.source() is self and event.mimeData().hasFormat(self.PAGE_DRAG_MIME):
+            raw_rows = bytes(event.mimeData().data(self.PAGE_DRAG_MIME)).decode("ascii")
+            source_rows = sorted(int(row) for row in raw_rows.split(",") if row)
             if not source_rows:
                 event.ignore()
                 return
