@@ -20,11 +20,16 @@ class QtAppTests(unittest.TestCase):
     def setUp(self):
         self.temp_dir = tempfile.TemporaryDirectory()
         self.source = Path(self.temp_dir.name) / "source.pdf"
+        self.second_source = Path(self.temp_dir.name) / "second.pdf"
         writer = PdfWriter()
         writer.add_blank_page(width=300, height=400)
         writer.add_blank_page(width=300, height=400)
         with self.source.open("wb") as stream:
             writer.write(stream)
+        second_writer = PdfWriter()
+        second_writer.add_blank_page(width=300, height=400)
+        with self.second_source.open("wb") as stream:
+            second_writer.write(stream)
 
     def tearDown(self):
         self.temp_dir.cleanup()
@@ -55,6 +60,22 @@ class QtAppTests(unittest.TestCase):
 
         self.assertEqual([item.page_index for item in window.page_items], [1, 0])
         self.assertTrue(window.page_grid.item(1).isSelected())
+
+    def test_each_pdf_opens_in_its_own_document_tab(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.add_files_from_paths([str(self.second_source)])
+
+        self.assertEqual(window.document_tabs.count(), 2)
+        self.assertEqual(window.document_tabs.tabText(0), "source.pdf")
+        self.assertEqual(window.document_tabs.tabText(1), "second.pdf")
+        self.assertEqual(len(window.page_items), 1)
+        self.assertEqual(window.stats_label.text(), "總頁數：1　已選取：0")
+
+        window.document_tabs.setCurrentIndex(0)
+
+        self.assertEqual(len(window.page_items), 2)
+        self.assertEqual(window.stats_label.text(), "總頁數：2　已選取：0")
 
 
 if __name__ == "__main__":

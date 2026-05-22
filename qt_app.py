@@ -5,8 +5,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 from PIL.ImageQt import ImageQt
-from pypdf import PdfReader
-from PySide6.QtCore import QSize, Qt, Signal
+from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -109,8 +108,7 @@ class PageGrid(QListWidget):
             if not source_rows:
                 event.ignore()
                 return
-            target_row = self.drop_target_row(event)
-            self.reorderRequested.emit(source_rows, target_row)
+            self.reorderRequested.emit(source_rows, self.drop_target_row(event))
             event.acceptProposedAction()
             return
         super().dropEvent(event)
@@ -132,13 +130,12 @@ class VictorPdfToolsQt(QMainWindow):
         super().__init__()
         self.setWindowTitle("Victor PDF Tools Box")
         self.resize(1280, 820)
+
+        self.workspaces: dict[PageGrid, dict] = {}
+        self.page_grid: PageGrid | None = None
         self.page_items: list[PageItem] = []
         self.thumbnail_cache: dict[tuple[str, int, int], QIcon] = {}
-
-        self.page_grid = PageGrid()
-        self.page_grid.filesDropped.connect(self.add_files_from_paths)
-        self.page_grid.reorderRequested.connect(self.reorder_pages)
-        self.page_grid.itemSelectionChanged.connect(self.update_stats)
+        self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
         self.stats_label = QLabel("總頁數：0　已選取：0")
         self.stats_label.setObjectName("muted")
@@ -150,7 +147,8 @@ class VictorPdfToolsQt(QMainWindow):
 
         self.build_ui()
         self.setStatusBar(QStatusBar())
-        self.set_status("把 PDF 直接拖入左邊縮圖區，或按「加入 PDF」。")
+        self.create_document_tab("未命名")
+        self.set_status("把 PDF 直接拖入縮圖區；每個 PDF 會像 DC 一樣開成獨立文件 Tab。")
 
     def build_ui(self) -> None:
         self.setStyleSheet(
@@ -186,7 +184,7 @@ class VictorPdfToolsQt(QMainWindow):
 
         title = QLabel("Victor PDF Tools Box")
         title.setObjectName("title")
-        subtitle = QLabel("第二代 Qt 介面：本機處理 PDF，支援拖入檔案、縮圖重排、旋轉、擷取與合併。")
+        subtitle = QLabel("第二代 Qt 介面：本機處理 PDF，支援文件 Tab、縮圖重排、旋轉、擷取與合併。")
         subtitle.setObjectName("muted")
         layout.addWidget(title)
         layout.addWidget(subtitle)
@@ -215,14 +213,19 @@ class VictorPdfToolsQt(QMainWindow):
         controls = QHBoxLayout()
         self.add_button(controls, "加入 PDF", self.choose_pdf_files)
         self.add_button(controls, "移除選取", self.remove_selected_pages, "danger")
-        self.add_button(controls, "清空", self.clear_pages)
+        self.add_button(controls, "清空目前 Tab", self.clear_pages)
         controls.addSpacing(10)
         self.add_button(controls, "選取左轉", lambda: self.rotate_selected_pages(270))
         self.add_button(controls, "選取右轉", lambda: self.rotate_selected_pages(90))
         controls.addStretch(1)
         controls.addWidget(self.stats_label)
         left_layout.addLayout(controls)
-        left_layout.addWidget(self.page_grid, 1)
+
+        self.document_tabs = QTabWidget()
+        self.document_tabs.setTabsClosable(True)
+        self.document_tabs.currentChanged.connect(self.on_document_tab_changed)
+        self.document_tabs.tabCloseRequested.connect(self.close_document_tab)
+        left_layout.addWidget(self.document_tabs, 1)
         layout.addWidget(left, 1)
 
         side = QFrame()
@@ -235,13 +238,13 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(QLabel("頁面排序"))
         self.add_button(side_layout, "上移", lambda: self.move_selected_page(-1))
         self.add_button(side_layout, "下移", lambda: self.move_selected_page(1))
-        save_button = self.add_button(side_layout, "儲存最新版 PDF", self.export_arranged_pdf, "primary")
+        save_button = self.add_button(side_layout, "儲存目前 Tab PDF", self.export_arranged_pdf, "primary")
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         side_layout.addSpacing(12)
         side_layout.addWidget(QLabel("擷取頁碼範圍"))
         side_layout.addWidget(self.range_input)
-        hint = QLabel("可輸入 1-12,15-18。留空時使用目前選取的縮圖頁面。")
+        hint = QLabel("可輸入 1-12,15-18。留空時使用目前 Tab 已選取的縮圖頁面。")
         hint.setWordWrap(True)
         hint.setObjectName("muted")
         side_layout.addWidget(hint)
@@ -252,7 +255,7 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(QLabel("加密 PDF 密碼"))
         side_layout.addWidget(self.password_input)
         side_layout.addStretch(1)
-        guide = QLabel("提示：縮圖可直接拖拉重排；Ctrl 或 Shift 可多選。旋轉、擷取會套用目前排列。")
+        guide = QLabel("提示：每個 PDF 會開成獨立 Tab；縮圖可直接拖到目標位置插入重排。")
         guide.setWordWrap(True)
         guide.setObjectName("muted")
         side_layout.addWidget(guide)
@@ -282,65 +285,167 @@ class VictorPdfToolsQt(QMainWindow):
         layout.addWidget(button)
         return button
 
+    def create_document_tab(self, title: str) -> PageGrid:
+        grid = PageGrid()
+        grid.filesDropped.connect(self.add_files_from_paths)
+        grid.reorderRequested.connect(lambda rows, target, page_grid=grid: self.reorder_pages(rows, target, page_grid))
+        grid.itemSelectionChanged.connect(self.update_stats)
+        self.workspaces[grid] = {"items": [], "cache": {}, "pending": [], "generation": 0}
+        self.document_tabs.addTab(grid, title)
+        self.document_tabs.setCurrentWidget(grid)
+        self.set_current_workspace(grid)
+        return grid
+
+    def set_current_workspace(self, grid: PageGrid | None) -> None:
+        self.page_grid = grid
+        if grid is None:
+            self.page_items = []
+            self.thumbnail_cache = {}
+            self.update_stats()
+            return
+        workspace = self.workspaces[grid]
+        self.page_items = workspace["items"]
+        self.thumbnail_cache = workspace["cache"]
+        self.update_stats()
+
+    def current_grid(self) -> PageGrid | None:
+        widget = self.document_tabs.currentWidget()
+        return widget if isinstance(widget, PageGrid) else None
+
+    def current_workspace(self) -> dict | None:
+        grid = self.current_grid()
+        if grid is None:
+            return None
+        return self.workspaces.get(grid)
+
+    def on_document_tab_changed(self, _index: int) -> None:
+        self.set_current_workspace(self.current_grid())
+
+    def close_document_tab(self, index: int) -> None:
+        widget = self.document_tabs.widget(index)
+        if isinstance(widget, PageGrid):
+            self.workspaces.pop(widget, None)
+        self.document_tabs.removeTab(index)
+        if self.document_tabs.count() == 0:
+            self.create_document_tab("未命名")
+        else:
+            self.set_current_workspace(self.current_grid())
+
     def choose_pdf_files(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(self, "加入 PDF", "", "PDF files (*.pdf)")
         self.add_files_from_paths(files)
 
     def add_files_from_paths(self, paths: list[str]) -> None:
-        added = 0
-        skipped = 0
-        for raw_path in paths:
-            path = Path(raw_path)
-            if not path.is_file() or path.suffix.lower() != ".pdf":
-                skipped += 1
-                continue
+        pdf_paths = [Path(path) for path in paths if Path(path).is_file() and Path(path).suffix.lower() == ".pdf"]
+        skipped = len(paths) - len(pdf_paths)
+        added_pages = 0
+        added_files = 0
+        for path in pdf_paths:
             try:
                 reader = open_reader(path, self.password_input.text())
             except Exception as exc:
                 skipped += 1
                 self.show_error(exc)
                 continue
+            added_files += 1
+
+            grid = self.target_grid_for_new_file(path.name)
+            workspace = self.workspaces[grid]
+            workspace["items"].clear()
+            workspace["cache"].clear()
             for page_index in range(len(reader.pages)):
-                self.page_items.append(PageItem(path, page_index, f"{path.name} - Page {page_index + 1}"))
-                added += 1
-        self.rebuild_grid()
-        if added:
-            self.set_status(f"已加入 {added} 頁。")
+                workspace["items"].append(PageItem(path, page_index, f"{path.name} - Page {page_index + 1}"))
+                added_pages += 1
+            self.rebuild_grid(grid=grid)
+            self.document_tabs.setTabText(self.document_tabs.indexOf(grid), path.name)
+
+        if added_pages:
+            self.set_status(f"已加入 {added_files} 個 PDF，共 {added_pages} 頁。")
         elif skipped:
             self.set_status("沒有加入頁面，請確認檔案是 PDF 或密碼正確。")
 
-    def rebuild_grid(self, selected_indexes: set[int] | None = None) -> None:
+    def target_grid_for_new_file(self, title: str) -> PageGrid:
+        grid = self.current_grid()
+        workspace = self.current_workspace()
+        if grid is not None and workspace is not None and not workspace["items"] and self.document_tabs.count() == 1:
+            self.document_tabs.setTabText(self.document_tabs.indexOf(grid), title)
+            return grid
+        return self.create_document_tab(title)
+
+    def rebuild_grid(self, selected_indexes: set[int] | None = None, grid: PageGrid | None = None) -> None:
+        grid = grid or self.current_grid()
+        if grid is None:
+            return
+        workspace = self.workspaces[grid]
         selected_indexes = selected_indexes or set()
-        self.page_grid.blockSignals(True)
-        self.page_grid.clear()
-        for index, item in enumerate(self.page_items):
-            list_item = QListWidgetItem(self.thumbnail_for_page(item), page_item_label(item))
+        workspace["generation"] += 1
+        generation = workspace["generation"]
+        workspace["pending"] = []
+
+        grid.blockSignals(True)
+        grid.clear()
+        for index, item in enumerate(workspace["items"]):
+            icon = workspace["cache"].get(self.thumbnail_key(item), self.placeholder_icon)
+            list_item = QListWidgetItem(icon, page_item_label(item))
             list_item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
             list_item.setData(Qt.UserRole, item)
             list_item.setSizeHint(THUMB_SIZE)
-            self.page_grid.addItem(list_item)
+            grid.addItem(list_item)
             if index in selected_indexes:
                 list_item.setSelected(True)
-        self.page_grid.blockSignals(False)
+            if self.thumbnail_key(item) not in workspace["cache"]:
+                workspace["pending"].append(index)
+        grid.blockSignals(False)
         self.update_stats()
+        if workspace["pending"]:
+            QTimer.singleShot(0, lambda page_grid=grid, token=generation: self.render_next_thumbnails(page_grid, token))
 
-    def reorder_pages(self, source_rows: list[int], target_row: int) -> None:
-        source_rows = sorted(set(row for row in source_rows if 0 <= row < len(self.page_items)))
+    def render_next_thumbnails(self, grid: PageGrid, generation: int) -> None:
+        workspace = self.workspaces.get(grid)
+        if not workspace or generation != workspace["generation"]:
+            return
+        for _ in range(3):
+            if not workspace["pending"]:
+                return
+            index = workspace["pending"].pop(0)
+            if index >= len(workspace["items"]) or index >= grid.count():
+                continue
+            item = workspace["items"][index]
+            key = self.thumbnail_key(item)
+            icon = workspace["cache"].get(key)
+            if icon is None:
+                icon = QIcon(QPixmap.fromImage(ImageQt(self.render_page_thumbnail(item))))
+                workspace["cache"][key] = icon
+            grid.item(index).setIcon(icon)
+        if workspace["pending"]:
+            QTimer.singleShot(1, lambda page_grid=grid, token=generation: self.render_next_thumbnails(page_grid, token))
+
+    def reorder_pages(self, source_rows: list[int], target_row: int, grid: PageGrid | None = None) -> None:
+        grid = grid or self.current_grid()
+        if grid is None:
+            return
+        items = self.workspaces[grid]["items"]
+        source_rows = sorted(set(row for row in source_rows if 0 <= row < len(items)))
         if not source_rows:
             return
         if target_row in source_rows and len(source_rows) == 1:
             return
-        moving = [self.page_items[row] for row in source_rows]
-        remaining = [item for index, item in enumerate(self.page_items) if index not in source_rows]
+        moving = [items[row] for row in source_rows]
+        remaining = [item for index, item in enumerate(items) if index not in source_rows]
         adjusted_target = target_row - sum(1 for row in source_rows if row < target_row)
         adjusted_target = max(0, min(adjusted_target, len(remaining)))
-        self.page_items = remaining[:adjusted_target] + moving + remaining[adjusted_target:]
+        self.workspaces[grid]["items"] = remaining[:adjusted_target] + moving + remaining[adjusted_target:]
+        if grid is self.current_grid():
+            self.page_items = self.workspaces[grid]["items"]
         selected = set(range(adjusted_target, adjusted_target + len(moving)))
-        self.rebuild_grid(selected)
+        self.rebuild_grid(selected, grid)
         self.set_status("頁面順序已更新。")
 
     def selected_indexes(self) -> list[int]:
-        return sorted(self.page_grid.row(item) for item in self.page_grid.selectedItems())
+        grid = self.current_grid()
+        if grid is None:
+            return []
+        return sorted(grid.row(item) for item in grid.selectedItems())
 
     def selected_or_range_indexes(self) -> list[int]:
         spec = self.range_input.text().strip()
@@ -373,7 +478,7 @@ class VictorPdfToolsQt(QMainWindow):
             item = self.page_items[index]
             self.page_items[index] = PageItem(item.pdf_path, item.page_index, item.label, (item.rotation + angle) % 360)
         self.rebuild_grid(set(indexes))
-        self.set_status(f"已旋轉 {len(indexes)} 頁，按「儲存最新版 PDF」輸出新檔。")
+        self.set_status(f"已旋轉 {len(indexes)} 頁，按「儲存目前 Tab PDF」輸出新檔。")
 
     def remove_selected_pages(self) -> None:
         indexes = self.selected_indexes()
@@ -389,20 +494,20 @@ class VictorPdfToolsQt(QMainWindow):
         self.page_items.clear()
         self.thumbnail_cache.clear()
         self.rebuild_grid()
-        self.set_status("已清空頁面。")
+        self.set_status("已清空目前 Tab。")
 
     def export_arranged_pdf(self) -> None:
         if not self.page_items:
             self.set_status("請先加入 PDF 頁面。")
             return
-        target, _ = QFileDialog.getSaveFileName(self, "儲存最新版 PDF", "arranged-pages.pdf", "PDF files (*.pdf)")
+        target, _ = QFileDialog.getSaveFileName(self, "儲存目前 Tab PDF", "arranged-pages.pdf", "PDF files (*.pdf)")
         if not target:
             return
         self.run_pdf_job(
             lambda: write_page_items_merged(
                 self.page_items, list(range(len(self.page_items))), Path(target), self.password_input.text()
             ),
-            f"已儲存最新版 PDF：{target}",
+            f"已儲存目前 Tab PDF：{target}",
         )
 
     def extract_pages_merged(self) -> None:
@@ -415,7 +520,7 @@ class VictorPdfToolsQt(QMainWindow):
             self.set_status("請先選取要擷取的頁面，或輸入頁碼範圍。")
             return
         target, _ = QFileDialog.getSaveFileName(
-            self, "擷取選取頁面並合併", "extracted-selected-pages.pdf", "PDF files (*.pdf)"
+            self, "擷取目前 Tab 頁面並合併", "extracted-selected-pages.pdf", "PDF files (*.pdf)"
         )
         if not target:
             return
@@ -452,15 +557,8 @@ class VictorPdfToolsQt(QMainWindow):
         finally:
             QApplication.restoreOverrideCursor()
 
-    def thumbnail_for_page(self, item: PageItem) -> QIcon:
-        key = (str(item.pdf_path), item.page_index, item.rotation)
-        cached = self.thumbnail_cache.get(key)
-        if cached is not None:
-            return cached
-        image = self.render_page_thumbnail(item)
-        icon = QIcon(QPixmap.fromImage(ImageQt(image)))
-        self.thumbnail_cache[key] = icon
-        return icon
+    def thumbnail_key(self, item: PageItem) -> tuple[str, int, int]:
+        return (str(item.pdf_path), item.page_index, item.rotation)
 
     def render_page_thumbnail(self, item: PageItem) -> Image.Image:
         if PDF_RENDER_AVAILABLE and pdfium is not None:
@@ -483,12 +581,13 @@ class VictorPdfToolsQt(QMainWindow):
                 pass
         return self.placeholder_thumbnail(item)
 
-    def placeholder_thumbnail(self, item: PageItem) -> Image.Image:
+    def placeholder_thumbnail(self, item: PageItem | None) -> Image.Image:
         image = Image.new("RGB", (ICON_SIZE.width(), ICON_SIZE.height()), "#ffffff")
         draw = ImageDraw.Draw(image)
         draw.rectangle((8, 8, ICON_SIZE.width() - 8, ICON_SIZE.height() - 8), outline="#d0d0d0", width=2)
         draw.text((22, 76), "PDF", fill="#666666")
-        draw.text((22, 102), f"Page {item.page_index + 1}", fill="#666666")
+        if item is not None:
+            draw.text((22, 102), f"Page {item.page_index + 1}", fill="#666666")
         return image
 
     def set_status(self, message: str) -> None:
