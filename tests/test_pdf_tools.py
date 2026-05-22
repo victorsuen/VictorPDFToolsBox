@@ -5,12 +5,14 @@ from pypdf import PdfReader, PdfWriter
 
 from app import copy_pages, parse_pages
 from desktop_app import (
-    PageItem,
     add_page_numbers,
     add_text_overlay_annotation,
     add_watermark,
     clean_metadata,
     remove_blank_pages,
+)
+from pdf_core import (
+    PageItem,
     write_page_items_merged,
     write_page_items_separately,
 )

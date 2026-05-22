@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-python -m PyInstaller --noconfirm --clean --onedir --console --icon NONE --collect-all tkinterdnd2 --collect-all pypdfium2 --name "VictorPDFToolsBox" --distpath "C:\tmp\victor_pdf_dist" --workpath "C:\tmp\victor_pdf_build" desktop_app.py
+python -m PyInstaller --noconfirm --clean --onedir --console --icon NONE --name "VictorPDFToolsBox" --distpath "C:\tmp\victor_pdf_dist" --workpath "C:\tmp\victor_pdf_build" qt_app.py
 if errorlevel 1 goto build_failed
 
 set "DESKTOP_DIR=%USERPROFILE%\Desktop\VictorPDFToolsBox"
