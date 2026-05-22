@@ -5,7 +5,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QPoint, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -41,7 +41,7 @@ from pdf_core import (
 )
 
 
-THUMB_SIZE = QSize(170, 230)
+THUMB_SIZE = QSize(170, 260)
 ICON_SIZE = QSize(150, 200)
 
 
@@ -51,11 +51,13 @@ class PageGrid(QListWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self.drag_start_position: QPoint | None = None
+        self.drag_source_rows: list[int] = []
         self.setAcceptDrops(True)
-        self.setDragEnabled(True)
+        self.setDragEnabled(False)
         self.setDropIndicatorShown(True)
         self.setDefaultDropAction(Qt.MoveAction)
-        self.setDragDropMode(QListWidget.DragDrop)
+        self.setDragDropMode(QListWidget.DropOnly)
         self.setDragDropOverwriteMode(False)
         self.setSelectionMode(QListWidget.ExtendedSelection)
         self.setViewMode(QListWidget.IconMode)
@@ -86,6 +88,29 @@ class PageGrid(QListWidget):
             }
             """
         )
+
+    def mousePressEvent(self, event) -> None:
+        super().mousePressEvent(event)
+        if event.button() == Qt.LeftButton:
+            self.drag_start_position = event.position().toPoint()
+            self.drag_source_rows = sorted(self.row(item) for item in self.selectedItems())
+
+    def mouseReleaseEvent(self, event) -> None:
+        if (
+            event.button() == Qt.LeftButton
+            and self.drag_start_position is not None
+            and self.drag_source_rows
+            and (event.position().toPoint() - self.drag_start_position).manhattanLength()
+            >= QApplication.startDragDistance()
+        ):
+            self.reorderRequested.emit(self.drag_source_rows, self.row_from_point(event.position().toPoint()))
+            self.drag_start_position = None
+            self.drag_source_rows = []
+            event.accept()
+            return
+        self.drag_start_position = None
+        self.drag_source_rows = []
+        super().mouseReleaseEvent(event)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if event.source() is self:
@@ -124,7 +149,9 @@ class PageGrid(QListWidget):
         super().dropEvent(event)
 
     def drop_target_row(self, event: QDropEvent) -> int:
-        point = event.position().toPoint()
+        return self.row_from_point(event.position().toPoint())
+
+    def row_from_point(self, point: QPoint) -> int:
         item = self.itemAt(point)
         if item is None:
             return self.count()
@@ -271,6 +298,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.page_grid: PageGrid | None = None
         self.page_items: list[PageItem] = []
         self.thumbnail_cache: dict[tuple[str, int, int], QIcon] = {}
+        self.page_clipboard: list[PageItem] = []
         self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
         self.stats_label = QLabel("總頁數：0　已選取：0")
@@ -282,6 +310,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.password_input.setPlaceholderText("如 PDF 已加密，在此輸入密碼")
 
         self.build_ui()
+        self.install_shortcuts()
         self.setStatusBar(QStatusBar())
         self.create_document_tab("未命名")
         self.set_status("把 PDF 直接拖入縮圖區；每個 PDF 會像 DC 一樣開成獨立文件 Tab。")
@@ -362,6 +391,19 @@ class VictorPdfToolsQt(QMainWindow):
         open_action.triggered.connect(self.choose_pdf_files)
         self.addAction(open_action)
 
+    def install_shortcuts(self) -> None:
+        shortcuts = [
+            ("Ctrl+C", self.copy_selected_pages),
+            ("Ctrl+X", self.cut_selected_pages),
+            ("Ctrl+V", self.paste_pages),
+            ("Delete", self.remove_selected_pages),
+        ]
+        for key, callback in shortcuts:
+            action = QAction(self)
+            action.setShortcut(key)
+            action.triggered.connect(callback)
+            self.addAction(action)
+
     def build_organize_tab(self) -> QWidget:
         tab = QWidget()
         layout = QHBoxLayout(tab)
@@ -375,7 +417,10 @@ class VictorPdfToolsQt(QMainWindow):
 
         controls = QHBoxLayout()
         self.add_button(controls, "加入 PDF", self.choose_pdf_files)
-        self.add_button(controls, "移除選取", self.remove_selected_pages, "danger")
+        self.add_button(controls, "複製頁", self.copy_selected_pages)
+        self.add_button(controls, "剪下頁", self.cut_selected_pages)
+        self.add_button(controls, "貼上頁", self.paste_pages)
+        self.add_button(controls, "刪除頁", self.remove_selected_pages, "danger")
         self.add_button(controls, "清空目前 Tab", self.clear_pages)
         controls.addSpacing(10)
         self.add_button(controls, "選取左轉", lambda: self.rotate_selected_pages(270))
@@ -559,7 +604,7 @@ class VictorPdfToolsQt(QMainWindow):
         grid.clear()
         for index, item in enumerate(workspace["items"]):
             icon = workspace["cache"].get(self.thumbnail_key(item), self.placeholder_icon)
-            list_item = QListWidgetItem(icon, page_item_label(item))
+            list_item = QListWidgetItem(icon, self.page_card_label(index, item))
             list_item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
             list_item.setData(Qt.UserRole, item)
             list_item.setSizeHint(THUMB_SIZE)
@@ -614,6 +659,12 @@ class VictorPdfToolsQt(QMainWindow):
         self.rebuild_grid(selected, grid)
         self.set_status("頁面順序已更新。")
 
+    def page_card_label(self, index: int, item: PageItem) -> str:
+        label = f"Page {index + 1}\n原頁 {item.page_index + 1}\n{item.pdf_path.name}"
+        if item.rotation:
+            label += f"\n旋轉 {item.rotation}度"
+        return label
+
     def selected_indexes(self) -> list[int]:
         grid = self.current_grid()
         if grid is None:
@@ -662,6 +713,38 @@ class VictorPdfToolsQt(QMainWindow):
             self.page_items.pop(index)
         self.rebuild_grid()
         self.set_status(f"已移除 {len(indexes)} 頁。")
+
+    def copy_selected_pages(self) -> None:
+        indexes = self.selected_indexes()
+        if not indexes:
+            self.set_status("請先選取要複製的頁面。")
+            return
+        self.page_clipboard = [self.page_items[index] for index in indexes]
+        self.set_status(f"已複製 {len(self.page_clipboard)} 頁。")
+
+    def cut_selected_pages(self) -> None:
+        indexes = self.selected_indexes()
+        if not indexes:
+            self.set_status("請先選取要剪下的頁面。")
+            return
+        self.page_clipboard = [self.page_items[index] for index in indexes]
+        for index in reversed(indexes):
+            self.page_items.pop(index)
+        self.rebuild_grid()
+        self.set_status(f"已剪下 {len(self.page_clipboard)} 頁，可切到其他 Tab 後貼上。")
+
+    def paste_pages(self) -> None:
+        if not self.page_clipboard:
+            self.set_status("剪貼簿沒有頁面。")
+            return
+        if self.current_grid() is None:
+            self.create_document_tab("貼上頁面")
+        indexes = self.selected_indexes()
+        insert_at = indexes[-1] + 1 if indexes else len(self.page_items)
+        self.page_items[insert_at:insert_at] = list(self.page_clipboard)
+        selected = set(range(insert_at, insert_at + len(self.page_clipboard)))
+        self.rebuild_grid(selected)
+        self.set_status(f"已貼上 {len(self.page_clipboard)} 頁。")
 
     def clear_pages(self) -> None:
         self.page_items.clear()

@@ -61,6 +61,40 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual([item.page_index for item in window.page_items], [1, 0])
         self.assertTrue(window.page_grid.item(1).isSelected())
 
+    def test_page_card_label_shows_current_and_original_page(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+
+        self.assertIn("Page 1", window.page_grid.item(0).text())
+        self.assertIn("原頁 1", window.page_grid.item(0).text())
+        self.assertIn("source.pdf", window.page_grid.item(0).text())
+
+    def test_cut_and_paste_pages_across_tabs(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.add_files_from_paths([str(self.second_source)])
+        window.document_tabs.setCurrentIndex(0)
+        window.page_grid.item(0).setSelected(True)
+
+        window.cut_selected_pages()
+        self.assertEqual(len(window.workspaces[window.document_tabs.widget(0)]["items"]), 1)
+
+        window.document_tabs.setCurrentIndex(1)
+        window.paste_pages()
+
+        self.assertEqual([item.pdf_path.name for item in window.page_items], ["second.pdf", "source.pdf"])
+        self.assertEqual([item.page_index for item in window.page_items], [0, 0])
+
+    def test_delete_selected_pages_removes_items(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.page_grid.item(0).setSelected(True)
+
+        window.remove_selected_pages()
+
+        self.assertEqual(len(window.page_items), 1)
+        self.assertEqual(window.page_items[0].page_index, 1)
+
     def test_each_pdf_opens_in_its_own_document_tab(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
