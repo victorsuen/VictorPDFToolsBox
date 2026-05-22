@@ -396,6 +396,7 @@ class VictorPdfToolsQt(QMainWindow):
             ("Ctrl+C", self.copy_selected_pages),
             ("Ctrl+X", self.cut_selected_pages),
             ("Ctrl+V", self.paste_pages),
+            ("Ctrl+Z", self.undo_last_action),
             ("Delete", self.remove_selected_pages),
         ]
         for key, callback in shortcuts:
@@ -420,6 +421,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.add_button(controls, "複製頁", self.copy_selected_pages)
         self.add_button(controls, "剪下頁", self.cut_selected_pages)
         self.add_button(controls, "貼上頁", self.paste_pages)
+        self.add_button(controls, "復原", self.undo_last_action)
         self.add_button(controls, "刪除頁", self.remove_selected_pages, "danger")
         self.add_button(controls, "清空目前 Tab", self.clear_pages)
         controls.addSpacing(10)
@@ -500,7 +502,7 @@ class VictorPdfToolsQt(QMainWindow):
         grid.filesDropped.connect(self.add_files_from_paths)
         grid.reorderRequested.connect(lambda rows, target, page_grid=grid: self.reorder_pages(rows, target, page_grid))
         grid.itemSelectionChanged.connect(self.update_stats)
-        self.workspaces[grid] = {"items": [], "cache": {}, "pending": [], "generation": 0}
+        self.workspaces[grid] = {"items": [], "cache": {}, "pending": [], "generation": 0, "undo": []}
         self.document_tabs.addTab(grid, title)
         self.document_tabs.setCurrentWidget(grid)
         self.set_current_workspace(grid)
@@ -590,6 +592,42 @@ class VictorPdfToolsQt(QMainWindow):
             return grid
         return self.create_document_tab(title)
 
+    def push_undo_state(self, label: str, grid: PageGrid | None = None) -> None:
+        grid = grid or self.current_grid()
+        if grid is None:
+            return
+        workspace = self.workspaces.get(grid)
+        if workspace is None:
+            return
+        workspace["undo"].append(
+            {
+                "label": label,
+                "items": list(workspace["items"]),
+                "selected": self.selected_indexes_for_grid(grid),
+            }
+        )
+        if len(workspace["undo"]) > 30:
+            workspace["undo"].pop(0)
+
+    def undo_last_action(self) -> None:
+        grid = self.current_grid()
+        if grid is None:
+            self.set_status("沒有可復原的動作。")
+            return
+        workspace = self.workspaces.get(grid)
+        if not workspace or not workspace["undo"]:
+            self.set_status("沒有可復原的動作。")
+            return
+        state = workspace["undo"].pop()
+        workspace["items"] = list(state["items"])
+        if grid is self.current_grid():
+            self.page_items = workspace["items"]
+        self.rebuild_grid(set(state["selected"]), grid)
+        self.set_status(f"已復原：{state['label']}。")
+
+    def selected_indexes_for_grid(self, grid: PageGrid) -> list[int]:
+        return sorted(grid.row(item) for item in grid.selectedItems())
+
     def rebuild_grid(self, selected_indexes: set[int] | None = None, grid: PageGrid | None = None) -> None:
         grid = grid or self.current_grid()
         if grid is None:
@@ -648,6 +686,7 @@ class VictorPdfToolsQt(QMainWindow):
             return
         if target_row in source_rows and len(source_rows) == 1:
             return
+        self.push_undo_state("移動頁面", grid)
         moving = [items[row] for row in source_rows]
         remaining = [item for index, item in enumerate(items) if index not in source_rows]
         adjusted_target = target_row - sum(1 for row in source_rows if row < target_row)
@@ -669,7 +708,7 @@ class VictorPdfToolsQt(QMainWindow):
         grid = self.current_grid()
         if grid is None:
             return []
-        return sorted(grid.row(item) for item in grid.selectedItems())
+        return self.selected_indexes_for_grid(grid)
 
     def selected_or_range_indexes(self) -> list[int]:
         spec = self.range_input.text().strip()
@@ -689,6 +728,7 @@ class VictorPdfToolsQt(QMainWindow):
         target = source + direction
         if target < 0 or target >= len(self.page_items):
             return
+        self.push_undo_state("上移/下移頁面")
         self.page_items[source], self.page_items[target] = self.page_items[target], self.page_items[source]
         self.rebuild_grid({target})
         self.set_status("頁面順序已更新。")
@@ -698,6 +738,7 @@ class VictorPdfToolsQt(QMainWindow):
         if not indexes:
             self.set_status("請先選取要旋轉的頁面。")
             return
+        self.push_undo_state("旋轉頁面")
         for index in indexes:
             item = self.page_items[index]
             self.page_items[index] = PageItem(item.pdf_path, item.page_index, item.label, (item.rotation + angle) % 360)
@@ -709,6 +750,7 @@ class VictorPdfToolsQt(QMainWindow):
         if not indexes:
             self.set_status("請先選取要移除的頁面。")
             return
+        self.push_undo_state("刪除頁面")
         for index in reversed(indexes):
             self.page_items.pop(index)
         self.rebuild_grid()
@@ -727,6 +769,7 @@ class VictorPdfToolsQt(QMainWindow):
         if not indexes:
             self.set_status("請先選取要剪下的頁面。")
             return
+        self.push_undo_state("剪下頁面")
         self.page_clipboard = [self.page_items[index] for index in indexes]
         for index in reversed(indexes):
             self.page_items.pop(index)
@@ -741,12 +784,16 @@ class VictorPdfToolsQt(QMainWindow):
             self.create_document_tab("貼上頁面")
         indexes = self.selected_indexes()
         insert_at = indexes[-1] + 1 if indexes else len(self.page_items)
+        self.push_undo_state("貼上頁面")
         self.page_items[insert_at:insert_at] = list(self.page_clipboard)
         selected = set(range(insert_at, insert_at + len(self.page_clipboard)))
         self.rebuild_grid(selected)
         self.set_status(f"已貼上 {len(self.page_clipboard)} 頁。")
 
     def clear_pages(self) -> None:
+        if not self.page_items:
+            return
+        self.push_undo_state("清空目前 Tab")
         self.page_items.clear()
         self.thumbnail_cache.clear()
         self.rebuild_grid()

@@ -95,6 +95,38 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(len(window.page_items), 1)
         self.assertEqual(window.page_items[0].page_index, 1)
 
+    def test_undo_restores_cut_pages(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.page_grid.item(0).setSelected(True)
+
+        window.cut_selected_pages()
+        window.undo_last_action()
+
+        self.assertEqual([item.page_index for item in window.page_items], [0, 1])
+        self.assertTrue(window.page_grid.item(0).isSelected())
+
+    def test_undo_restores_deleted_pages(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.page_grid.item(0).setSelected(True)
+
+        window.remove_selected_pages()
+        window.undo_last_action()
+
+        self.assertEqual([item.page_index for item in window.page_items], [0, 1])
+
+    def test_undo_removes_pasted_pages(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.page_grid.item(0).setSelected(True)
+        window.copy_selected_pages()
+
+        window.paste_pages()
+        window.undo_last_action()
+
+        self.assertEqual([item.page_index for item in window.page_items], [0, 1])
+
     def test_each_pdf_opens_in_its_own_document_tab(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
