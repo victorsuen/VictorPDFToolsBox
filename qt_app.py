@@ -9,6 +9,8 @@ from PySide6.QtCore import QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QFrame,
     QGridLayout,
@@ -166,6 +168,98 @@ class PdfDropTabWidget(QTabWidget):
         return any(Path(url.toLocalFile()).suffix.lower() == ".pdf" for url in event.mimeData().urls())
 
 
+class MergeFilesDialog(QDialog):
+    def __init__(self, main_window: "VictorPdfToolsQt") -> None:
+        super().__init__(main_window)
+        self.main_window = main_window
+        self.setWindowTitle("合併文件")
+        self.resize(760, 520)
+
+        layout = QVBoxLayout(self)
+        hint = QLabel("選擇要合併的文件，然後拖拉圖示調整文件順序。")
+        hint.setObjectName("muted")
+        layout.addWidget(hint)
+
+        controls = QHBoxLayout()
+        main_window.add_button(controls, "加入目前 Tab", self.add_current_tab)
+        main_window.add_button(controls, "加入所有已開 Tab", self.add_open_tabs)
+        main_window.add_button(controls, "加入外部 PDF", self.add_external_pdf)
+        main_window.add_button(controls, "移除選取", self.remove_selected, "danger")
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        self.source_list = QListWidget()
+        self.source_list.setDragEnabled(True)
+        self.source_list.setAcceptDrops(True)
+        self.source_list.setDropIndicatorShown(True)
+        self.source_list.setDefaultDropAction(Qt.MoveAction)
+        self.source_list.setDragDropMode(QListWidget.InternalMove)
+        self.source_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.source_list.setViewMode(QListWidget.IconMode)
+        self.source_list.setMovement(QListWidget.Snap)
+        self.source_list.setResizeMode(QListWidget.Adjust)
+        self.source_list.setWrapping(True)
+        self.source_list.setSpacing(14)
+        self.source_list.setIconSize(ICON_SIZE)
+        self.source_list.setGridSize(THUMB_SIZE)
+        layout.addWidget(self.source_list, 1)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self.accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def add_current_tab(self) -> None:
+        grid = self.main_window.current_grid()
+        if not isinstance(grid, PageGrid):
+            return
+        self.add_grid_source(grid)
+
+    def add_open_tabs(self) -> None:
+        for index in range(self.main_window.document_tabs.count()):
+            grid = self.main_window.document_tabs.widget(index)
+            if isinstance(grid, PageGrid):
+                self.add_grid_source(grid)
+
+    def add_external_pdf(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "加入外部 PDF", "", "PDF files (*.pdf)")
+        for raw_path in files:
+            path = Path(raw_path)
+            try:
+                reader = open_reader(path, self.main_window.password_input.text())
+            except Exception as exc:
+                self.main_window.show_error(exc)
+                continue
+            items = [PageItem(path, page_index, f"{path.name} - Page {page_index + 1}") for page_index in range(len(reader.pages))]
+            self.add_source(path.name, items)
+
+    def add_grid_source(self, grid: PageGrid) -> None:
+        workspace = self.main_window.workspaces.get(grid)
+        if not workspace or not workspace["items"]:
+            return
+        title = self.main_window.document_tabs.tabText(self.main_window.document_tabs.indexOf(grid))
+        self.add_source(title, list(workspace["items"]))
+
+    def add_source(self, title: str, items: list[PageItem]) -> None:
+        if not items:
+            return
+        list_item = QListWidgetItem(self.main_window.placeholder_icon, f"{title}\n{len(items)} 頁")
+        list_item.setData(Qt.UserRole, items)
+        list_item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        list_item.setSizeHint(THUMB_SIZE)
+        self.source_list.addItem(list_item)
+
+    def remove_selected(self) -> None:
+        for item in self.source_list.selectedItems():
+            self.source_list.takeItem(self.source_list.row(item))
+
+    def page_items(self) -> list[PageItem]:
+        items: list[PageItem] = []
+        for index in range(self.source_list.count()):
+            items.extend(self.source_list.item(index).data(Qt.UserRole))
+        return items
+
+
 class VictorPdfToolsQt(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
@@ -320,7 +414,7 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(hint)
         self.add_button(side_layout, "擷取選取 - 合併", self.extract_pages_merged)
         self.add_button(side_layout, "擷取選取 - 單獨", self.extract_pages_separate)
-        self.add_button(side_layout, "合併全部 Tab", self.merge_all_tabs)
+        self.add_button(side_layout, "合併文件...", self.open_merge_files_dialog)
 
         side_layout.addSpacing(12)
         side_layout.addWidget(QLabel("加密 PDF 密碼"))
@@ -609,18 +703,22 @@ class VictorPdfToolsQt(QMainWindow):
             on_success=lambda target_path=Path(target): self.open_pdf_as_new_tab(target_path),
         )
 
-    def merge_all_tabs(self) -> None:
-        all_items = self.all_tab_page_items()
-        if not all_items:
-            self.set_status("請先加入 PDF 頁面。")
+    def open_merge_files_dialog(self) -> None:
+        dialog = MergeFilesDialog(self)
+        dialog.add_open_tabs()
+        if dialog.exec() != QDialog.Accepted:
             return
-        target, _ = QFileDialog.getSaveFileName(self, "合併全部 Tab", "merged-all-tabs.pdf", "PDF files (*.pdf)")
+        merge_items = dialog.page_items()
+        if not merge_items:
+            self.set_status("請先加入要合併的文件。")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "合併文件", "merged-files.pdf", "PDF files (*.pdf)")
         if not target:
             return
         target_path = Path(target)
         self.run_pdf_job(
-            lambda: write_page_items_merged(all_items, list(range(len(all_items))), target_path, self.password_input.text()),
-            f"已合併全部 Tab，共 {len(all_items)} 頁。",
+            lambda: write_page_items_merged(merge_items, list(range(len(merge_items))), target_path, self.password_input.text()),
+            f"已合併 {dialog.source_list.count()} 個文件，共 {len(merge_items)} 頁。",
             on_success=lambda: self.open_pdf_as_new_tab(target_path),
         )
 

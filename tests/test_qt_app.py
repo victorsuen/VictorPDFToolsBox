@@ -9,7 +9,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from qt_app import VictorPdfToolsQt
+from qt_app import MergeFilesDialog, VictorPdfToolsQt
 
 
 class QtAppTests(unittest.TestCase):
@@ -96,6 +96,20 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.document_tabs.count(), 2)
         self.assertEqual(window.document_tabs.tabText(1), "second.pdf")
         self.assertEqual(len(window.page_items), 1)
+
+    def test_merge_dialog_uses_user_controlled_file_order(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.add_files_from_paths([str(self.second_source)])
+        dialog = MergeFilesDialog(window)
+        dialog.add_open_tabs()
+
+        moved = dialog.source_list.takeItem(1)
+        dialog.source_list.insertItem(0, moved)
+
+        items = dialog.page_items()
+        self.assertEqual([item.pdf_path.name for item in items], ["second.pdf", "source.pdf", "source.pdf"])
+        self.assertEqual([item.page_index for item in items], [0, 0, 1])
 
 
 if __name__ == "__main__":
