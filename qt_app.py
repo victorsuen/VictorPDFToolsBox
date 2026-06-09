@@ -1263,6 +1263,9 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(QLabel("替換成"))
         self.text_edit_replacement_input = QTextEdit()
         self.text_edit_replacement_input.setFixedHeight(80)
+        self.text_edit_replacement_input.textChanged.connect(
+            lambda: self.update_text_edit_preview(self.current_text_edit_block())
+        )
         side_layout.addWidget(self.text_edit_replacement_input)
 
         side_layout.addWidget(QLabel("替換方式"))
@@ -1480,6 +1483,16 @@ class VictorPdfToolsQt(QMainWindow):
             bottom = image.height - selected_block.y * scale_y
             top = bottom - selected_block.height * scale_y
             right = left + selected_block.width * scale_x
+            replacement = self.text_edit_replacement_input.toPlainText().strip()
+            if replacement:
+                draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#cbd5e1", width=1)
+                preview_font_size = max(selected_block.font_size * scale_y * 0.92, 8)
+                font = self.annotation_preview_font(
+                    preview_font_size,
+                    "bold" in (selected_block.font_name or "").lower(),
+                    "courier" if "courier" in (selected_block.font_name or "").lower() else "helvetica",
+                )
+                draw.text((left + 3, top + 2), replacement, fill="#111827", font=font)
             draw.rectangle((left, top, right, bottom), outline="#0f766e", width=3)
         pixmap = QPixmap.fromImage(ImageQt(image))
         self.text_edit_preview_label.setPixmap(pixmap)
