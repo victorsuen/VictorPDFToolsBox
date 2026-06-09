@@ -393,6 +393,43 @@ def replace_text_block_overlay(
     )
 
 
+def redact_text_block_overlay(
+    source: Path,
+    target: Path,
+    page_index: int,
+    block: TextBlock,
+    password: str = "",
+) -> None:
+    reader = open_reader(source, password)
+    if page_index < 0 or page_index >= len(reader.pages):
+        raise ValueError("頁碼超出範圍。")
+
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    page = writer.pages[page_index]
+    padding = max(block.font_size * 0.2, 2.0)
+    redact_box = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/Square"),
+            NameObject("/Rect"): ArrayObject(
+                [
+                    FloatObject(block.x - padding),
+                    FloatObject(block.y - block.height - padding),
+                    FloatObject(block.x + block.width + padding),
+                    FloatObject(block.y + padding),
+                ]
+            ),
+            NameObject("/C"): ArrayObject([FloatObject(0), FloatObject(0), FloatObject(0)]),
+            NameObject("/IC"): ArrayObject([FloatObject(0), FloatObject(0), FloatObject(0)]),
+            NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
+            NameObject("/F"): NumberObject(4),
+        }
+    )
+    add_annotation_to_page(writer, page, redact_box)
+    write_pdf(writer, target)
+
+
 def validate_content_stream_replacement(original: str, replacement: str) -> tuple[str, str]:
     old_text = re.sub(r"\s+", " ", original or "").strip()
     new_text = replacement.strip()

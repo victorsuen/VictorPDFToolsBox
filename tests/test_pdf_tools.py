@@ -21,6 +21,7 @@ from pdf_core import (
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
     pdf_to_images,
+    redact_text_block_overlay,
     replace_text_block_content_stream,
     replace_text_block_overlay,
     remove_blank_pages,
@@ -101,6 +102,25 @@ class PdfToolsTests(unittest.TestCase):
 
         annots = PdfReader(str(target)).pages[0].get("/Annots")
         self.assertEqual(len(annots), 2)
+
+    def test_redact_text_block_overlay_adds_black_box(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        redact_text_block_overlay(
+            source,
+            target,
+            0,
+            TextBlock("Secret", 72, 300, 80, 24, 12, "/Helvetica"),
+        )
+
+        annot = PdfReader(str(target)).pages[0].get("/Annots")[0].get_object()
+        self.assertEqual(annot.get("/Subtype"), "/Square")
+        self.assertEqual(list(annot.get("/IC")), [0, 0, 0])
 
     def test_replace_text_block_content_stream_rewrites_simple_text(self):
         source = Path(self.temp_dir.name) / "source.pdf"

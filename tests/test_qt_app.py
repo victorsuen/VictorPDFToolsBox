@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from unittest.mock import patch
 
-from pypdf import PdfWriter
+from pypdf import PdfReader, PdfWriter
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -252,6 +252,21 @@ class QtAppTests(unittest.TestCase):
 
         window.find_next_text_edit_block()
         self.assertEqual(window.text_edit_block_list.currentRow(), 2)
+
+    def test_text_edit_redact_selected_block_writes_output(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [TextBlock("Secret", 72, 300, 80, 20, 12)]
+        window.refresh_text_edit_blocks()
+        window.text_edit_block_list.setCurrentRow(0)
+        target = Path(self.temp_dir.name) / "redacted.pdf"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch.object(window, "open_pdf_as_new_tab"):
+                window.redact_text_edit_pdf()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(len(PdfReader(str(target)).pages[0].get("/Annots")), 1)
 
     def test_output_preferences_default_enabled(self):
         window = VictorPdfToolsQt()

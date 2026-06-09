@@ -66,6 +66,7 @@ from pdf_core import (
     page_item_label,
     parse_pages,
     pdfium,
+    redact_text_block_overlay,
     remove_blank_pages,
     replace_text_block_content_stream,
     replace_text_block_overlay,
@@ -1259,9 +1260,11 @@ class VictorPdfToolsQt(QMainWindow):
 
         save_button = self.add_button(side_layout, "替換並另存 PDF", self.save_text_edit_pdf, "primary")
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        redact_button = self.add_button(side_layout, "遮蔽選取文字並另存", self.redact_text_edit_pdf)
+        redact_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
-            "Beta：覆蓋替換最穩定；直接改內容流只適合簡單英文/數字且新舊長度相同，"
+            "Beta：覆蓋替換最穩定；遮蔽會以黑框蓋住選取區塊；直接改內容流只適合簡單英文/數字且新舊長度相同，"
             "可保留原文字樣式。掃描 PDF 請先用 OCR 轉可搜尋 PDF。"
         )
         guide.setObjectName("muted")
@@ -1473,6 +1476,34 @@ class VictorPdfToolsQt(QMainWindow):
                 self.text_edit_password_input.text(),
             ),
             f"已替換文字並另存：{target_path.name}",
+            on_success=lambda: self.open_pdf_as_new_tab(target_path),
+        )
+
+    def redact_text_edit_pdf(self) -> None:
+        if self.text_edit_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        item = self.text_edit_block_list.currentItem()
+        if item is None:
+            self.set_status("請先選取要遮蔽的文字片段。")
+            return
+        block = item.data(Qt.UserRole)
+        if not isinstance(block, TextBlock):
+            self.set_status("請先選取有效的文字片段。")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "另存遮蔽 PDF", "redacted-text.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        self.run_pdf_job(
+            lambda: redact_text_block_overlay(
+                self.text_edit_pdf_path,
+                target_path,
+                int(self.text_edit_page_input.text() or "1") - 1,
+                block,
+                self.text_edit_password_input.text(),
+            ),
+            f"已遮蔽文字並另存：{target_path.name}",
             on_success=lambda: self.open_pdf_as_new_tab(target_path),
         )
 
