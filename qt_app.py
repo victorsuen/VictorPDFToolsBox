@@ -1339,23 +1339,42 @@ class VictorPdfToolsQt(QMainWindow):
         if not query:
             self.set_status("請輸入要搜尋的文字。")
             return
-        if not self.text_edit_blocks:
-            self.set_status("此頁沒有可搜尋的文字片段。")
+        if self.text_edit_pdf_path is None:
+            self.set_status("請先載入 PDF。")
             return
 
-        start = self.text_edit_block_list.currentRow() + 1
-        indexes = list(range(start, len(self.text_edit_blocks))) + list(range(0, max(start, 0)))
-        matches = [
-            index
-            for index in indexes
-            if query in self.text_edit_blocks[index].text.lower()
-        ]
-        if not matches:
-            self.set_status(f"找不到文字：{self.text_edit_search_input.text().strip()}")
+        current_page = min(max(int(self.text_edit_page_input.text() or "1"), 1), self.text_edit_page_count)
+        current_row = self.text_edit_block_list.currentRow()
+        page_blocks = self.text_edit_blocks
+        try:
+            for offset in range(self.text_edit_page_count):
+                page_number = ((current_page - 1 + offset) % self.text_edit_page_count) + 1
+                if offset == 0:
+                    blocks = page_blocks
+                    start = current_row + 1
+                else:
+                    blocks = extract_page_text_blocks(
+                        self.text_edit_pdf_path,
+                        page_number - 1,
+                        self.text_edit_password_input.text(),
+                    )
+                    start = 0
+                indexes = list(range(start, len(blocks))) + ([] if offset else list(range(0, max(start, 0))))
+                matches = [index for index in indexes if query in blocks[index].text.lower()]
+                if matches:
+                    if page_number != current_page:
+                        self.text_edit_page_input.setText(str(page_number))
+                        self.text_edit_blocks = blocks
+                        self.render_text_edit_preview()
+                        self.refresh_text_edit_blocks()
+                    self.text_edit_block_list.setCurrentRow(matches[0])
+                    total = sum(1 for block in blocks if query in block.text.lower())
+                    self.set_status(f"第 {page_number} 頁找到第 {matches[0] + 1} 個文字片段，共 {total} 個符合。")
+                    return
+        except Exception as exc:
+            self.show_error(exc)
             return
-        self.text_edit_block_list.setCurrentRow(matches[0])
-        total = sum(1 for block in self.text_edit_blocks if query in block.text.lower())
-        self.set_status(f"找到第 {matches[0] + 1} 個文字片段，共 {total} 個符合。")
+        self.set_status(f"找不到文字：{self.text_edit_search_input.text().strip()}")
 
     def render_text_edit_preview(self) -> None:
         if self.text_edit_pdf_path is None:
