@@ -9,6 +9,7 @@ from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSize, Qt, QTimer, Sig
 from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QComboBox,
     QDialog,
     QDialogButtonBox,
     QFileDialog,
@@ -25,6 +26,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSpinBox,
     QStatusBar,
     QTabWidget,
     QVBoxLayout,
@@ -32,15 +34,51 @@ from PySide6.QtWidgets import (
 )
 
 from pdf_core import (
+    IMAGE_SUFFIXES,
     PDF_RENDER_AVAILABLE,
+    PDF_SUFFIXES,
     PageItem,
+    add_page_numbers,
+    add_watermark,
+    clean_metadata,
+    compress_pdf,
+    decrypt_pdf,
+    delete_pdf_pages,
+    encrypt_pdf,
+    extract_pdf_pages,
+    extract_pdf_text,
+    images_to_pdf,
+    merge_pdf_files,
     open_reader,
     page_item_label,
     parse_pages,
     pdfium,
+    remove_blank_pages,
+    rotate_pdf_pages,
+    safe_output_name,
+    split_pdf_to_zip,
     write_page_items_merged,
     write_page_items_separately,
+    write_pdf_info,
 )
+
+TOOL_OPERATIONS = [
+    ("merge", "合併 PDF"),
+    ("split", "逐頁拆分 (ZIP)"),
+    ("extract", "抽取頁碼"),
+    ("delete", "刪除頁碼"),
+    ("rotate", "旋轉頁面"),
+    ("encrypt", "加密 PDF"),
+    ("decrypt", "解除密碼"),
+    ("compress", "基礎壓縮"),
+    ("extract_text", "抽取文字"),
+    ("images_to_pdf", "圖片轉 PDF"),
+    ("info", "PDF 資訊"),
+    ("add_page_numbers", "加頁碼 / Footer"),
+    ("watermark", "加水印 / 印章"),
+    ("remove_blank_pages", "刪除空白頁"),
+    ("clean_metadata", "清理 Metadata"),
+]
 
 
 THUMB_SIZE = QSize(195, 292)
@@ -463,6 +501,8 @@ class VictorPdfToolsQt(QMainWindow):
         self.page_items: list[PageItem] = []
         self.thumbnail_cache: dict[tuple[str, int, int], QIcon] = {}
         self.page_clipboard: list[PageItem] = []
+        self.tool_file_items: list[Path] = []
+        self._last_tool_status_message = ""
         self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
         self.stats_label = QLabel("總頁數：0　已選取：0")
@@ -640,18 +680,222 @@ class VictorPdfToolsQt(QMainWindow):
 
     def build_tools_tab(self) -> QWidget:
         tab = QWidget()
-        layout = QGridLayout(tab)
-        layout.setContentsMargins(18, 18, 18, 18)
-        title = QLabel("常用工具會逐步搬到 Qt 介面")
-        title.setObjectName("title")
-        title.setStyleSheet("font-size: 16pt;")
-        note = QLabel("這一版先重構最常用的頁面組織、旋轉、擷取流程。舊版 Tkinter 入口仍保留，可作為過渡。")
-        note.setObjectName("muted")
-        note.setWordWrap(True)
-        layout.addWidget(title, 0, 0)
-        layout.addWidget(note, 1, 0)
-        layout.setRowStretch(2, 1)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(10)
+
+        controls = QHBoxLayout()
+        self.add_button(controls, "加入 PDF", self.add_tool_pdf_files)
+        self.add_button(controls, "加入圖片", self.add_tool_image_files)
+        self.add_button(controls, "移除選取", self.remove_tool_files, "danger")
+        self.add_button(controls, "上移", lambda: self.move_tool_file(-1))
+        self.add_button(controls, "下移", lambda: self.move_tool_file(1))
+        self.add_button(controls, "清空", self.clear_tool_files, "danger")
+        controls.addStretch(1)
+        layout.addLayout(controls)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        self.tool_file_list = QListWidget()
+        self.tool_file_list.setSelectionMode(QListWidget.ExtendedSelection)
+        body.addWidget(self.tool_file_list, 1)
+
+        form = QFrame()
+        form.setObjectName("panel")
+        form.setFixedWidth(300)
+        form_layout = QVBoxLayout(form)
+        form_layout.setContentsMargins(14, 14, 14, 14)
+        form_layout.setSpacing(10)
+
+        form_layout.addWidget(QLabel("工具"))
+        self.tool_operation = QComboBox()
+        for slug, title in TOOL_OPERATIONS:
+            self.tool_operation.addItem(title, slug)
+        form_layout.addWidget(self.tool_operation)
+
+        form_layout.addWidget(QLabel("頁碼 / 範圍"))
+        self.tool_pages_input = QLineEdit()
+        self.tool_pages_input.setPlaceholderText("例如 1,3,5-8；旋轉留空代表全部")
+        form_layout.addWidget(self.tool_pages_input)
+
+        form_layout.addWidget(QLabel("原 PDF 密碼（如適用）"))
+        self.tool_password_input = QLineEdit()
+        self.tool_password_input.setEchoMode(QLineEdit.Password)
+        form_layout.addWidget(self.tool_password_input)
+
+        form_layout.addWidget(QLabel("新密碼（加密用）"))
+        self.tool_new_password_input = QLineEdit()
+        self.tool_new_password_input.setEchoMode(QLineEdit.Password)
+        form_layout.addWidget(self.tool_new_password_input)
+
+        form_layout.addWidget(QLabel("旋轉角度"))
+        self.tool_angle_input = QComboBox()
+        self.tool_angle_input.addItems(["90", "180", "270"])
+        form_layout.addWidget(self.tool_angle_input)
+
+        form_layout.addWidget(QLabel("文字 / 模板"))
+        self.tool_batch_text_input = QLineEdit("CONFIDENTIAL")
+        form_layout.addWidget(self.tool_batch_text_input)
+        template_hint = QLabel("頁碼模板可用 {page} / {total}")
+        template_hint.setObjectName("muted")
+        template_hint.setWordWrap(True)
+        form_layout.addWidget(template_hint)
+
+        form_layout.addWidget(QLabel("空白頁靈敏度"))
+        self.tool_blank_threshold = QSpinBox()
+        self.tool_blank_threshold.setRange(1, 1000)
+        self.tool_blank_threshold.setValue(25)
+        form_layout.addWidget(self.tool_blank_threshold)
+
+        run_button = self.add_button(form_layout, "處理並另存", self.run_tool_operation, "primary")
+        run_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        hint = QLabel("提示：合併 / 圖片轉 PDF 可加入多個檔案；其餘工具使用清單第一個 PDF。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        form_layout.addWidget(hint)
+        form_layout.addStretch(1)
+        body.addWidget(form)
+        layout.addLayout(body, 1)
         return tab
+
+    def refresh_tool_file_list(self) -> None:
+        self.tool_file_list.clear()
+        for path in self.tool_file_items:
+            self.tool_file_list.addItem(str(path))
+
+    def add_tool_files_from_paths(self, paths: list[Path], allowed_suffixes: set[str]) -> None:
+        added = 0
+        skipped = 0
+        for path in paths:
+            if path.is_file() and path.suffix.lower() in allowed_suffixes:
+                self.tool_file_items.append(path)
+                added += 1
+            else:
+                skipped += 1
+        self.refresh_tool_file_list()
+        if skipped:
+            self.set_status(f"已加入 {added} 個檔案，略過 {skipped} 個不支援項目。")
+        elif added:
+            self.set_status(f"已加入 {added} 個檔案。")
+
+    def add_tool_pdf_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "加入 PDF", "", "PDF files (*.pdf)")
+        self.add_tool_files_from_paths([Path(path) for path in files], PDF_SUFFIXES)
+
+    def add_tool_image_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self,
+            "加入圖片",
+            "",
+            "Image files (*.jpg *.jpeg *.png *.bmp *.tif *.tiff *.webp)",
+        )
+        self.add_tool_files_from_paths([Path(path) for path in files], IMAGE_SUFFIXES)
+
+    def remove_tool_files(self) -> None:
+        for index in sorted((self.tool_file_list.row(item) for item in self.tool_file_list.selectedItems()), reverse=True):
+            self.tool_file_items.pop(index)
+        self.refresh_tool_file_list()
+
+    def move_tool_file(self, direction: int) -> None:
+        selected = sorted(self.tool_file_list.row(item) for item in self.tool_file_list.selectedItems())
+        if len(selected) != 1:
+            self.set_status("請選取一個檔案來上移或下移。")
+            return
+        source = selected[0]
+        target = source + direction
+        if target < 0 or target >= len(self.tool_file_items):
+            return
+        item = self.tool_file_items.pop(source)
+        self.tool_file_items.insert(target, item)
+        self.refresh_tool_file_list()
+        self.tool_file_list.item(target).setSelected(True)
+
+    def clear_tool_files(self) -> None:
+        self.tool_file_items.clear()
+        self.refresh_tool_file_list()
+
+    def run_tool_operation(self) -> None:
+        if not self.tool_file_items:
+            self.set_status("請先加入檔案。")
+            return
+        operation = self.tool_operation.currentData()
+        password = self.tool_password_input.text()
+        source = self.tool_file_items[0]
+        extension = ".txt" if operation in {"extract_text", "info"} else ".pdf"
+        if operation == "split":
+            extension = ".zip"
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "另存輸出檔案",
+            safe_output_name(f"{operation}{extension}"),
+            f"Output files (*{extension})",
+        )
+        if not target:
+            return
+        target_path = Path(target)
+
+        self.run_pdf_job(
+            lambda: self._execute_tool_operation(operation, source, target_path, password),
+            "",
+            on_success=lambda: self.set_status(self._last_tool_status_message),
+        )
+
+    def _execute_tool_operation(self, operation: str, source: Path, target_path: Path, password: str) -> None:
+        if operation == "merge":
+            merge_pdf_files(self.tool_file_items, target_path, password)
+            self._last_tool_status_message = f"已合併 {len(self.tool_file_items)} 個 PDF。"
+            return
+        if operation == "split":
+            page_count = split_pdf_to_zip(source, target_path, password)
+            self._last_tool_status_message = f"已拆分 {page_count} 頁並打包成 ZIP。"
+            return
+        if operation == "images_to_pdf":
+            images_to_pdf(self.tool_file_items, target_path)
+            self._last_tool_status_message = f"已把 {len(self.tool_file_items)} 張圖片轉成 PDF。"
+            return
+        if operation == "extract":
+            extract_pdf_pages(source, target_path, self.tool_pages_input.text(), password)
+        elif operation == "delete":
+            delete_pdf_pages(source, target_path, self.tool_pages_input.text(), password)
+        elif operation == "rotate":
+            rotate_pdf_pages(
+                source,
+                target_path,
+                int(self.tool_angle_input.currentText()),
+                self.tool_pages_input.text(),
+                password,
+            )
+        elif operation == "encrypt":
+            encrypt_pdf(source, target_path, self.tool_new_password_input.text(), password)
+        elif operation == "decrypt":
+            decrypt_pdf(source, target_path, password)
+        elif operation == "compress":
+            compress_pdf(source, target_path, password)
+        elif operation == "extract_text":
+            extract_pdf_text(source, target_path, password)
+        elif operation == "info":
+            write_pdf_info(source, target_path, password)
+        elif operation == "add_page_numbers":
+            template = self.tool_batch_text_input.text().strip() or "Page {page} of {total}"
+            add_page_numbers(source, target_path, template, password)
+        elif operation == "watermark":
+            add_watermark(source, target_path, self.tool_batch_text_input.text(), password)
+        elif operation == "remove_blank_pages":
+            removed = remove_blank_pages(
+                source,
+                target_path,
+                threshold=self.tool_blank_threshold.value(),
+                password=password,
+            )
+            self._last_tool_status_message = f"已移除 {removed} 頁空白頁。"
+            return
+        elif operation == "clean_metadata":
+            clean_metadata(source, target_path, password)
+        else:
+            raise ValueError(f"未知工具：{operation}")
+        self._last_tool_status_message = f"已完成：{self.tool_operation.currentText()}"
 
     def add_button(self, layout, text: str, callback, kind: str | None = None) -> QPushButton:
         button = QPushButton(text)
@@ -1056,7 +1300,8 @@ class VictorPdfToolsQt(QMainWindow):
         else:
             if on_success is not None:
                 on_success()
-            self.set_status(success_message)
+            if success_message:
+                self.set_status(success_message)
         finally:
             QApplication.restoreOverrideCursor()
 

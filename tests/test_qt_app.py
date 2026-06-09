@@ -190,6 +190,13 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(dialog.source_list.count(), 1)
         self.assertEqual(dialog.source_list.item(0).text().split("\n", 1)[0], "second.pdf")
 
+    def test_tool_tab_accepts_pdf_files(self):
+        window = VictorPdfToolsQt()
+        window.add_tool_files_from_paths([self.source], {".pdf"})
+
+        self.assertEqual(len(window.tool_file_items), 1)
+        self.assertEqual(window.tool_file_list.count(), 1)
+
     def test_merge_dialog_undo_restores_removed_source(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])

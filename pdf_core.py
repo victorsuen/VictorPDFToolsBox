@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import re
+import tempfile
+import zipfile
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
 
+from PIL import Image
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import (
+    ArrayObject,
+    DictionaryObject,
+    FloatObject,
+    NameObject,
+    NumberObject,
+    TextStringObject,
+)
 
 try:
     import pypdfium2 as pdfium
@@ -14,6 +25,9 @@ try:
 except Exception:
     pdfium = None
     PDF_RENDER_AVAILABLE = False
+
+PDF_SUFFIXES = {".pdf"}
+IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 
 
 @dataclass(frozen=True)
@@ -116,3 +130,313 @@ def write_page_items_separately(page_items: list[PageItem], indexes: list[int], 
         filename = safe_output_name(f"{output_index:03d}-{item.pdf_path.stem}-page-{item.page_index + 1}.pdf")
         write_pdf(writer, folder / filename)
     return len(indexes)
+
+
+def merge_pdf_files(paths: list[Path], target: Path, password: str = "") -> None:
+    if len(paths) < 2:
+        raise ValueError("合併 PDF 至少需要兩個檔案。")
+    writer = PdfWriter()
+    for path in paths:
+        reader = open_reader(path, password)
+        for page in reader.pages:
+            writer.add_page(page)
+    write_pdf(writer, target)
+
+
+def split_pdf_to_zip(source: Path, target_zip: Path, password: str = "") -> int:
+    reader = open_reader(source, password)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        generated: list[Path] = []
+        for index, page in enumerate(reader.pages, start=1):
+            writer = PdfWriter()
+            writer.add_page(page)
+            part = temp_path / f"page-{index:04d}.pdf"
+            write_pdf(writer, part)
+            generated.append(part)
+        with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in generated:
+                archive.write(item, item.name)
+    return len(reader.pages)
+
+
+def extract_pdf_pages(source: Path, target: Path, pages_spec: str, password: str = "") -> None:
+    reader = open_reader(source, password)
+    pages = parse_pages(pages_spec, len(reader.pages))
+    writer = PdfWriter()
+    for index in pages:
+        writer.add_page(reader.pages[index])
+    write_pdf(writer, target)
+
+
+def delete_pdf_pages(source: Path, target: Path, pages_spec: str, password: str = "") -> None:
+    reader = open_reader(source, password)
+    delete_pages = set(parse_pages(pages_spec, len(reader.pages)))
+    writer = PdfWriter()
+    for index, page in enumerate(reader.pages):
+        if index not in delete_pages:
+            writer.add_page(page)
+    if not writer.pages:
+        raise ValueError("不能刪除全部頁面。")
+    write_pdf(writer, target)
+
+
+def rotate_pdf_pages(source: Path, target: Path, angle: int, pages_spec: str = "", password: str = "") -> None:
+    if angle not in {90, 180, 270}:
+        raise ValueError("旋轉角度只支援 90、180、270。")
+    reader = open_reader(source, password)
+    rotate_pages = set(parse_pages(pages_spec, len(reader.pages))) if pages_spec.strip() else set(range(len(reader.pages)))
+    writer = PdfWriter()
+    for index, page in enumerate(reader.pages):
+        if index in rotate_pages:
+            page.rotate(angle)
+        writer.add_page(page)
+    write_pdf(writer, target)
+
+
+def encrypt_pdf(source: Path, target: Path, new_password: str, password: str = "") -> None:
+    if not new_password:
+        raise ValueError("請輸入新密碼。")
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    writer.encrypt(new_password)
+    write_pdf(writer, target)
+
+
+def decrypt_pdf(source: Path, target: Path, password: str = "") -> None:
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    write_pdf(writer, target)
+
+
+def compress_pdf(source: Path, target: Path, password: str = "") -> None:
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    for page in reader.pages:
+        page.compress_content_streams()
+        writer.add_page(page)
+    write_pdf(writer, target)
+
+
+def extract_pdf_text(source: Path, target: Path, password: str = "") -> None:
+    reader = open_reader(source, password)
+    pieces = []
+    for index, page in enumerate(reader.pages, start=1):
+        text = page.extract_text() or ""
+        pieces.append(f"--- Page {index} ---\n{text.strip()}\n")
+    target.write_text("\n".join(pieces), encoding="utf-8")
+
+
+def write_pdf_info(source: Path, target: Path, password: str = "") -> None:
+    reader = open_reader(source, password)
+    metadata = reader.metadata or {}
+    lines = [
+        "Victor PDF Tools Box - PDF Info",
+        f"File: {source.name}",
+        f"Pages: {len(reader.pages)}",
+        f"Encrypted: {reader.is_encrypted}",
+        "",
+        "Metadata:",
+    ]
+    for key, value in metadata.items():
+        lines.append(f"{key}: {value}")
+    target.write_text("\n".join(lines), encoding="utf-8")
+
+
+def images_to_pdf(paths: list[Path], target: Path) -> None:
+    if not paths:
+        raise ValueError("請選擇圖片。")
+    converted: list[Image.Image] = []
+    for image_path in paths:
+        image = Image.open(image_path)
+        if image.mode in {"RGBA", "P"}:
+            image = image.convert("RGB")
+        converted.append(image)
+    first, rest = converted[0], converted[1:]
+    first.save(target, save_all=True, append_images=rest, resolution=150.0)
+    for image in converted:
+        image.close()
+
+
+def add_annotation_to_page(writer: PdfWriter, page, annotation: DictionaryObject) -> None:
+    annotation_ref = writer._add_object(annotation)
+    if "/Annots" not in page:
+        page[NameObject("/Annots")] = ArrayObject()
+    page["/Annots"].append(annotation_ref)
+
+
+def add_text_overlay_annotation(
+    source: Path,
+    target: Path,
+    page_index: int,
+    x: float,
+    y: float,
+    text: str,
+    font_size: int,
+    cover_original: bool,
+    cover_width: float,
+    cover_height: float,
+    password: str = "",
+) -> None:
+    reader = open_reader(source, password)
+    if page_index < 0 or page_index >= len(reader.pages):
+        raise ValueError("頁碼超出範圍。")
+    if not text.strip():
+        raise ValueError("請輸入要加入的文字。")
+
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    page = writer.pages[page_index]
+    text_height = max(float(font_size) * 1.8, 24.0)
+    rect_width = max(float(cover_width), 80.0)
+    rect_height = max(float(cover_height), text_height)
+
+    if cover_original:
+        cover = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/Square"),
+                NameObject("/Rect"): ArrayObject(
+                    [
+                        FloatObject(x),
+                        FloatObject(y - 4),
+                        FloatObject(x + rect_width),
+                        FloatObject(y + rect_height),
+                    ]
+                ),
+                NameObject("/C"): ArrayObject([FloatObject(1), FloatObject(1), FloatObject(1)]),
+                NameObject("/IC"): ArrayObject([FloatObject(1), FloatObject(1), FloatObject(1)]),
+                NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        add_annotation_to_page(writer, page, cover)
+
+    free_text = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/FreeText"),
+            NameObject("/Rect"): ArrayObject(
+                [
+                    FloatObject(x),
+                    FloatObject(y),
+                    FloatObject(x + rect_width),
+                    FloatObject(y + rect_height),
+                ]
+            ),
+            NameObject("/Contents"): TextStringObject(text),
+            NameObject("/DA"): TextStringObject(f"/Helv {font_size} Tf 0 0 0 rg"),
+            NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
+            NameObject("/F"): NumberObject(4),
+        }
+    )
+    add_annotation_to_page(writer, page, free_text)
+    write_pdf(writer, target)
+
+
+def add_page_numbers(source: Path, target: Path, template: str = "Page {page} of {total}", password: str = "") -> None:
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    total = len(writer.pages)
+    for index, page in enumerate(writer.pages, start=1):
+        width = float(page.mediabox.width)
+        text = template.format(page=index, total=total)
+        rect_width = max(160.0, len(text) * 7.0)
+        x = max((width - rect_width) / 2, 24.0)
+        annotation = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/FreeText"),
+                NameObject("/Rect"): ArrayObject(
+                    [FloatObject(x), FloatObject(20), FloatObject(x + rect_width), FloatObject(42)]
+                ),
+                NameObject("/Contents"): TextStringObject(text),
+                NameObject("/DA"): TextStringObject("/Helv 10 Tf 0.25 0.25 0.25 rg"),
+                NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        add_annotation_to_page(writer, page, annotation)
+    write_pdf(writer, target)
+
+
+def add_watermark(source: Path, target: Path, text: str, password: str = "") -> None:
+    if not text.strip():
+        raise ValueError("請輸入水印 / 印章文字。")
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    for page in writer.pages:
+        width = float(page.mediabox.width)
+        height = float(page.mediabox.height)
+        rect_width = min(max(len(text) * 18.0, 240.0), max(width - 72.0, 180.0))
+        rect_height = 70.0
+        x = max((width - rect_width) / 2, 24.0)
+        y = max((height - rect_height) / 2, 24.0)
+        annotation = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/FreeText"),
+                NameObject("/Rect"): ArrayObject(
+                    [FloatObject(x), FloatObject(y), FloatObject(x + rect_width), FloatObject(y + rect_height)]
+                ),
+                NameObject("/Contents"): TextStringObject(text),
+                NameObject("/DA"): TextStringObject("/Helv 34 Tf 0.75 0.75 0.75 rg"),
+                NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        add_annotation_to_page(writer, page, annotation)
+    write_pdf(writer, target)
+
+
+def rendered_page_is_blank(page, threshold: int) -> bool:
+    if not PDF_RENDER_AVAILABLE or pdfium is None:
+        raise ValueError("刪除空白頁需要 pypdfium2 預覽元件。")
+    bitmap = page.render(scale=0.15)
+    image = bitmap.to_pil().convert("L")
+    non_white = 0
+    for pixel in image.getdata():
+        if pixel < 245:
+            non_white += 1
+            if non_white > threshold:
+                return False
+    return True
+
+
+def remove_blank_pages(source: Path, target: Path, threshold: int = 25, password: str = "") -> int:
+    reader = open_reader(source, password)
+    document = pdfium.PdfDocument(str(source), password=password or None) if pdfium is not None else None
+    writer = PdfWriter()
+    removed = 0
+    try:
+        for index, source_page in enumerate(reader.pages):
+            rendered_page = document.get_page(index)
+            try:
+                is_blank = rendered_page_is_blank(rendered_page, threshold)
+            finally:
+                rendered_page.close()
+            if is_blank:
+                removed += 1
+            else:
+                writer.add_page(source_page)
+    finally:
+        if document is not None:
+            document.close()
+    if not writer.pages:
+        raise ValueError("所有頁面都被判定為空白，已取消輸出。")
+    write_pdf(writer, target)
+    return removed
+
+
+def clean_metadata(source: Path, target: Path, password: str = "") -> None:
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    writer.add_metadata({"/Producer": "Victor PDF Tools Box"})
+    write_pdf(writer, target)

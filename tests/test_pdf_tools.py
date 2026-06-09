@@ -4,15 +4,15 @@ import unittest
 from pypdf import PdfReader, PdfWriter
 
 from app import copy_pages, parse_pages
-from desktop_app import (
+from pdf_core import (
+    PageItem,
     add_page_numbers,
     add_text_overlay_annotation,
     add_watermark,
     clean_metadata,
+    merge_pdf_files,
     remove_blank_pages,
-)
-from pdf_core import (
-    PageItem,
+    split_pdf_to_zip,
     write_page_items_merged,
     write_page_items_separately,
 )
@@ -143,6 +143,34 @@ class PdfToolsTests(unittest.TestCase):
         write_page_items_merged(page_items, [0], target)
 
         self.assertEqual(PdfReader(str(target)).pages[0].get("/Rotate"), 90)
+
+    def test_merge_pdf_files(self):
+        first = Path(self.temp_dir.name) / "first.pdf"
+        second = Path(self.temp_dir.name) / "second.pdf"
+        target = Path(self.temp_dir.name) / "merged.pdf"
+        for path in (first, second):
+            writer = PdfWriter()
+            writer.add_blank_page(width=300, height=400)
+            with path.open("wb") as stream:
+                writer.write(stream)
+
+        merge_pdf_files([first, second], target)
+
+        self.assertEqual(len(PdfReader(str(target)).pages), 2)
+
+    def test_split_pdf_to_zip(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "split.zip"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        page_count = split_pdf_to_zip(source, target)
+
+        self.assertEqual(page_count, 2)
+        self.assertTrue(target.exists())
 
     def test_write_page_items_separately(self):
         source = Path(self.temp_dir.name) / "source.pdf"
