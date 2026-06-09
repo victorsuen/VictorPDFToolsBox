@@ -1230,6 +1230,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_search_input = QLineEdit()
         self.text_edit_search_input.setPlaceholderText("輸入要尋找的文字")
         self.text_edit_search_input.returnPressed.connect(self.find_next_text_edit_block)
+        self.text_edit_search_input.textChanged.connect(lambda _text: self.update_text_edit_preview(self.current_text_edit_block()))
         search_row.addWidget(self.text_edit_search_input, 1)
         self.add_button(search_row, "上一個", self.find_previous_text_edit_block)
         self.add_button(search_row, "下一個", self.find_next_text_edit_block)
@@ -1422,19 +1423,37 @@ class VictorPdfToolsQt(QMainWindow):
         )
         self.update_text_edit_preview(block)
 
+    def current_text_edit_block(self) -> TextBlock | None:
+        item = self.text_edit_block_list.currentItem()
+        if item is None:
+            return None
+        block = item.data(Qt.UserRole)
+        return block if isinstance(block, TextBlock) else None
+
     def update_text_edit_preview(self, selected_block: TextBlock | None = None) -> None:
         if self.text_edit_preview_image is None:
             self.text_edit_preview_label.clear()
             return
         image = self.text_edit_preview_image.copy()
+        reader = open_reader(self.text_edit_pdf_path, self.text_edit_password_input.text())
+        page = reader.pages[int(self.text_edit_page_input.text() or "1") - 1]
+        page_width = float(page.mediabox.width)
+        page_height = float(page.mediabox.height)
+        draw = ImageDraw.Draw(image)
+        scale_x = image.width / page_width
+        scale_y = image.height / page_height
+
+        query = self.text_edit_search_input.text().strip().lower()
+        if query:
+            for block in self.text_edit_blocks:
+                if query in block.text.lower():
+                    left = block.x * scale_x
+                    bottom = image.height - block.y * scale_y
+                    top = bottom - block.height * scale_y
+                    right = left + block.width * scale_x
+                    draw.rectangle((left, top, right, bottom), outline="#f97316", width=2)
+
         if selected_block is not None:
-            reader = open_reader(self.text_edit_pdf_path, self.text_edit_password_input.text())
-            page = reader.pages[int(self.text_edit_page_input.text() or "1") - 1]
-            page_width = float(page.mediabox.width)
-            page_height = float(page.mediabox.height)
-            draw = ImageDraw.Draw(image)
-            scale_x = image.width / page_width
-            scale_y = image.height / page_height
             left = selected_block.x * scale_x
             bottom = image.height - selected_block.y * scale_y
             top = bottom - selected_block.height * scale_y
