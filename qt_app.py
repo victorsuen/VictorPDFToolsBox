@@ -75,6 +75,7 @@ from pdf_core import (
     rotate_pdf_pages,
     safe_output_name,
     split_pdf_to_zip,
+    text_matches_query,
     write_page_items_merged,
     write_page_items_separately,
     write_pdf_info,
@@ -1235,6 +1236,19 @@ class VictorPdfToolsQt(QMainWindow):
         self.add_button(search_row, "上一個", self.find_previous_text_edit_block)
         self.add_button(search_row, "下一個", self.find_next_text_edit_block)
         side_layout.addLayout(search_row)
+        search_options_row = QHBoxLayout()
+        self.text_edit_case_sensitive_checkbox = QCheckBox("區分大小寫")
+        self.text_edit_case_sensitive_checkbox.toggled.connect(
+            lambda _checked: self.update_text_edit_preview(self.current_text_edit_block())
+        )
+        search_options_row.addWidget(self.text_edit_case_sensitive_checkbox)
+        self.text_edit_whole_word_checkbox = QCheckBox("全字匹配")
+        self.text_edit_whole_word_checkbox.toggled.connect(
+            lambda _checked: self.update_text_edit_preview(self.current_text_edit_block())
+        )
+        search_options_row.addWidget(self.text_edit_whole_word_checkbox)
+        search_options_row.addStretch(1)
+        side_layout.addLayout(search_options_row)
 
         side_layout.addWidget(QLabel("偵測到的文字片段"))
         self.text_edit_block_list = QListWidget()
@@ -1346,7 +1360,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.find_text_edit_block(direction=-1)
 
     def find_text_edit_block(self, direction: int = 1) -> None:
-        query = self.text_edit_search_input.text().strip().lower()
+        query = self.text_edit_search_input.text().strip()
         if not query:
             self.set_status("請輸入要搜尋的文字。")
             return
@@ -1374,7 +1388,7 @@ class VictorPdfToolsQt(QMainWindow):
                         self.text_edit_password_input.text(),
                     )
                     indexes = list(range(len(blocks))) if direction > 0 else list(range(len(blocks) - 1, -1, -1))
-                matches = [index for index in indexes if query in blocks[index].text.lower()]
+                matches = [index for index in indexes if self.text_edit_block_matches_query(blocks[index], query)]
                 if matches:
                     if page_number != current_page:
                         self.text_edit_page_input.setText(str(page_number))
@@ -1382,13 +1396,21 @@ class VictorPdfToolsQt(QMainWindow):
                         self.render_text_edit_preview()
                         self.refresh_text_edit_blocks()
                     self.text_edit_block_list.setCurrentRow(matches[0])
-                    total = sum(1 for block in blocks if query in block.text.lower())
+                    total = sum(1 for block in blocks if self.text_edit_block_matches_query(block, query))
                     self.set_status(f"第 {page_number} 頁找到第 {matches[0] + 1} 個文字片段，共 {total} 個符合。")
                     return
         except Exception as exc:
             self.show_error(exc)
             return
         self.set_status(f"找不到文字：{self.text_edit_search_input.text().strip()}")
+
+    def text_edit_block_matches_query(self, block: TextBlock, query: str) -> bool:
+        return text_matches_query(
+            block.text,
+            query,
+            self.text_edit_case_sensitive_checkbox.isChecked(),
+            self.text_edit_whole_word_checkbox.isChecked(),
+        )
 
     def render_text_edit_preview(self) -> None:
         if self.text_edit_pdf_path is None:
@@ -1443,10 +1465,10 @@ class VictorPdfToolsQt(QMainWindow):
         scale_x = image.width / page_width
         scale_y = image.height / page_height
 
-        query = self.text_edit_search_input.text().strip().lower()
+        query = self.text_edit_search_input.text().strip()
         if query:
             for block in self.text_edit_blocks:
-                if query in block.text.lower():
+                if self.text_edit_block_matches_query(block, query):
                     left = block.x * scale_x
                     bottom = image.height - block.y * scale_y
                     top = bottom - block.height * scale_y
@@ -1588,6 +1610,8 @@ class VictorPdfToolsQt(QMainWindow):
                 target_path,
                 query,
                 self.text_edit_password_input.text(),
+                self.text_edit_case_sensitive_checkbox.isChecked(),
+                self.text_edit_whole_word_checkbox.isChecked(),
             )
 
         self.run_pdf_job(

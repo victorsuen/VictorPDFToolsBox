@@ -28,6 +28,7 @@ from pdf_core import (
     replace_text_block_overlay,
     remove_blank_pages,
     split_pdf_to_zip,
+    text_matches_query,
     write_page_items_merged,
     write_page_items_separately,
 )
@@ -144,6 +145,13 @@ class PdfToolsTests(unittest.TestCase):
         self.assertEqual(count, 2)
         self.assertEqual(len(reader.pages[0].get("/Annots")), 1)
         self.assertEqual(len(reader.pages[1].get("/Annots")), 1)
+
+    def test_text_matches_query_supports_case_and_whole_word(self):
+        self.assertTrue(text_matches_query("Invoice Number", "invoice"))
+        self.assertFalse(text_matches_query("Invoice Number", "invoice", case_sensitive=True))
+        self.assertTrue(text_matches_query("Invoice Number", "Invoice", case_sensitive=True))
+        self.assertTrue(text_matches_query("Invoice Number", "Invoice", whole_word=True))
+        self.assertFalse(text_matches_query("InvoiceNumber", "Invoice", whole_word=True))
 
     def test_redact_text_block_secure_removes_simple_text_and_adds_black_box(self):
         source = Path(self.temp_dir.name) / "source.pdf"

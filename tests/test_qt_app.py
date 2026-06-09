@@ -225,6 +225,8 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.text_edit_mode_combo.itemData(1), "content_stream")
         self.assertEqual(window.text_edit_redaction_mode_combo.currentData(), "visual")
         self.assertEqual(window.text_edit_redaction_mode_combo.itemData(1), "secure")
+        self.assertFalse(window.text_edit_case_sensitive_checkbox.isChecked())
+        self.assertFalse(window.text_edit_whole_word_checkbox.isChecked())
 
     def test_text_edit_preview_click_selects_block(self):
         window = VictorPdfToolsQt()
@@ -273,6 +275,35 @@ class QtAppTests(unittest.TestCase):
 
         self.assertIsNotNone(window.text_edit_preview_label.pixmap())
         self.assertFalse(window.text_edit_preview_label.pixmap().isNull())
+
+    def test_text_edit_search_respects_case_sensitive_option(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [TextBlock("Invoice Number", 72, 320, 100, 20, 12)]
+        window.refresh_text_edit_blocks()
+        window.text_edit_search_input.setText("invoice")
+        window.text_edit_case_sensitive_checkbox.setChecked(True)
+
+        window.find_next_text_edit_block()
+        self.assertEqual(window.text_edit_block_list.currentRow(), -1)
+
+        window.text_edit_search_input.setText("Invoice")
+        window.find_next_text_edit_block()
+        self.assertEqual(window.text_edit_block_list.currentRow(), 0)
+
+    def test_text_edit_search_respects_whole_word_option(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("InvoiceNumber", 72, 320, 100, 20, 12),
+            TextBlock("Invoice Number", 72, 290, 100, 20, 12),
+        ]
+        window.refresh_text_edit_blocks()
+        window.text_edit_search_input.setText("invoice")
+        window.text_edit_whole_word_checkbox.setChecked(True)
+
+        window.find_next_text_edit_block()
+        self.assertEqual(window.text_edit_block_list.currentRow(), 1)
 
     def test_text_edit_search_moves_to_next_page_match(self):
         window = VictorPdfToolsQt()
@@ -324,6 +355,8 @@ class QtAppTests(unittest.TestCase):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)
         window.text_edit_search_input.setText("invoice")
+        window.text_edit_case_sensitive_checkbox.setChecked(True)
+        window.text_edit_whole_word_checkbox.setChecked(True)
         target = Path(self.temp_dir.name) / "redacted-all.pdf"
 
         with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
@@ -336,6 +369,8 @@ class QtAppTests(unittest.TestCase):
             target,
             "invoice",
             "",
+            True,
+            True,
         )
 
     def test_output_preferences_default_enabled(self):

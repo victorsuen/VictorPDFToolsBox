@@ -438,9 +438,10 @@ def redact_matching_text_blocks_overlay(
     target: Path,
     query: str,
     password: str = "",
+    case_sensitive: bool = False,
+    whole_word: bool = False,
 ) -> int:
-    normalized_query = (query or "").strip().lower()
-    if not normalized_query:
+    if not (query or "").strip():
         raise ValueError("請輸入要批量遮蔽的搜尋文字。")
 
     reader = open_reader(source, password)
@@ -450,13 +451,26 @@ def redact_matching_text_blocks_overlay(
     for page_index, page in enumerate(writer.pages):
         blocks = extract_page_text_blocks(source, page_index, password)
         for block in blocks:
-            if normalized_query in block.text.lower():
+            if text_matches_query(block.text, query, case_sensitive, whole_word):
                 add_annotation_to_page(writer, page, redaction_annotation_for_block(block))
                 match_count += 1
     if match_count == 0:
         raise ValueError(f"找不到要遮蔽的文字：{query.strip()}")
     write_pdf(writer, target)
     return match_count
+
+
+def text_matches_query(text: str, query: str, case_sensitive: bool = False, whole_word: bool = False) -> bool:
+    needle = (query or "").strip()
+    if not needle:
+        return False
+    haystack = text or ""
+    if whole_word:
+        flags = 0 if case_sensitive else re.IGNORECASE
+        return re.search(rf"(?<!\w){re.escape(needle)}(?!\w)", haystack, flags) is not None
+    if case_sensitive:
+        return needle in haystack
+    return needle.lower() in haystack.lower()
 
 
 def validate_content_stream_replacement(original: str, replacement: str) -> tuple[str, str]:
