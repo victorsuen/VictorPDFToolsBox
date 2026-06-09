@@ -227,6 +227,7 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.text_edit_redaction_mode_combo.itemData(1), "secure")
         self.assertFalse(window.text_edit_case_sensitive_checkbox.isChecked())
         self.assertFalse(window.text_edit_whole_word_checkbox.isChecked())
+        self.assertIn("替換限制", window.text_edit_replacement_hint.text())
 
     def test_text_edit_preview_click_selects_block(self):
         window = VictorPdfToolsQt()
@@ -302,6 +303,20 @@ class QtAppTests(unittest.TestCase):
         )
 
         self.assertGreater(right - left, block.width)
+
+    def test_text_edit_replacement_hint_reports_content_stream_limits(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [TextBlock("Old", 72, 320, 30, 20, 12, "/Helvetica")]
+        window.refresh_text_edit_blocks()
+        window.text_edit_block_list.setCurrentRow(0)
+        window.text_edit_mode_combo.setCurrentIndex(1)
+
+        window.text_edit_replacement_input.setPlainText("Long")
+        self.assertIn("長度不同", window.text_edit_replacement_hint.text())
+
+        window.text_edit_replacement_input.setPlainText("New")
+        self.assertIn("可嘗試", window.text_edit_replacement_hint.text())
 
     def test_text_edit_search_respects_case_sensitive_option(self):
         window = VictorPdfToolsQt()

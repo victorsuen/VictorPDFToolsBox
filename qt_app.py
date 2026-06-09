@@ -1267,13 +1267,22 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_replacement_input.textChanged.connect(
             lambda: self.update_text_edit_preview(self.current_text_edit_block())
         )
+        self.text_edit_replacement_input.textChanged.connect(self.update_text_edit_replacement_hint)
         side_layout.addWidget(self.text_edit_replacement_input)
 
         side_layout.addWidget(QLabel("替換方式"))
         self.text_edit_mode_combo = QComboBox()
         self.text_edit_mode_combo.addItem("覆蓋替換（最穩定）", "overlay")
         self.text_edit_mode_combo.addItem("直接改內容流（實驗：英文/數字同長度）", "content_stream")
+        self.text_edit_mode_combo.currentIndexChanged.connect(
+            lambda _index: self.update_text_edit_replacement_hint()
+        )
         side_layout.addWidget(self.text_edit_mode_combo)
+
+        self.text_edit_replacement_hint = QLabel("選取文字片段後會顯示替換限制。")
+        self.text_edit_replacement_hint.setObjectName("muted")
+        self.text_edit_replacement_hint.setWordWrap(True)
+        side_layout.addWidget(self.text_edit_replacement_hint)
 
         side_layout.addWidget(QLabel("遮蔽方式"))
         self.text_edit_redaction_mode_combo = QComboBox()
@@ -1447,6 +1456,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_block_info.setText(
             f"位置 X {block.x:.1f}, Y {block.y:.1f}；估計字體大小 {block.font_size:.1f}；字型 {block.font_name or '未知'}"
         )
+        self.update_text_edit_replacement_hint()
         self.update_text_edit_preview(block)
 
     def current_text_edit_block(self) -> TextBlock | None:
@@ -1455,6 +1465,31 @@ class VictorPdfToolsQt(QMainWindow):
             return None
         block = item.data(Qt.UserRole)
         return block if isinstance(block, TextBlock) else None
+
+    def update_text_edit_replacement_hint(self) -> None:
+        block = self.current_text_edit_block()
+        if block is None:
+            self.text_edit_replacement_hint.setText("選取文字片段後會顯示替換限制。")
+            return
+        original = block.text.strip()
+        replacement = self.text_edit_replacement_input.toPlainText().strip()
+        original_length = len(original)
+        replacement_length = len(replacement)
+        if (self.text_edit_mode_combo.currentData() or "overlay") != "content_stream":
+            self.text_edit_replacement_hint.setText(
+                f"覆蓋替換：原文 {original_length} 字，新文字 {replacement_length} 字，可不同長度。"
+            )
+            return
+        is_ascii = all(32 <= ord(char) <= 126 for char in original + replacement)
+        if not replacement:
+            message = "直接改內容流：請輸入替換文字；目前只支援半形英文/數字且新舊同長度。"
+        elif not is_ascii:
+            message = "直接改內容流：目前只支援半形英文、數字和符號；中文請用覆蓋替換。"
+        elif original_length != replacement_length:
+            message = f"直接改內容流：長度不同（原文 {original_length} 字，新文字 {replacement_length} 字），請改同長度或使用覆蓋替換。"
+        else:
+            message = f"直接改內容流：長度相同（{original_length} 字），可嘗試保留原樣式直接修改。"
+        self.text_edit_replacement_hint.setText(message)
 
     def update_text_edit_preview(self, selected_block: TextBlock | None = None) -> None:
         if self.text_edit_preview_image is None:
