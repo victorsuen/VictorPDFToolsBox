@@ -229,6 +229,22 @@ class QtAppTests(unittest.TestCase):
         self.assertFalse(window.text_edit_whole_word_checkbox.isChecked())
         self.assertIn("替換限制", window.text_edit_replacement_hint.text())
 
+    def test_text_edit_page_navigation_changes_page_within_bounds(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+
+        window.change_text_edit_page(1)
+        self.assertEqual(window.text_edit_page_input.text(), "2")
+
+        window.change_text_edit_page(1)
+        self.assertEqual(window.text_edit_page_input.text(), "2")
+
+        window.change_text_edit_page(-1)
+        self.assertEqual(window.text_edit_page_input.text(), "1")
+
+        window.change_text_edit_page(-1)
+        self.assertEqual(window.text_edit_page_input.text(), "1")
+
     def test_text_edit_preview_click_selects_block(self):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)

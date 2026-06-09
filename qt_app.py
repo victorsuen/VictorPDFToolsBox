@@ -1208,6 +1208,8 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_page_input.setValidator(self.text_edit_page_validator)
         self.text_edit_page_input.editingFinished.connect(self.refresh_text_edit_page)
         top.addWidget(self.text_edit_page_input)
+        self.add_button(top, "上一頁", lambda: self.change_text_edit_page(-1))
+        self.add_button(top, "下一頁", lambda: self.change_text_edit_page(1))
         self.add_button(top, "偵測文字", self.refresh_text_edit_page)
         top.addStretch(1)
         left.addLayout(top)
@@ -1336,6 +1338,19 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_page_input.setText("1")
         self.refresh_text_edit_page()
         self.set_status(f"已載入文字編輯 PDF：{path.name}")
+
+    def change_text_edit_page(self, delta: int) -> None:
+        if self.text_edit_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        current = min(max(int(self.text_edit_page_input.text() or "1"), 1), self.text_edit_page_count)
+        next_page = min(max(current + delta, 1), self.text_edit_page_count)
+        if next_page == current:
+            boundary = "第一頁" if delta < 0 else "最後一頁"
+            self.set_status(f"已在{boundary}。")
+            return
+        self.text_edit_page_input.setText(str(next_page))
+        self.refresh_text_edit_page()
 
     def refresh_text_edit_page(self) -> None:
         if self.text_edit_pdf_path is None:
