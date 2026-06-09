@@ -1222,6 +1222,15 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
 
+        side_layout.addWidget(QLabel("搜尋文字"))
+        search_row = QHBoxLayout()
+        self.text_edit_search_input = QLineEdit()
+        self.text_edit_search_input.setPlaceholderText("輸入要尋找的文字")
+        self.text_edit_search_input.returnPressed.connect(self.find_next_text_edit_block)
+        search_row.addWidget(self.text_edit_search_input, 1)
+        self.add_button(search_row, "下一個", self.find_next_text_edit_block)
+        side_layout.addLayout(search_row)
+
         side_layout.addWidget(QLabel("偵測到的文字片段"))
         self.text_edit_block_list = QListWidget()
         self.text_edit_block_list.currentRowChanged.connect(self.on_text_edit_block_selected)
@@ -1314,6 +1323,29 @@ class VictorPdfToolsQt(QMainWindow):
             self.text_edit_block_list.addItem(item)
         if not self.text_edit_blocks:
             self.text_edit_block_info.setText("此頁沒有偵測到文字層。掃描 PDF 請先 OCR。")
+
+    def find_next_text_edit_block(self) -> None:
+        query = self.text_edit_search_input.text().strip().lower()
+        if not query:
+            self.set_status("請輸入要搜尋的文字。")
+            return
+        if not self.text_edit_blocks:
+            self.set_status("此頁沒有可搜尋的文字片段。")
+            return
+
+        start = self.text_edit_block_list.currentRow() + 1
+        indexes = list(range(start, len(self.text_edit_blocks))) + list(range(0, max(start, 0)))
+        matches = [
+            index
+            for index in indexes
+            if query in self.text_edit_blocks[index].text.lower()
+        ]
+        if not matches:
+            self.set_status(f"找不到文字：{self.text_edit_search_input.text().strip()}")
+            return
+        self.text_edit_block_list.setCurrentRow(matches[0])
+        total = sum(1 for block in self.text_edit_blocks if query in block.text.lower())
+        self.set_status(f"找到第 {matches[0] + 1} 個文字片段，共 {total} 個符合。")
 
     def render_text_edit_preview(self) -> None:
         if self.text_edit_pdf_path is None:

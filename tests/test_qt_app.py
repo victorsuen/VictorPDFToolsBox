@@ -236,6 +236,23 @@ class QtAppTests(unittest.TestCase):
 
         self.assertEqual(window.text_edit_block_list.currentRow(), 0)
 
+    def test_text_edit_search_selects_next_matching_block(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("Invoice Number", 72, 320, 100, 20, 12),
+            TextBlock("Customer Name", 72, 290, 100, 20, 12),
+            TextBlock("Invoice Total", 72, 260, 100, 20, 12),
+        ]
+        window.refresh_text_edit_blocks()
+        window.text_edit_search_input.setText("invoice")
+
+        window.find_next_text_edit_block()
+        self.assertEqual(window.text_edit_block_list.currentRow(), 0)
+
+        window.find_next_text_edit_block()
+        self.assertEqual(window.text_edit_block_list.currentRow(), 2)
+
     def test_output_preferences_default_enabled(self):
         window = VictorPdfToolsQt()
 
