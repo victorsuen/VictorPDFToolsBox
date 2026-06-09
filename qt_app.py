@@ -1230,6 +1230,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_search_input.setPlaceholderText("輸入要尋找的文字")
         self.text_edit_search_input.returnPressed.connect(self.find_next_text_edit_block)
         search_row.addWidget(self.text_edit_search_input, 1)
+        self.add_button(search_row, "上一個", self.find_previous_text_edit_block)
         self.add_button(search_row, "下一個", self.find_next_text_edit_block)
         side_layout.addLayout(search_row)
 
@@ -1335,6 +1336,12 @@ class VictorPdfToolsQt(QMainWindow):
             self.text_edit_block_info.setText("此頁沒有偵測到文字層。掃描 PDF 請先 OCR。")
 
     def find_next_text_edit_block(self) -> None:
+        self.find_text_edit_block(direction=1)
+
+    def find_previous_text_edit_block(self) -> None:
+        self.find_text_edit_block(direction=-1)
+
+    def find_text_edit_block(self, direction: int = 1) -> None:
         query = self.text_edit_search_input.text().strip().lower()
         if not query:
             self.set_status("請輸入要搜尋的文字。")
@@ -1348,18 +1355,21 @@ class VictorPdfToolsQt(QMainWindow):
         page_blocks = self.text_edit_blocks
         try:
             for offset in range(self.text_edit_page_count):
-                page_number = ((current_page - 1 + offset) % self.text_edit_page_count) + 1
+                page_number = ((current_page - 1 + offset * direction) % self.text_edit_page_count) + 1
                 if offset == 0:
                     blocks = page_blocks
-                    start = current_row + 1
+                    if direction > 0:
+                        indexes = list(range(current_row + 1, len(blocks))) + list(range(0, max(current_row + 1, 0)))
+                    else:
+                        start = current_row - 1 if current_row >= 0 else len(blocks) - 1
+                        indexes = list(range(start, -1, -1)) + list(range(len(blocks) - 1, start, -1))
                 else:
                     blocks = extract_page_text_blocks(
                         self.text_edit_pdf_path,
                         page_number - 1,
                         self.text_edit_password_input.text(),
                     )
-                    start = 0
-                indexes = list(range(start, len(blocks))) + ([] if offset else list(range(0, max(start, 0))))
+                    indexes = list(range(len(blocks))) if direction > 0 else list(range(len(blocks) - 1, -1, -1))
                 matches = [index for index in indexes if query in blocks[index].text.lower()]
                 if matches:
                     if page_number != current_page:

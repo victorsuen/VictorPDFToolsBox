@@ -255,6 +255,9 @@ class QtAppTests(unittest.TestCase):
         window.find_next_text_edit_block()
         self.assertEqual(window.text_edit_block_list.currentRow(), 2)
 
+        window.find_previous_text_edit_block()
+        self.assertEqual(window.text_edit_block_list.currentRow(), 0)
+
     def test_text_edit_search_moves_to_next_page_match(self):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)
@@ -269,6 +272,22 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.text_edit_page_input.text(), "2")
         self.assertEqual(window.text_edit_block_list.currentRow(), 0)
         self.assertEqual(window.text_edit_block_list.currentItem().text(), "Invoice Total")
+
+    def test_text_edit_search_moves_to_previous_page_match(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_page_input.setText("2")
+        window.text_edit_blocks = [TextBlock("Customer Name", 72, 320, 100, 20, 12)]
+        window.refresh_text_edit_blocks()
+        window.text_edit_search_input.setText("invoice")
+        previous_page_blocks = [TextBlock("Invoice Number", 72, 300, 100, 20, 12)]
+
+        with patch("qt_app.extract_page_text_blocks", return_value=previous_page_blocks):
+            window.find_previous_text_edit_block()
+
+        self.assertEqual(window.text_edit_page_input.text(), "1")
+        self.assertEqual(window.text_edit_block_list.currentRow(), 0)
+        self.assertEqual(window.text_edit_block_list.currentItem().text(), "Invoice Number")
 
     def test_text_edit_redact_selected_block_writes_output(self):
         window = VictorPdfToolsQt()
