@@ -210,7 +210,7 @@ class QtAppTests(unittest.TestCase):
 
         self.assertEqual(window.annotation_pdf_path, self.source)
         self.assertEqual(window.annotation_page_count, 2)
-        self.assertEqual(window.annotation_page_spin.maximum(), 2)
+        self.assertEqual(window.annotation_page_validator.top(), 2)
 
     def test_output_preferences_default_enabled(self):
         window = VictorPdfToolsQt()

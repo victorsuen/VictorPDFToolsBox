@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QDrag, QDragEnterEvent, QDropEvent, QIcon, QIntValidator, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
@@ -30,7 +30,6 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
     QStatusBar,
     QTabWidget,
     QTextEdit,
@@ -686,12 +685,16 @@ class VictorPdfToolsQt(QMainWindow):
             QPushButton:hover { background: #ffffff; border-color: #128576; }
             QPushButton#primary { background: #128576; color: #ffffff; border-color: #0d6f63; }
             QPushButton#danger { color: #9d2828; }
-            QLineEdit {
+            QLineEdit, QComboBox {
                 min-height: 30px;
                 padding: 2px 8px;
                 border: 1px solid #aaa69d;
                 border-radius: 6px;
                 background: #ffffff;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 24px;
             }
             QFrame#panel { border: 1px solid #c4c1b8; border-radius: 8px; }
             """
@@ -895,10 +898,11 @@ class VictorPdfToolsQt(QMainWindow):
         form_layout.addWidget(template_hint)
 
         form_layout.addWidget(QLabel("空白頁靈敏度"))
-        self.tool_blank_threshold = QSpinBox()
-        self.tool_blank_threshold.setRange(1, 1000)
-        self.tool_blank_threshold.setValue(25)
-        form_layout.addWidget(self.tool_blank_threshold)
+        self.tool_blank_threshold_combo = QComboBox()
+        for value in ("10", "15", "25", "50", "100", "200", "500"):
+            self.tool_blank_threshold_combo.addItem(value)
+        self.tool_blank_threshold_combo.setCurrentText("25")
+        form_layout.addWidget(self.tool_blank_threshold_combo)
 
         run_button = self.add_button(form_layout, "處理並另存", self.run_tool_operation, "primary")
         run_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -933,11 +937,12 @@ class VictorPdfToolsQt(QMainWindow):
         top = QHBoxLayout()
         self.add_button(top, "載入 PDF", self.load_annotation_pdf)
         top.addWidget(QLabel("頁碼"))
-        self.annotation_page_spin = QSpinBox()
-        self.annotation_page_spin.setMinimum(1)
-        self.annotation_page_spin.setMaximum(1)
-        self.annotation_page_spin.valueChanged.connect(self.render_annotation_preview)
-        top.addWidget(self.annotation_page_spin)
+        self.annotation_page_input = QLineEdit("1")
+        self.annotation_page_input.setFixedWidth(56)
+        self.annotation_page_validator = QIntValidator(1, 1, self)
+        self.annotation_page_input.setValidator(self.annotation_page_validator)
+        self.annotation_page_input.editingFinished.connect(self.render_annotation_preview)
+        top.addWidget(self.annotation_page_input)
         self.add_button(top, "更新預覽", self.render_annotation_preview)
         top.addStretch(1)
         left.addLayout(top)
@@ -1255,8 +1260,8 @@ class VictorPdfToolsQt(QMainWindow):
             return
         self.annotation_pdf_path = path
         self.annotation_page_count = len(reader.pages)
-        self.annotation_page_spin.setMaximum(max(self.annotation_page_count, 1))
-        self.annotation_page_spin.setValue(1)
+        self.annotation_page_validator.setRange(1, max(self.annotation_page_count, 1))
+        self.annotation_page_input.setText("1")
         self.render_annotation_preview()
         self.set_status(f"已載入 {path.name}，共 {self.annotation_page_count} 頁。")
 
@@ -1268,8 +1273,8 @@ class VictorPdfToolsQt(QMainWindow):
             self.set_status("PDF 預覽元件未啟用，仍可手動輸入 X/Y。")
             return
         try:
-            page_number = min(max(self.annotation_page_spin.value(), 1), self.annotation_page_count)
-            self.annotation_page_spin.setValue(page_number)
+            page_number = min(max(int(self.annotation_page_input.text() or "1"), 1), self.annotation_page_count)
+            self.annotation_page_input.setText(str(page_number))
             document = pdfium.PdfDocument(str(self.annotation_pdf_path), password=self.annotation_password_input.text() or None)
             page = document.get_page(page_number - 1)
             page_width, page_height = page.get_size()
@@ -1339,7 +1344,7 @@ class VictorPdfToolsQt(QMainWindow):
             add_text_overlay_annotation(
                 source=self.annotation_pdf_path,
                 target=target_path,
-                page_index=self.annotation_page_spin.value() - 1,
+                page_index=int(self.annotation_page_input.text() or "1") - 1,
                 x=style["pdf_x"],
                 y=style["pdf_y"],
                 text=text,
@@ -1467,7 +1472,7 @@ class VictorPdfToolsQt(QMainWindow):
             removed = remove_blank_pages(
                 source,
                 target_path,
-                threshold=self.tool_blank_threshold.value(),
+                threshold=int(self.tool_blank_threshold_combo.currentText()),
                 password=password,
             )
             self._last_tool_status_message = f"已移除 {removed} 頁空白頁。"
