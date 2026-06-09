@@ -262,6 +262,41 @@ def images_to_pdf(paths: list[Path], target: Path) -> None:
         image.close()
 
 
+ANNOTATION_FONT_OPTIONS = {
+    "helvetica": ("Helv", "Helv-Bold"),
+    "times": ("Times-Roman", "Times-Bold"),
+    "courier": ("Courier", "Courier-Bold"),
+}
+
+ANNOTATION_COLOR_PRESETS: dict[str, tuple[float, float, float]] = {
+    "black": (0.0, 0.0, 0.0),
+    "red": (0.8, 0.0, 0.0),
+    "blue": (0.0, 0.0, 0.7),
+    "gray": (0.4, 0.4, 0.4),
+}
+
+
+def build_annotation_da(
+    font_key: str,
+    font_size: int,
+    bold: bool,
+    color_rgb: tuple[float, float, float],
+) -> str:
+    regular, bold_name = ANNOTATION_FONT_OPTIONS.get(font_key, ANNOTATION_FONT_OPTIONS["helvetica"])
+    font_name = bold_name if bold else regular
+    red, green, blue = color_rgb
+    return f"/{font_name} {font_size} Tf {red} {green} {blue} rg"
+
+
+def rgb_to_hex(color_rgb: tuple[float, float, float]) -> str:
+    red, green, blue = color_rgb
+    return "#{:02x}{:02x}{:02x}".format(
+        int(max(0.0, min(red, 1.0)) * 255),
+        int(max(0.0, min(green, 1.0)) * 255),
+        int(max(0.0, min(blue, 1.0)) * 255),
+    )
+
+
 def add_annotation_to_page(writer: PdfWriter, page, annotation: DictionaryObject) -> None:
     annotation_ref = writer._add_object(annotation)
     if "/Annots" not in page:
@@ -281,6 +316,9 @@ def add_text_overlay_annotation(
     cover_width: float,
     cover_height: float,
     password: str = "",
+    font_key: str = "helvetica",
+    bold: bool = False,
+    color_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0),
 ) -> None:
     reader = open_reader(source, password)
     if page_index < 0 or page_index >= len(reader.pages):
@@ -329,7 +367,7 @@ def add_text_overlay_annotation(
                 ]
             ),
             NameObject("/Contents"): TextStringObject(text),
-            NameObject("/DA"): TextStringObject(f"/Helv {font_size} Tf 0 0 0 rg"),
+            NameObject("/DA"): TextStringObject(build_annotation_da(font_key, font_size, bold, color_rgb)),
             NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
             NameObject("/F"): NumberObject(4),
         }

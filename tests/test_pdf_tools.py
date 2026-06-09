@@ -9,6 +9,7 @@ from pdf_core import (
     add_page_numbers,
     add_text_overlay_annotation,
     add_watermark,
+    build_annotation_da,
     clean_metadata,
     merge_pdf_files,
     remove_blank_pages,
@@ -40,6 +41,12 @@ class PdfToolsTests(unittest.TestCase):
             copied.write(stream)
 
         self.assertEqual(len(PdfReader(str(target)).pages), 1)
+
+    def test_build_annotation_da_supports_bold_and_color(self):
+        self.assertEqual(
+            build_annotation_da("helvetica", 14, True, (0.8, 0.0, 0.0)),
+            "/Helv-Bold 14 Tf 0.8 0.0 0.0 rg",
+        )
 
     def test_add_text_overlay_annotation(self):
         source = Path(self.temp_dir.name) / "source.pdf"

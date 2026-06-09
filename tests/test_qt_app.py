@@ -211,6 +211,17 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.annotation_page_count, 2)
         self.assertEqual(window.annotation_page_spin.maximum(), 2)
 
+    def test_annotation_preview_draws_overlay_text(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.annotation_text_input.setPlainText("Hello World")
+        window.annotation_x_input.setText("72")
+        window.annotation_y_input.setText("300")
+        window.update_annotation_preview_display()
+
+        self.assertIsNotNone(window.annotation_preview_label.pixmap())
+        self.assertFalse(window.annotation_preview_label.pixmap().isNull())
+
     def test_merge_dialog_undo_restores_removed_source(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])

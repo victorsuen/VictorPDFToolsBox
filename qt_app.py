@@ -3,13 +3,14 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
-from PIL import Image, ImageDraw
+from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -41,8 +42,10 @@ from pdf_core import (
     PDF_SUFFIXES,
     PageItem,
     add_page_numbers,
+    ANNOTATION_COLOR_PRESETS,
     add_text_overlay_annotation,
     add_watermark,
+    rgb_to_hex,
     clean_metadata,
     compress_pdf,
     decrypt_pdf,
@@ -598,6 +601,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_page_count = 0
         self.annotation_page_size = (0.0, 0.0)
         self.annotation_preview_image: Image.Image | None = None
+        self.annotation_color_rgb = (0.0, 0.0, 0.0)
         self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
         self.stats_label = QLabel("總頁數：0　已選取：0")
@@ -888,7 +892,7 @@ class VictorPdfToolsQt(QMainWindow):
 
         side = QFrame()
         side.setObjectName("panel")
-        side.setFixedWidth(300)
+        side.setFixedWidth(320)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
@@ -896,12 +900,44 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(QLabel("標註文字"))
         self.annotation_text_input = QTextEdit()
         self.annotation_text_input.setPlaceholderText("輸入要覆蓋或加上的文字")
-        self.annotation_text_input.setFixedHeight(110)
+        self.annotation_text_input.setFixedHeight(90)
         side_layout.addWidget(self.annotation_text_input)
 
         self.annotation_cover_checkbox = QCheckBox("先用白底覆蓋原文字")
         self.annotation_cover_checkbox.setChecked(True)
         side_layout.addWidget(self.annotation_cover_checkbox)
+
+        side_layout.addWidget(QLabel("字體"))
+        self.annotation_font_combo = QComboBox()
+        self.annotation_font_combo.addItem("Helvetica", "helvetica")
+        self.annotation_font_combo.addItem("Times New Roman", "times")
+        self.annotation_font_combo.addItem("Courier", "courier")
+        side_layout.addWidget(self.annotation_font_combo)
+
+        style_row = QHBoxLayout()
+        style_row.addWidget(QLabel("大小"))
+        self.annotation_font_size_combo = QComboBox()
+        for size in ("8", "10", "12", "14", "16", "18", "24", "36"):
+            self.annotation_font_size_combo.addItem(size)
+        self.annotation_font_size_combo.setCurrentText("12")
+        style_row.addWidget(self.annotation_font_size_combo, 1)
+        self.annotation_bold_checkbox = QCheckBox("粗體")
+        style_row.addWidget(self.annotation_bold_checkbox)
+        side_layout.addLayout(style_row)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("顏色"))
+        self.annotation_color_combo = QComboBox()
+        self.annotation_color_combo.addItem("黑色", "black")
+        self.annotation_color_combo.addItem("紅色", "red")
+        self.annotation_color_combo.addItem("藍色", "blue")
+        self.annotation_color_combo.addItem("灰色", "gray")
+        self.annotation_color_combo.addItem("自訂...", "custom")
+        color_row.addWidget(self.annotation_color_combo, 1)
+        self.annotation_color_button = QPushButton("選色")
+        self.annotation_color_button.setFixedWidth(56)
+        color_row.addWidget(self.annotation_color_button)
+        side_layout.addLayout(color_row)
 
         side_layout.addWidget(QLabel("X / Y 位置"))
         xy = QHBoxLayout()
@@ -910,12 +946,6 @@ class VictorPdfToolsQt(QMainWindow):
         xy.addWidget(self.annotation_x_input)
         xy.addWidget(self.annotation_y_input)
         side_layout.addLayout(xy)
-
-        side_layout.addWidget(QLabel("字體大小"))
-        self.annotation_font_size_spin = QSpinBox()
-        self.annotation_font_size_spin.setRange(6, 72)
-        self.annotation_font_size_spin.setValue(12)
-        side_layout.addWidget(self.annotation_font_size_spin)
 
         side_layout.addWidget(QLabel("覆蓋框 / 文字框寬高"))
         wh = QHBoxLayout()
@@ -933,13 +963,128 @@ class VictorPdfToolsQt(QMainWindow):
         save_button = self.add_button(side_layout, "套用並另存 PDF", self.save_annotation_pdf, "primary")
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        guide = QLabel("提示：點擊左側預覽可設定文字位置；也可直接把 PDF 拖入此分頁。完成後會自動開成新 Tab。")
+        guide = QLabel("提示：左側會即時預覽白底覆蓋與文字效果；點擊預覽可調整位置。也可直接把 PDF 拖入此分頁。")
         guide.setObjectName("muted")
         guide.setWordWrap(True)
         side_layout.addWidget(guide)
         side_layout.addStretch(1)
         layout.addWidget(side)
+        self.connect_annotation_preview_updates()
         return tab
+
+    def connect_annotation_preview_updates(self) -> None:
+        self.annotation_text_input.textChanged.connect(self.update_annotation_preview_display)
+        self.annotation_cover_checkbox.toggled.connect(self.update_annotation_preview_display)
+        self.annotation_font_combo.currentIndexChanged.connect(self.update_annotation_preview_display)
+        self.annotation_font_size_combo.currentTextChanged.connect(self.update_annotation_preview_display)
+        self.annotation_bold_checkbox.toggled.connect(self.update_annotation_preview_display)
+        self.annotation_color_combo.currentIndexChanged.connect(self.on_annotation_color_preset_changed)
+        self.annotation_color_button.clicked.connect(self.choose_annotation_color)
+        self.annotation_x_input.textChanged.connect(self.update_annotation_preview_display)
+        self.annotation_y_input.textChanged.connect(self.update_annotation_preview_display)
+        self.annotation_width_input.textChanged.connect(self.update_annotation_preview_display)
+        self.annotation_height_input.textChanged.connect(self.update_annotation_preview_display)
+
+    def on_annotation_color_preset_changed(self) -> None:
+        preset = self.annotation_color_combo.currentData()
+        if preset == "custom":
+            self.choose_annotation_color()
+            return
+        if preset in ANNOTATION_COLOR_PRESETS:
+            self.annotation_color_rgb = ANNOTATION_COLOR_PRESETS[preset]
+        self.update_annotation_preview_display()
+
+    def choose_annotation_color(self) -> None:
+        current = QColor.fromRgbF(*self.annotation_color_rgb)
+        chosen = QColorDialog.getColor(current, self, "選擇文字顏色")
+        if not chosen.isValid():
+            return
+        self.annotation_color_rgb = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        custom_index = self.annotation_color_combo.findData("custom")
+        if custom_index >= 0:
+            self.annotation_color_combo.setCurrentIndex(custom_index)
+        self.update_annotation_preview_display()
+
+    def annotation_style_values(self) -> dict:
+        try:
+            rect_width = float(self.annotation_width_input.text())
+            rect_height = float(self.annotation_height_input.text())
+        except ValueError:
+            rect_width, rect_height = 220.0, 32.0
+        try:
+            pdf_x = float(self.annotation_x_input.text())
+            pdf_y = float(self.annotation_y_input.text())
+        except ValueError:
+            pdf_x, pdf_y = 72.0, 720.0
+        return {
+            "text": self.annotation_text_input.toPlainText(),
+            "cover": self.annotation_cover_checkbox.isChecked(),
+            "font_key": self.annotation_font_combo.currentData() or "helvetica",
+            "font_size": int(self.annotation_font_size_combo.currentText()),
+            "bold": self.annotation_bold_checkbox.isChecked(),
+            "color_rgb": self.annotation_color_rgb,
+            "pdf_x": pdf_x,
+            "pdf_y": pdf_y,
+            "rect_width": rect_width,
+            "rect_height": rect_height,
+        }
+
+    def annotation_preview_font(
+        self,
+        font_size_pt: float,
+        bold: bool,
+        font_key: str,
+    ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        windows_fonts = Path("C:/Windows/Fonts")
+        font_files = {
+            "helvetica": ("arialbd.ttf", "arial.ttf"),
+            "times": ("timesbd.ttf", "times.ttf"),
+            "courier": ("courbd.ttf", "cour.ttf"),
+        }
+        bold_name, regular_name = font_files.get(font_key, font_files["helvetica"])
+        primary = windows_fonts / (bold_name if bold else regular_name)
+        candidates = [
+            primary,
+            windows_fonts / ("msyhbd.ttc" if bold else "msyh.ttc"),
+            windows_fonts / ("arialbd.ttf" if bold else "arial.ttf"),
+        ]
+        size = max(int(font_size_pt), 8)
+        for path in candidates:
+            if path.exists():
+                try:
+                    return ImageFont.truetype(str(path), size=size)
+                except Exception:
+                    continue
+        return ImageFont.load_default()
+
+    def draw_annotation_overlay_on_image(self, image: Image.Image, style: dict) -> Image.Image:
+        page_width, page_height = self.annotation_page_size
+        if page_width <= 0 or page_height <= 0:
+            return image
+        canvas = image.copy()
+        draw = ImageDraw.Draw(canvas)
+        image_width, image_height = canvas.size
+        scale_x = image_width / page_width
+        scale_y = image_height / page_height
+
+        left = style["pdf_x"] * scale_x
+        bottom = image_height - style["pdf_y"] * scale_y
+        width = style["rect_width"] * scale_x
+        height = style["rect_height"] * scale_y
+        top = bottom - height
+        right = left + width
+        bottom = top + height
+
+        if style["cover"]:
+            draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#b7c4ce", width=1)
+
+        text = style["text"].strip()
+        if text:
+            preview_font_size = max(style["font_size"] * scale_y * 0.92, 8)
+            font = self.annotation_preview_font(preview_font_size, style["bold"], style["font_key"])
+            text_color = rgb_to_hex(style["color_rgb"])
+            draw.text((left + 4, top + 2), text, fill=text_color, font=font)
+        return canvas
 
     def refresh_tool_file_list(self) -> None:
         self.tool_file_list.clear()
@@ -1059,20 +1204,16 @@ class VictorPdfToolsQt(QMainWindow):
         if self.annotation_preview_image is None:
             self.annotation_preview_label.clear()
             return
-        pixmap = QPixmap.fromImage(ImageQt(self.annotation_preview_image.copy()))
+        style = self.annotation_style_values()
+        preview_image = self.draw_annotation_overlay_on_image(self.annotation_preview_image, style)
+        pixmap = QPixmap.fromImage(ImageQt(preview_image))
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
         page_width, page_height = self.annotation_page_size
-        image_width, image_height = self.annotation_preview_image.size
+        image_width, image_height = preview_image.size
         if page_width > 0 and page_height > 0:
-            try:
-                pdf_x = float(self.annotation_x_input.text())
-                pdf_y = float(self.annotation_y_input.text())
-            except ValueError:
-                pdf_x = 72.0
-                pdf_y = 720.0
-            x = pdf_x / page_width * image_width
-            y = (page_height - pdf_y) / page_height * image_height
+            x = style["pdf_x"] / page_width * image_width
+            y = (page_height - style["pdf_y"]) / page_height * image_height
             pen = QPen(Qt.GlobalColor.darkCyan, 2)
             painter.setPen(pen)
             painter.drawEllipse(QPoint(int(x), int(y)), 5, 5)
@@ -1109,19 +1250,24 @@ class VictorPdfToolsQt(QMainWindow):
             return
         target_path = Path(target)
 
+        style = self.annotation_style_values()
+
         def job() -> None:
             add_text_overlay_annotation(
                 source=self.annotation_pdf_path,
                 target=target_path,
                 page_index=self.annotation_page_spin.value() - 1,
-                x=float(self.annotation_x_input.text()),
-                y=float(self.annotation_y_input.text()),
+                x=style["pdf_x"],
+                y=style["pdf_y"],
                 text=text,
-                font_size=self.annotation_font_size_spin.value(),
-                cover_original=self.annotation_cover_checkbox.isChecked(),
-                cover_width=float(self.annotation_width_input.text()),
-                cover_height=float(self.annotation_height_input.text()),
+                font_size=style["font_size"],
+                cover_original=style["cover"],
+                cover_width=style["rect_width"],
+                cover_height=style["rect_height"],
                 password=self.annotation_password_input.text(),
+                font_key=style["font_key"],
+                bold=style["bold"],
+                color_rgb=style["color_rgb"],
             )
 
         self.run_pdf_job(
