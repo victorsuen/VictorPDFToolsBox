@@ -66,6 +66,7 @@ from pdf_core import (
     page_item_label,
     parse_pages,
     pdfium,
+    redact_matching_text_blocks_overlay,
     redact_text_block_secure,
     redact_text_block_overlay,
     remove_blank_pages,
@@ -1270,6 +1271,8 @@ class VictorPdfToolsQt(QMainWindow):
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         redact_button = self.add_button(side_layout, "遮蔽選取文字並另存", self.redact_text_edit_pdf)
         redact_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        redact_all_button = self.add_button(side_layout, "遮蔽全部搜尋結果並另存", self.redact_all_text_search_matches)
+        redact_all_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
             "Beta：覆蓋替換最穩定；安全遮蔽會嘗試移除簡單英文/數字底層文字再加黑框；直接改內容流只適合簡單英文/數字且新舊長度相同，"
@@ -1544,6 +1547,37 @@ class VictorPdfToolsQt(QMainWindow):
             ),
             f"已遮蔽文字並另存：{target_path.name}",
             on_success=lambda: self.open_pdf_as_new_tab(target_path),
+        )
+
+    def redact_all_text_search_matches(self) -> None:
+        if self.text_edit_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        query = self.text_edit_search_input.text().strip()
+        if not query:
+            self.set_status("請先輸入要批量遮蔽的搜尋文字。")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "另存批量遮蔽 PDF", "redacted-search-results.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        redacted_count = {"value": 0}
+
+        def job() -> None:
+            redacted_count["value"] = redact_matching_text_blocks_overlay(
+                self.text_edit_pdf_path,
+                target_path,
+                query,
+                self.text_edit_password_input.text(),
+            )
+
+        self.run_pdf_job(
+            job,
+            "",
+            on_success=lambda: (
+                self.open_pdf_as_new_tab(target_path),
+                self.set_status(f"已遮蔽 {redacted_count['value']} 個搜尋結果並另存：{target_path.name}"),
+            ),
         )
 
     def output_settings(self) -> QSettings:

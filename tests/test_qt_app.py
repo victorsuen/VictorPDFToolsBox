@@ -304,6 +304,24 @@ class QtAppTests(unittest.TestCase):
         self.assertTrue(target.exists())
         self.assertEqual(len(PdfReader(str(target)).pages[0].get("/Annots")), 1)
 
+    def test_text_edit_redact_all_search_matches_uses_query(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_search_input.setText("invoice")
+        target = Path(self.temp_dir.name) / "redacted-all.pdf"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch("qt_app.redact_matching_text_blocks_overlay", return_value=3) as redact_all:
+                with patch.object(window, "open_pdf_as_new_tab"):
+                    window.redact_all_text_search_matches()
+
+        redact_all.assert_called_once_with(
+            self.source,
+            target,
+            "invoice",
+            "",
+        )
+
     def test_output_preferences_default_enabled(self):
         window = VictorPdfToolsQt()
 

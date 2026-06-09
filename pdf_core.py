@@ -407,8 +407,13 @@ def redact_text_block_overlay(
     writer = PdfWriter()
     writer.append_pages_from_reader(reader)
     page = writer.pages[page_index]
+    add_annotation_to_page(writer, page, redaction_annotation_for_block(block))
+    write_pdf(writer, target)
+
+
+def redaction_annotation_for_block(block: TextBlock) -> DictionaryObject:
     padding = max(block.font_size * 0.2, 2.0)
-    redact_box = DictionaryObject(
+    return DictionaryObject(
         {
             NameObject("/Type"): NameObject("/Annot"),
             NameObject("/Subtype"): NameObject("/Square"),
@@ -426,8 +431,32 @@ def redact_text_block_overlay(
             NameObject("/F"): NumberObject(4),
         }
     )
-    add_annotation_to_page(writer, page, redact_box)
+
+
+def redact_matching_text_blocks_overlay(
+    source: Path,
+    target: Path,
+    query: str,
+    password: str = "",
+) -> int:
+    normalized_query = (query or "").strip().lower()
+    if not normalized_query:
+        raise ValueError("請輸入要批量遮蔽的搜尋文字。")
+
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    match_count = 0
+    for page_index, page in enumerate(writer.pages):
+        blocks = extract_page_text_blocks(source, page_index, password)
+        for block in blocks:
+            if normalized_query in block.text.lower():
+                add_annotation_to_page(writer, page, redaction_annotation_for_block(block))
+                match_count += 1
+    if match_count == 0:
+        raise ValueError(f"找不到要遮蔽的文字：{query.strip()}")
     write_pdf(writer, target)
+    return match_count
 
 
 def validate_content_stream_replacement(original: str, replacement: str) -> tuple[str, str]:

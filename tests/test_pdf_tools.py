@@ -21,6 +21,7 @@ from pdf_core import (
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
     pdf_to_images,
+    redact_matching_text_blocks_overlay,
     redact_text_block_secure,
     redact_text_block_overlay,
     replace_text_block_content_stream,
@@ -122,6 +123,27 @@ class PdfToolsTests(unittest.TestCase):
         annot = PdfReader(str(target)).pages[0].get("/Annots")[0].get_object()
         self.assertEqual(annot.get("/Subtype"), "/Square")
         self.assertEqual(list(annot.get("/IC")), [0, 0, 0])
+
+    def test_redact_matching_text_blocks_overlay_adds_all_matches(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        page_blocks = {
+            0: [TextBlock("Invoice Number", 72, 300, 80, 24, 12, "/Helvetica")],
+            1: [TextBlock("Invoice Total", 72, 260, 80, 24, 12, "/Helvetica")],
+        }
+
+        with patch("pdf_core.extract_page_text_blocks", side_effect=lambda _source, page, _password="": page_blocks[page]):
+            count = redact_matching_text_blocks_overlay(source, target, "invoice")
+
+        reader = PdfReader(str(target))
+        self.assertEqual(count, 2)
+        self.assertEqual(len(reader.pages[0].get("/Annots")), 1)
+        self.assertEqual(len(reader.pages[1].get("/Annots")), 1)
 
     def test_redact_text_block_secure_removes_simple_text_and_adds_black_box(self):
         source = Path(self.temp_dir.name) / "source.pdf"
