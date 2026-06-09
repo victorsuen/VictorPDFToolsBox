@@ -39,6 +39,7 @@ from PySide6.QtWidgets import (
 
 from pdf_core import (
     IMAGE_SUFFIXES,
+    OCR_LANGUAGE_OPTIONS,
     PDF_RENDER_AVAILABLE,
     PDF_SUFFIXES,
     PageItem,
@@ -56,6 +57,8 @@ from pdf_core import (
     extract_pdf_text,
     images_to_pdf,
     merge_pdf_files,
+    ocr_pdf_to_searchable_pdf,
+    ocr_pdf_to_text,
     pdf_to_images,
     open_reader,
     page_item_label,
@@ -80,6 +83,8 @@ TOOL_OPERATIONS = [
     ("decrypt", "解除密碼"),
     ("compress", "基礎壓縮"),
     ("extract_text", "抽取文字"),
+    ("ocr_text", "OCR 抽文字"),
+    ("ocr_searchable_pdf", "掃描 PDF 轉可搜尋 PDF"),
     ("images_to_pdf", "圖片轉 PDF"),
     ("pdf_to_images", "PDF 轉圖片"),
     ("info", "PDF 資訊"),
@@ -103,10 +108,11 @@ PDF_OUTPUT_OPERATIONS = frozenset(
         "watermark",
         "remove_blank_pages",
         "clean_metadata",
+        "ocr_searchable_pdf",
     }
 )
 
-FOLDER_REVEAL_OPERATIONS = frozenset({"split", "extract_text", "info", "pdf_to_images"})
+FOLDER_REVEAL_OPERATIONS = frozenset({"split", "extract_text", "ocr_text", "info", "pdf_to_images"})
 
 SETTINGS_ORG = "VictorSuen"
 SETTINGS_APP = "VictorPDFToolsBox"
@@ -889,6 +895,13 @@ class VictorPdfToolsQt(QMainWindow):
         self.tool_images_zip_checkbox = QCheckBox("PDF 轉圖片時打包成 ZIP")
         form_layout.addWidget(self.tool_images_zip_checkbox)
 
+        form_layout.addWidget(QLabel("OCR 語言"))
+        self.tool_ocr_language_combo = QComboBox()
+        for code, label in OCR_LANGUAGE_OPTIONS.items():
+            self.tool_ocr_language_combo.addItem(label, code)
+        self.tool_ocr_language_combo.setCurrentIndex(self.tool_ocr_language_combo.findData("eng+chi_tra"))
+        form_layout.addWidget(self.tool_ocr_language_combo)
+
         form_layout.addWidget(QLabel("文字 / 模板"))
         self.tool_batch_text_input = QLineEdit("CONFIDENTIAL")
         form_layout.addWidget(self.tool_batch_text_input)
@@ -1388,7 +1401,7 @@ class VictorPdfToolsQt(QMainWindow):
                     return
                 target_path = Path(folder)
         else:
-            extension = ".txt" if operation in {"extract_text", "info"} else ".pdf"
+            extension = ".txt" if operation in {"extract_text", "ocr_text", "info"} else ".pdf"
             if operation == "split":
                 extension = ".zip"
             target, _ = QFileDialog.getSaveFileName(
@@ -1461,6 +1474,28 @@ class VictorPdfToolsQt(QMainWindow):
             compress_pdf(source, target_path, password)
         elif operation == "extract_text":
             extract_pdf_text(source, target_path, password)
+        elif operation == "ocr_text":
+            page_count = ocr_pdf_to_text(
+                source,
+                target_path,
+                password,
+                language=self.tool_ocr_language_combo.currentData(),
+                pages_spec=self.tool_pages_input.text(),
+                dpi=int(self.tool_image_dpi_combo.currentText()),
+            )
+            self._last_tool_status_message = f"已 OCR 抽出 {page_count} 頁文字。"
+            return
+        elif operation == "ocr_searchable_pdf":
+            page_count = ocr_pdf_to_searchable_pdf(
+                source,
+                target_path,
+                password,
+                language=self.tool_ocr_language_combo.currentData(),
+                pages_spec=self.tool_pages_input.text(),
+                dpi=int(self.tool_image_dpi_combo.currentText()),
+            )
+            self._last_tool_status_message = f"已產生 {page_count} 頁可搜尋 PDF。"
+            return
         elif operation == "info":
             write_pdf_info(source, target_path, password)
         elif operation == "add_page_numbers":

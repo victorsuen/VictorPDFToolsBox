@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import io
 import re
 import tempfile
 import zipfile
@@ -26,8 +27,28 @@ except Exception:
     pdfium = None
     PDF_RENDER_AVAILABLE = False
 
+try:
+    import pytesseract
+    from pytesseract import TesseractNotFoundError
+
+    OCR_AVAILABLE = True
+except Exception:
+    pytesseract = None
+
+    class TesseractNotFoundError(Exception):
+        pass
+
+    OCR_AVAILABLE = False
+
 PDF_SUFFIXES = {".pdf"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+OCR_LANGUAGE_OPTIONS = {
+    "eng": "English",
+    "chi_tra": "Traditional Chinese",
+    "chi_sim": "Simplified Chinese",
+    "eng+chi_tra": "English + Traditional Chinese",
+    "eng+chi_sim": "English + Simplified Chinese",
+}
 
 
 @dataclass(frozen=True)
@@ -247,6 +268,102 @@ def write_pdf_info(source: Path, target: Path, password: str = "") -> None:
     target.write_text("\n".join(lines), encoding="utf-8")
 
 
+def ensure_ocr_available() -> None:
+    if not OCR_AVAILABLE or pytesseract is None:
+        raise ValueError("OCR 需要安裝 pytesseract Python 套件和 Tesseract OCR。")
+    try:
+        pytesseract.get_tesseract_version()
+    except TesseractNotFoundError as exc:
+        raise ValueError(
+            "找不到 Tesseract OCR 執行檔。請先安裝 Tesseract，或把 tesseract.exe 加入 PATH。"
+        ) from exc
+
+
+def selected_page_indexes(source: Path, password: str = "", pages_spec: str = "") -> list[int]:
+    reader = open_reader(source, password)
+    if (pages_spec or "").strip():
+        return parse_pages(pages_spec, len(reader.pages))
+    return list(range(len(reader.pages)))
+
+
+def render_pdf_page_images(
+    source: Path,
+    password: str = "",
+    pages_spec: str = "",
+    dpi: int = 200,
+) -> list[tuple[int, Image.Image]]:
+    if not PDF_RENDER_AVAILABLE or pdfium is None:
+        raise ValueError("PDF OCR 需要 pypdfium2 預覽元件。")
+    if dpi < 72 or dpi > 600:
+        raise ValueError("解析度請介於 72 至 600 DPI。")
+
+    page_indexes = selected_page_indexes(source, password, pages_spec)
+    if not page_indexes:
+        raise ValueError("沒有可處理的頁面。")
+
+    scale = dpi / 72.0
+    images: list[tuple[int, Image.Image]] = []
+    document = pdfium.PdfDocument(str(source), password=password or None)
+    try:
+        for page_index in page_indexes:
+            page = document.get_page(page_index)
+            try:
+                image = page.render(scale=scale).to_pil().convert("RGB")
+            finally:
+                page.close()
+            images.append((page_index, image))
+    finally:
+        document.close()
+    return images
+
+
+def ocr_pdf_to_text(
+    source: Path,
+    target: Path,
+    password: str = "",
+    language: str = "eng+chi_tra",
+    pages_spec: str = "",
+    dpi: int = 200,
+) -> int:
+    ensure_ocr_available()
+    pieces: list[str] = []
+    rendered_pages = render_pdf_page_images(source, password, pages_spec, dpi)
+    for page_index, image in rendered_pages:
+        text = pytesseract.image_to_string(image, lang=language)
+        pieces.append(f"--- Page {page_index + 1} ---\n{text.strip()}\n")
+        image.close()
+    target.write_text("\n".join(pieces), encoding="utf-8")
+    return len(rendered_pages)
+
+
+def ocr_pdf_to_searchable_pdf(
+    source: Path,
+    target: Path,
+    password: str = "",
+    language: str = "eng+chi_tra",
+    pages_spec: str = "",
+    dpi: int = 200,
+) -> int:
+    ensure_ocr_available()
+    writer = PdfWriter()
+    rendered_pages = render_pdf_page_images(source, password, pages_spec, dpi)
+    try:
+        for _page_index, image in rendered_pages:
+            pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+                image,
+                extension="pdf",
+                lang=language,
+            )
+            reader = PdfReader(io.BytesIO(pdf_bytes))
+            for page in reader.pages:
+                writer.add_page(page)
+    finally:
+        for _page_index, image in rendered_pages:
+            image.close()
+    write_pdf(writer, target)
+    return len(rendered_pages)
+
+
 IMAGE_EXPORT_FORMATS = {"png", "jpg", "jpeg", "webp"}
 
 
@@ -282,12 +399,7 @@ def pdf_to_images(
     if dpi < 72 or dpi > 600:
         raise ValueError("解析度請介於 72 至 600 DPI。")
 
-    reader = open_reader(source, password)
-    page_indexes = (
-        list(range(len(reader.pages)))
-        if not (pages_spec or "").strip()
-        else parse_pages(pages_spec, len(reader.pages))
-    )
+    page_indexes = selected_page_indexes(source, password, pages_spec)
     if not page_indexes:
         raise ValueError("沒有可輸出的頁面。")
 

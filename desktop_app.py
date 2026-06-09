@@ -25,6 +25,8 @@ from pdf_core import (
     extract_pdf_text,
     images_to_pdf,
     merge_pdf_files,
+    ocr_pdf_to_searchable_pdf,
+    ocr_pdf_to_text,
     pdf_to_images,
     open_reader,
     page_item_label,
@@ -252,6 +254,8 @@ class VictorPdfToolsApp(BaseTk):
             ("解除密碼", "decrypt"),
             ("基礎壓縮", "compress"),
             ("抽取文字", "extract_text"),
+            ("OCR 抽文字", "ocr_text"),
+            ("掃描 PDF 轉可搜尋 PDF", "ocr_searchable_pdf"),
             ("圖片轉 PDF", "images_to_pdf"),
             ("PDF 轉圖片", "pdf_to_images"),
             ("PDF 資訊", "info"),
@@ -920,7 +924,7 @@ class VictorPdfToolsApp(BaseTk):
                 return
             self.run_in_thread(lambda: self._run_operation(operation, Path(target)), "正在輸出圖片...")
             return
-        extension = ".txt" if operation in {"extract_text", "info"} else ".pdf"
+        extension = ".txt" if operation in {"extract_text", "ocr_text", "info"} else ".pdf"
         target = filedialog.asksaveasfilename(
             title="另存輸出檔案",
             defaultextension=extension,
@@ -960,6 +964,12 @@ class VictorPdfToolsApp(BaseTk):
             compress_pdf(source, target, password)
         elif operation == "extract_text":
             extract_pdf_text(source, target, password)
+        elif operation == "ocr_text":
+            count = ocr_pdf_to_text(source, target, password, pages_spec=self.pages_var.get())
+            self.after(0, lambda: self.set_status(f"完成，已 OCR 抽出 {count} 頁文字。"))
+        elif operation == "ocr_searchable_pdf":
+            count = ocr_pdf_to_searchable_pdf(source, target, password, pages_spec=self.pages_var.get())
+            self.after(0, lambda: self.set_status(f"完成，已產生 {count} 頁可搜尋 PDF。"))
         elif operation == "info":
             write_pdf_info(source, target, password)
         elif operation == "add_page_numbers":

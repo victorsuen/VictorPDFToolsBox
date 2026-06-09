@@ -15,7 +15,7 @@ from flask import Flask, flash, redirect, render_template, request, send_file, u
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 
-from pdf_core import pdf_to_images
+from pdf_core import ocr_pdf_to_searchable_pdf, ocr_pdf_to_text, pdf_to_images
 
 
 BASE_DIR = Path(__file__).resolve().parent
@@ -53,6 +53,8 @@ TOOLS = [
     ToolCard("decrypt", "解除密碼", "輸入已知密碼後輸出未加密版本。", "PDF file"),
     ToolCard("compress", "基礎壓縮", "壓縮內容 stream；不會上傳外部服務。", "PDF file"),
     ToolCard("extract_text", "抽取文字", "把 PDF 可讀文字抽出成 TXT。", "PDF file"),
+    ToolCard("ocr_text", "OCR 抽文字", "把掃描 PDF 頁面辨識成 TXT。", "PDF file"),
+    ToolCard("ocr_searchable_pdf", "掃描 PDF 轉可搜尋 PDF", "為掃描 PDF 加入可搜尋文字層。", "PDF file"),
     ToolCard("images_to_pdf", "圖片轉 PDF", "把 JPG / PNG / TIFF 等圖片合併成 PDF。", "Image files", True, True),
     ToolCard("pdf_to_images", "PDF 轉圖片", "把 PDF 頁面輸出成 PNG 圖片，並打包成 ZIP。", "PDF file"),
     ToolCard("info", "PDF 資訊", "查看頁數、是否加密、文件 metadata。", "PDF file"),
@@ -264,6 +266,32 @@ def handle_extract_text() -> tuple[Path, str]:
     return target, "extracted-text.txt"
 
 
+def handle_ocr_text() -> tuple[Path, str]:
+    pdf = first_pdf()
+    target = output_path("ocr-text.txt")
+    ocr_pdf_to_text(
+        pdf,
+        target,
+        request.form.get("password") or "",
+        language=request.form.get("ocr_language") or "eng+chi_tra",
+        pages_spec=request.form.get("pages", ""),
+    )
+    return target, "ocr-text.txt"
+
+
+def handle_ocr_searchable_pdf() -> tuple[Path, str]:
+    pdf = first_pdf()
+    target = output_path("searchable.pdf")
+    ocr_pdf_to_searchable_pdf(
+        pdf,
+        target,
+        request.form.get("password") or "",
+        language=request.form.get("ocr_language") or "eng+chi_tra",
+        pages_spec=request.form.get("pages", ""),
+    )
+    return target, "searchable.pdf"
+
+
 def handle_pdf_to_images() -> tuple[Path, str]:
     pdf = first_pdf()
     target = output_path("pdf-images.zip")
@@ -320,6 +348,8 @@ HANDLERS = {
     "decrypt": handle_decrypt,
     "compress": handle_compress,
     "extract_text": handle_extract_text,
+    "ocr_text": handle_ocr_text,
+    "ocr_searchable_pdf": handle_ocr_searchable_pdf,
     "images_to_pdf": handle_images_to_pdf,
     "pdf_to_images": handle_pdf_to_images,
     "info": handle_info,

@@ -1,6 +1,9 @@
 from pathlib import Path
+import io
 import unittest
+from unittest.mock import Mock, patch
 
+from PIL import Image
 from pypdf import PdfReader, PdfWriter
 
 from app import copy_pages, parse_pages
@@ -12,6 +15,8 @@ from pdf_core import (
     build_annotation_da,
     clean_metadata,
     merge_pdf_files,
+    ocr_pdf_to_searchable_pdf,
+    ocr_pdf_to_text,
     pdf_to_images,
     remove_blank_pages,
     split_pdf_to_zip,
@@ -193,6 +198,35 @@ class PdfToolsTests(unittest.TestCase):
 
         self.assertEqual(count, 2)
         self.assertEqual(len(list(folder.glob("*.jpg"))), 2)
+
+    def test_ocr_pdf_to_text_writes_text(self):
+        target = Path(self.temp_dir.name) / "ocr.txt"
+        with patch("pdf_core.ensure_ocr_available"), patch(
+            "pdf_core.render_pdf_page_images",
+            return_value=[(0, Image.new("RGB", (10, 10), "white"))],
+        ), patch("pdf_core.pytesseract", Mock(image_to_string=Mock(return_value="Hello OCR"))):
+            count = ocr_pdf_to_text(Path("source.pdf"), target, language="eng")
+
+        self.assertEqual(count, 1)
+        self.assertIn("Hello OCR", target.read_text(encoding="utf-8"))
+
+    def test_ocr_pdf_to_searchable_pdf_merges_ocr_pages(self):
+        target = Path(self.temp_dir.name) / "searchable.pdf"
+        pdf_stream = io.BytesIO()
+        writer = PdfWriter()
+        writer.add_blank_page(width=100, height=100)
+        writer.write(pdf_stream)
+        with patch("pdf_core.ensure_ocr_available"), patch(
+            "pdf_core.render_pdf_page_images",
+            return_value=[(0, Image.new("RGB", (10, 10), "white"))],
+        ), patch(
+            "pdf_core.pytesseract",
+            Mock(image_to_pdf_or_hocr=Mock(return_value=pdf_stream.getvalue())),
+        ):
+            count = ocr_pdf_to_searchable_pdf(Path("source.pdf"), target, language="eng")
+
+        self.assertEqual(count, 1)
+        self.assertEqual(len(PdfReader(str(target)).pages), 1)
 
     def test_split_pdf_to_zip(self):
         source = Path(self.temp_dir.name) / "source.pdf"

@@ -23,7 +23,7 @@
 - 合併文件對話框支援移除選取、清空清單、復原上一個動作；快捷鍵為 `Delete` / `Ctrl+Z`，亦可右鍵操作
 - 合併清單中的文件會以綠色邊框顯示選取狀態，未選取就移除時會提示
 - 可將目前排列和旋轉儲存為最新版 PDF
-- 「常用 PDF 工具」分頁已補回批次工具：合併、拆分 ZIP、抽頁、刪頁、旋轉、加密、解密、壓縮、抽文字、圖片轉 PDF、PDF 轉圖片、PDF 資訊、頁碼、水印、刪空白頁、清理 Metadata
+- 「常用 PDF 工具」分頁已補回批次工具：合併、拆分 ZIP、抽頁、刪頁、旋轉、加密、解密、壓縮、抽文字、OCR 抽文字、掃描 PDF 轉可搜尋 PDF、圖片轉 PDF、PDF 轉圖片、PDF 資訊、頁碼、水印、刪空白頁、清理 Metadata
 - 常用工具支援拖放 PDF / 圖片到清單；輸出 PDF 會自動開成新文件 Tab
 - 「文字標註 / 覆蓋」分頁：即時預覽白底覆蓋與文字效果、字體／大小／粗體／顏色、點擊設定位置後另存並自動開新 Tab
 - GitHub Actions 會在每次 push / PR 自動執行單元測試（`.github/workflows/test.yml`）
@@ -53,7 +53,15 @@
 - 抽取 PDF 文字
 - 圖片轉 PDF
 - PDF 轉圖片（PNG / JPG / WEBP，可指定頁碼與 DPI）
+- OCR 抽文字（掃描 PDF → TXT）
+- 掃描 PDF 轉可搜尋 PDF（加入 OCR 文字層）
 - PDF 頁數及 metadata 資訊
+
+## OCR 功能注意
+
+OCR 使用本機 Tesseract OCR，不會上傳文件到外部服務。使用前需在 Windows 安裝 Tesseract，並把 `tesseract.exe`
+加入 PATH；如要辨識繁中 / 簡中，亦需安裝 `chi_tra` / `chi_sim` 語言包。Qt 版可在常用工具分頁選擇
+`英文 + 繁中`、`英文 + 簡中`、純英文、純繁中或純簡中。
 
 ## 桌面 EXE 版
 
