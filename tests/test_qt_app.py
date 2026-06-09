@@ -212,6 +212,14 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.annotation_page_count, 2)
         self.assertEqual(window.annotation_page_validator.top(), 2)
 
+    def test_text_edit_tab_loads_pdf(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+
+        self.assertEqual(window.text_edit_pdf_path, self.source)
+        self.assertEqual(window.text_edit_page_count, 2)
+        self.assertEqual(window.text_edit_page_validator.top(), 2)
+
     def test_output_preferences_default_enabled(self):
         window = VictorPdfToolsQt()
 

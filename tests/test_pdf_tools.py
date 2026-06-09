@@ -9,6 +9,7 @@ from pypdf import PdfReader, PdfWriter
 from app import copy_pages, parse_pages
 from pdf_core import (
     PageItem,
+    TextBlock,
     add_page_numbers,
     add_text_overlay_annotation,
     add_watermark,
@@ -18,6 +19,7 @@ from pdf_core import (
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
     pdf_to_images,
+    replace_text_block_overlay,
     remove_blank_pages,
     split_pdf_to_zip,
     write_page_items_merged,
@@ -73,6 +75,25 @@ class PdfToolsTests(unittest.TestCase):
             cover_original=True,
             cover_width=180,
             cover_height=30,
+        )
+
+        annots = PdfReader(str(target)).pages[0].get("/Annots")
+        self.assertEqual(len(annots), 2)
+
+    def test_replace_text_block_overlay(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        replace_text_block_overlay(
+            source,
+            target,
+            0,
+            TextBlock("Old", 72, 300, 80, 24, 12, "/Helvetica"),
+            "New",
         )
 
         annots = PdfReader(str(target)).pages[0].get("/Annots")

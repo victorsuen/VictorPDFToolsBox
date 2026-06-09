@@ -59,6 +59,17 @@ class PageItem:
     rotation: int = 0
 
 
+@dataclass(frozen=True)
+class TextBlock:
+    text: str
+    x: float
+    y: float
+    width: float
+    height: float
+    font_size: float
+    font_name: str = ""
+
+
 def parse_pages(spec: str, page_count: int) -> list[int]:
     spec = (spec or "").strip()
     if not spec:
@@ -266,6 +277,56 @@ def write_pdf_info(source: Path, target: Path, password: str = "") -> None:
     for key, value in metadata.items():
         lines.append(f"{key}: {value}")
     target.write_text("\n".join(lines), encoding="utf-8")
+
+
+def extract_page_text_blocks(source: Path, page_index: int, password: str = "") -> list[TextBlock]:
+    reader = open_reader(source, password)
+    if page_index < 0 or page_index >= len(reader.pages):
+        raise ValueError("頁碼超出範圍。")
+
+    blocks: list[TextBlock] = []
+
+    def visitor_text(text, _cm, tm, font_dict, font_size):
+        normalized = (text or "").strip()
+        if not normalized:
+            return
+        x = float(tm[4])
+        y = float(tm[5])
+        size = float(font_size or 12)
+        width = max(len(normalized) * size * 0.55, size * 2.0)
+        height = max(size * 1.5, 12.0)
+        font_name = ""
+        if font_dict:
+            font_name = str(font_dict.get("/BaseFont", ""))
+        blocks.append(TextBlock(normalized, x, y, width, height, size, font_name))
+
+    reader.pages[page_index].extract_text(visitor_text=visitor_text)
+    return blocks
+
+
+def replace_text_block_overlay(
+    source: Path,
+    target: Path,
+    page_index: int,
+    block: TextBlock,
+    replacement: str,
+    password: str = "",
+) -> None:
+    if not replacement.strip():
+        raise ValueError("請輸入替換文字。")
+    add_text_overlay_annotation(
+        source=source,
+        target=target,
+        page_index=page_index,
+        x=block.x,
+        y=block.y,
+        text=replacement,
+        font_size=max(int(round(block.font_size)), 8),
+        cover_original=True,
+        cover_width=max(block.width, len(replacement) * block.font_size * 0.6),
+        cover_height=block.height,
+        password=password,
+    )
 
 
 def ensure_ocr_available() -> None:

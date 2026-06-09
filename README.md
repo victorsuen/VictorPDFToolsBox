@@ -29,6 +29,7 @@
 - GitHub Actions 會在每次 push / PR 自動執行單元測試（`.github/workflows/test.yml`）
 - 組織分頁可勾選「儲存 PDF 後開成新 Tab」「匯出後開啟輸出資料夾」
 - 常用工具可勾選「PDF 輸出後開成新 Tab」「ZIP / TXT 輸出後開啟資料夾」；偏好會記住
+- 「文字編輯 Beta」分頁可偵測 PDF 文字層、列出文字片段，選中後以覆蓋方式替換並另存
 
 舊版 Tkinter 程式仍保留在 `desktop_app.py`，方便需要過渡或回查功能時使用。
 
@@ -62,6 +63,12 @@
 OCR 使用本機 Tesseract OCR，不會上傳文件到外部服務。使用前需在 Windows 安裝 Tesseract，並把 `tesseract.exe`
 加入 PATH；如要辨識繁中 / 簡中，亦需安裝 `chi_tra` / `chi_sim` 語言包。Qt 版可在常用工具分頁選擇
 `英文 + 繁中`、`英文 + 簡中`、純英文、純繁中或純簡中。
+
+## 文字編輯 Beta 注意
+
+PDF 文字不像 Word 段落，很多文件會把文字拆成座標碎片，或只內嵌部分字型。文字編輯 Beta 會先偵測
+PDF 的文字層，讓你選取文字片段，再用白底覆蓋原字並放入新文字；這是穩定的第一階段做法。掃描 PDF
+請先使用 OCR 轉成可搜尋 PDF，再嘗試文字編輯。
 
 ## 桌面 EXE 版
 

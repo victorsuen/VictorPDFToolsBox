@@ -43,6 +43,7 @@ from pdf_core import (
     PDF_RENDER_AVAILABLE,
     PDF_SUFFIXES,
     PageItem,
+    TextBlock,
     add_page_numbers,
     ANNOTATION_COLOR_PRESETS,
     add_text_overlay_annotation,
@@ -54,6 +55,7 @@ from pdf_core import (
     delete_pdf_pages,
     encrypt_pdf,
     extract_pdf_pages,
+    extract_page_text_blocks,
     extract_pdf_text,
     images_to_pdf,
     merge_pdf_files,
@@ -65,6 +67,7 @@ from pdf_core import (
     parse_pages,
     pdfium,
     remove_blank_pages,
+    replace_text_block_overlay,
     rotate_pdf_pages,
     safe_output_name,
     split_pdf_to_zip,
@@ -632,6 +635,10 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_page_size = (0.0, 0.0)
         self.annotation_preview_image: Image.Image | None = None
         self.annotation_color_rgb = (0.0, 0.0, 0.0)
+        self.text_edit_pdf_path: Path | None = None
+        self.text_edit_page_count = 0
+        self.text_edit_blocks: list[TextBlock] = []
+        self.text_edit_preview_image: Image.Image | None = None
         self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
         self.stats_label = QLabel("總頁數：0　已選取：0")
@@ -722,6 +729,7 @@ class VictorPdfToolsQt(QMainWindow):
         tabs.addTab(self.build_organize_tab(), "組織 / 擷取")
         tabs.addTab(self.build_tools_tab(), "常用 PDF 工具")
         tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
+        tabs.addTab(self.build_text_edit_tab(), "文字編輯 Beta")
         layout.addWidget(tabs, 1)
         self.setCentralWidget(root)
 
@@ -1163,6 +1171,203 @@ class VictorPdfToolsQt(QMainWindow):
             text_color = rgb_to_hex(style["color_rgb"])
             draw.text((left + 4, top + 2), text, fill=text_color, font=font)
         return canvas
+
+    def build_text_edit_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_text_edit_pdf)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(14)
+
+        left = QVBoxLayout()
+        top = QHBoxLayout()
+        self.add_button(top, "載入 PDF", self.load_text_edit_pdf)
+        top.addWidget(QLabel("頁碼"))
+        self.text_edit_page_input = QLineEdit("1")
+        self.text_edit_page_input.setFixedWidth(56)
+        self.text_edit_page_validator = QIntValidator(1, 1, self)
+        self.text_edit_page_input.setValidator(self.text_edit_page_validator)
+        self.text_edit_page_input.editingFinished.connect(self.refresh_text_edit_page)
+        top.addWidget(self.text_edit_page_input)
+        self.add_button(top, "偵測文字", self.refresh_text_edit_page)
+        top.addStretch(1)
+        left.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.text_edit_preview_label = QLabel()
+        self.text_edit_preview_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.text_edit_preview_label.setStyleSheet("background: #f6f8fb; border: 1px solid #dce3ec;")
+        scroll.setWidget(self.text_edit_preview_label)
+        left.addWidget(scroll, 1)
+        layout.addLayout(left, 1)
+
+        side = QFrame()
+        side.setObjectName("panel")
+        side.setFixedWidth(360)
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(10)
+
+        side_layout.addWidget(QLabel("偵測到的文字片段"))
+        self.text_edit_block_list = QListWidget()
+        self.text_edit_block_list.currentRowChanged.connect(self.on_text_edit_block_selected)
+        side_layout.addWidget(self.text_edit_block_list, 1)
+
+        self.text_edit_block_info = QLabel("選取文字片段後可替換。")
+        self.text_edit_block_info.setObjectName("muted")
+        self.text_edit_block_info.setWordWrap(True)
+        side_layout.addWidget(self.text_edit_block_info)
+
+        side_layout.addWidget(QLabel("替換成"))
+        self.text_edit_replacement_input = QTextEdit()
+        self.text_edit_replacement_input.setFixedHeight(80)
+        side_layout.addWidget(self.text_edit_replacement_input)
+
+        side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.text_edit_password_input = QLineEdit()
+        self.text_edit_password_input.setEchoMode(QLineEdit.Password)
+        side_layout.addWidget(self.text_edit_password_input)
+
+        save_button = self.add_button(side_layout, "替換並另存 PDF", self.save_text_edit_pdf, "primary")
+        save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        guide = QLabel(
+            "Beta：此功能會先偵測文字層，選中片段後用白底覆蓋原字，再用接近原大小的新文字放上去。"
+            "若是掃描 PDF，請先用 OCR 轉可搜尋 PDF。"
+        )
+        guide.setObjectName("muted")
+        guide.setWordWrap(True)
+        side_layout.addWidget(guide)
+        layout.addWidget(side)
+        return tab
+
+    def load_text_edit_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
+        if path:
+            self.set_text_edit_pdf(Path(path))
+
+    def drop_text_edit_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到文字編輯分頁。")
+            return
+        self.set_text_edit_pdf(pdf_paths[0])
+
+    def set_text_edit_pdf(self, path: Path) -> None:
+        try:
+            reader = open_reader(path, self.text_edit_password_input.text())
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.text_edit_pdf_path = path
+        self.text_edit_page_count = len(reader.pages)
+        self.text_edit_page_validator.setRange(1, max(self.text_edit_page_count, 1))
+        self.text_edit_page_input.setText("1")
+        self.refresh_text_edit_page()
+        self.set_status(f"已載入文字編輯 PDF：{path.name}")
+
+    def refresh_text_edit_page(self) -> None:
+        if self.text_edit_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        page_number = min(max(int(self.text_edit_page_input.text() or "1"), 1), self.text_edit_page_count)
+        self.text_edit_page_input.setText(str(page_number))
+        try:
+            self.text_edit_blocks = extract_page_text_blocks(
+                self.text_edit_pdf_path,
+                page_number - 1,
+                self.text_edit_password_input.text(),
+            )
+            self.render_text_edit_preview()
+            self.refresh_text_edit_blocks()
+        except Exception as exc:
+            self.show_error(exc)
+
+    def refresh_text_edit_blocks(self) -> None:
+        self.text_edit_block_list.clear()
+        for block in self.text_edit_blocks:
+            label = block.text.replace("\n", " ")
+            if len(label) > 80:
+                label = f"{label[:77]}..."
+            item = QListWidgetItem(label)
+            item.setData(Qt.UserRole, block)
+            self.text_edit_block_list.addItem(item)
+        if not self.text_edit_blocks:
+            self.text_edit_block_info.setText("此頁沒有偵測到文字層。掃描 PDF 請先 OCR。")
+
+    def render_text_edit_preview(self) -> None:
+        if self.text_edit_pdf_path is None:
+            return
+        item = PageItem(
+            self.text_edit_pdf_path,
+            int(self.text_edit_page_input.text() or "1") - 1,
+            self.text_edit_pdf_path.name,
+        )
+        self.text_edit_preview_image = self.render_page_image(item, scale=1.2, max_size=(760, 980))
+        self.update_text_edit_preview()
+
+    def on_text_edit_block_selected(self, row: int) -> None:
+        if row < 0:
+            return
+        block = self.text_edit_block_list.item(row).data(Qt.UserRole)
+        if not isinstance(block, TextBlock):
+            return
+        self.text_edit_replacement_input.setPlainText(block.text)
+        self.text_edit_block_info.setText(
+            f"位置 X {block.x:.1f}, Y {block.y:.1f}；估計字體大小 {block.font_size:.1f}；字型 {block.font_name or '未知'}"
+        )
+        self.update_text_edit_preview(block)
+
+    def update_text_edit_preview(self, selected_block: TextBlock | None = None) -> None:
+        if self.text_edit_preview_image is None:
+            self.text_edit_preview_label.clear()
+            return
+        image = self.text_edit_preview_image.copy()
+        if selected_block is not None:
+            reader = open_reader(self.text_edit_pdf_path, self.text_edit_password_input.text())
+            page = reader.pages[int(self.text_edit_page_input.text() or "1") - 1]
+            page_width = float(page.mediabox.width)
+            page_height = float(page.mediabox.height)
+            draw = ImageDraw.Draw(image)
+            scale_x = image.width / page_width
+            scale_y = image.height / page_height
+            left = selected_block.x * scale_x
+            bottom = image.height - selected_block.y * scale_y
+            top = bottom - selected_block.height * scale_y
+            right = left + selected_block.width * scale_x
+            draw.rectangle((left, top, right, bottom), outline="#0f766e", width=3)
+        pixmap = QPixmap.fromImage(ImageQt(image))
+        self.text_edit_preview_label.setPixmap(pixmap)
+        self.text_edit_preview_label.resize(pixmap.size())
+
+    def save_text_edit_pdf(self) -> None:
+        if self.text_edit_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        item = self.text_edit_block_list.currentItem()
+        if item is None:
+            self.set_status("請先選取要替換的文字片段。")
+            return
+        block = item.data(Qt.UserRole)
+        replacement = self.text_edit_replacement_input.toPlainText().strip()
+        target, _ = QFileDialog.getSaveFileName(self, "另存文字編輯 PDF", "edited-text.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+
+        self.run_pdf_job(
+            lambda: replace_text_block_overlay(
+                self.text_edit_pdf_path,
+                target_path,
+                int(self.text_edit_page_input.text() or "1") - 1,
+                block,
+                replacement,
+                self.text_edit_password_input.text(),
+            ),
+            f"已替換文字並另存：{target_path.name}",
+            on_success=lambda: self.open_pdf_as_new_tab(target_path),
+        )
 
     def output_settings(self) -> QSettings:
         return QSettings(SETTINGS_ORG, SETTINGS_APP)
