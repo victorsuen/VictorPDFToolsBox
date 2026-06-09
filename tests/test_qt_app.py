@@ -289,6 +289,20 @@ class QtAppTests(unittest.TestCase):
         self.assertIsNotNone(window.text_edit_preview_label.pixmap())
         self.assertFalse(window.text_edit_preview_label.pixmap().isNull())
 
+    def test_text_edit_replacement_preview_expands_for_long_text(self):
+        window = VictorPdfToolsQt()
+        block = TextBlock("Old", 72, 320, 30, 20, 12, "/Helvetica")
+
+        left, _top, right, _bottom = window.text_replacement_preview_rect(
+            block,
+            "Long replacement value",
+            1.0,
+            1.0,
+            500,
+        )
+
+        self.assertGreater(right - left, block.width)
+
     def test_text_edit_search_respects_case_sensitive_option(self):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)

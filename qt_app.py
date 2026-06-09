@@ -57,6 +57,7 @@ from pdf_core import (
     extract_pdf_pages,
     extract_page_text_blocks,
     extract_pdf_text,
+    font_key_for_pdf_font,
     images_to_pdf,
     merge_pdf_files,
     ocr_pdf_to_searchable_pdf,
@@ -1479,24 +1480,49 @@ class VictorPdfToolsQt(QMainWindow):
                     draw.rectangle((left, top, right, bottom), outline="#f97316", width=2)
 
         if selected_block is not None:
-            left = selected_block.x * scale_x
-            bottom = image.height - selected_block.y * scale_y
-            top = bottom - selected_block.height * scale_y
-            right = left + selected_block.width * scale_x
             replacement = self.text_edit_replacement_input.toPlainText().strip()
+            left, top, right, bottom = self.text_replacement_preview_rect(
+                selected_block,
+                replacement,
+                scale_x,
+                scale_y,
+                image.height,
+            )
             if replacement:
                 draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#cbd5e1", width=1)
                 preview_font_size = max(selected_block.font_size * scale_y * 0.92, 8)
                 font = self.annotation_preview_font(
                     preview_font_size,
                     "bold" in (selected_block.font_name or "").lower(),
-                    "courier" if "courier" in (selected_block.font_name or "").lower() else "helvetica",
+                    font_key_for_pdf_font(selected_block.font_name),
                 )
                 draw.text((left + 3, top + 2), replacement, fill="#111827", font=font)
             draw.rectangle((left, top, right, bottom), outline="#0f766e", width=3)
         pixmap = QPixmap.fromImage(ImageQt(image))
         self.text_edit_preview_label.setPixmap(pixmap)
         self.text_edit_preview_label.resize(pixmap.size())
+
+    def text_replacement_preview_rect(
+        self,
+        block: TextBlock,
+        replacement: str,
+        scale_x: float,
+        scale_y: float,
+        image_height: int,
+    ) -> tuple[float, float, float, float]:
+        if replacement:
+            cover_width = max(block.width + block.font_size * 0.8, len(replacement) * block.font_size * 0.65)
+            cover_height = max(block.height, block.font_size * 1.8)
+            left = block.x * scale_x
+            top = image_height - (block.y + cover_height) * scale_y
+            right = (block.x + cover_width) * scale_x
+            bottom = image_height - (block.y - 4) * scale_y
+            return (left, top, right, bottom)
+        left = block.x * scale_x
+        bottom = image_height - block.y * scale_y
+        top = bottom - block.height * scale_y
+        right = left + block.width * scale_x
+        return (left, top, right, bottom)
 
     def current_text_edit_page_size(self) -> tuple[float, float]:
         if self.text_edit_pdf_path is None:
