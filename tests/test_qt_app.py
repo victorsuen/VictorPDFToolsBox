@@ -197,6 +197,20 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(len(window.tool_file_items), 1)
         self.assertEqual(window.tool_file_list.count(), 1)
 
+    def test_tool_tab_accepts_dropped_pdf_files(self):
+        window = VictorPdfToolsQt()
+        window.drop_tool_files([str(self.source), str(self.second_source)])
+
+        self.assertEqual(len(window.tool_file_items), 2)
+
+    def test_annotation_tab_loads_pdf(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+
+        self.assertEqual(window.annotation_pdf_path, self.source)
+        self.assertEqual(window.annotation_page_count, 2)
+        self.assertEqual(window.annotation_page_spin.maximum(), 2)
+
     def test_merge_dialog_undo_restores_removed_source(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])

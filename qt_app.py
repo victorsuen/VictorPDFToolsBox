@@ -6,9 +6,10 @@ from pathlib import Path
 from PIL import Image, ImageDraw
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPixmap
+from PySide6.QtGui import QAction, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
+    QCheckBox,
     QComboBox,
     QDialog,
     QDialogButtonBox,
@@ -29,6 +30,7 @@ from PySide6.QtWidgets import (
     QSpinBox,
     QStatusBar,
     QTabWidget,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -39,6 +41,7 @@ from pdf_core import (
     PDF_SUFFIXES,
     PageItem,
     add_page_numbers,
+    add_text_overlay_annotation,
     add_watermark,
     clean_metadata,
     compress_pdf,
@@ -80,9 +83,97 @@ TOOL_OPERATIONS = [
     ("clean_metadata", "清理 Metadata"),
 ]
 
+PDF_OUTPUT_OPERATIONS = frozenset(
+    {
+        "merge",
+        "extract",
+        "delete",
+        "rotate",
+        "encrypt",
+        "decrypt",
+        "compress",
+        "images_to_pdf",
+        "add_page_numbers",
+        "watermark",
+        "remove_blank_pages",
+        "clean_metadata",
+    }
+)
 
 THUMB_SIZE = QSize(195, 292)
 ICON_SIZE = QSize(165, 215)
+ANNOT_PREVIEW_MAX_WIDTH = 760
+ANNOT_PREVIEW_MAX_HEIGHT = 760
+ANNOT_PREVIEW_OFFSET = 12
+
+
+class ToolFileList(QListWidget):
+    filesDropped = Signal(list)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
+            self.filesDropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
+
+class AnnotationPreviewLabel(QLabel):
+    positionClicked = Signal(QPoint)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.setStyleSheet("background: #f6f8fb; border: 1px solid #dce3ec;")
+
+    def mousePressEvent(self, event) -> None:
+        self.positionClicked.emit(event.position().toPoint())
+        super().mousePressEvent(event)
+
+
+class PdfDropPanel(QWidget):
+    filesDropped = Signal(list)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAcceptDrops(True)
+
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if event.mimeData().hasUrls():
+            paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
+            self.filesDropped.emit(paths)
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
 
 
 class PageGrid(QListWidget):
@@ -503,6 +594,10 @@ class VictorPdfToolsQt(QMainWindow):
         self.page_clipboard: list[PageItem] = []
         self.tool_file_items: list[Path] = []
         self._last_tool_status_message = ""
+        self.annotation_pdf_path: Path | None = None
+        self.annotation_page_count = 0
+        self.annotation_page_size = (0.0, 0.0)
+        self.annotation_preview_image: Image.Image | None = None
         self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
         self.stats_label = QLabel("總頁數：0　已選取：0")
@@ -588,6 +683,7 @@ class VictorPdfToolsQt(QMainWindow):
         tabs = QTabWidget()
         tabs.addTab(self.build_organize_tab(), "組織 / 擷取")
         tabs.addTab(self.build_tools_tab(), "常用 PDF 工具")
+        tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
         layout.addWidget(tabs, 1)
         self.setCentralWidget(root)
 
@@ -697,8 +793,9 @@ class VictorPdfToolsQt(QMainWindow):
         body = QHBoxLayout()
         body.setSpacing(14)
 
-        self.tool_file_list = QListWidget()
+        self.tool_file_list = ToolFileList()
         self.tool_file_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.tool_file_list.filesDropped.connect(self.drop_tool_files)
         body.addWidget(self.tool_file_list, 1)
 
         form = QFrame()
@@ -751,13 +848,97 @@ class VictorPdfToolsQt(QMainWindow):
         run_button = self.add_button(form_layout, "處理並另存", self.run_tool_operation, "primary")
         run_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        hint = QLabel("提示：合併 / 圖片轉 PDF 可加入多個檔案；其餘工具使用清單第一個 PDF。")
+        hint = QLabel("提示：可把 PDF / 圖片直接拖入左側清單；合併 / 圖片轉 PDF 可加入多個檔案，其餘工具使用清單第一個 PDF。輸出 PDF 會自動開成新 Tab。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         form_layout.addWidget(hint)
         form_layout.addStretch(1)
         body.addWidget(form)
         layout.addLayout(body, 1)
+        return tab
+
+    def build_annotation_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_annotation_pdf)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(14)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        top = QHBoxLayout()
+        self.add_button(top, "載入 PDF", self.load_annotation_pdf)
+        top.addWidget(QLabel("頁碼"))
+        self.annotation_page_spin = QSpinBox()
+        self.annotation_page_spin.setMinimum(1)
+        self.annotation_page_spin.setMaximum(1)
+        self.annotation_page_spin.valueChanged.connect(self.render_annotation_preview)
+        top.addWidget(self.annotation_page_spin)
+        self.add_button(top, "更新預覽", self.render_annotation_preview)
+        top.addStretch(1)
+        left.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.annotation_preview_label = AnnotationPreviewLabel()
+        self.annotation_preview_label.positionClicked.connect(self.set_annotation_position_from_click)
+        scroll.setWidget(self.annotation_preview_label)
+        left.addWidget(scroll, 1)
+        layout.addLayout(left, 1)
+
+        side = QFrame()
+        side.setObjectName("panel")
+        side.setFixedWidth(300)
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(10)
+
+        side_layout.addWidget(QLabel("標註文字"))
+        self.annotation_text_input = QTextEdit()
+        self.annotation_text_input.setPlaceholderText("輸入要覆蓋或加上的文字")
+        self.annotation_text_input.setFixedHeight(110)
+        side_layout.addWidget(self.annotation_text_input)
+
+        self.annotation_cover_checkbox = QCheckBox("先用白底覆蓋原文字")
+        self.annotation_cover_checkbox.setChecked(True)
+        side_layout.addWidget(self.annotation_cover_checkbox)
+
+        side_layout.addWidget(QLabel("X / Y 位置"))
+        xy = QHBoxLayout()
+        self.annotation_x_input = QLineEdit("72")
+        self.annotation_y_input = QLineEdit("720")
+        xy.addWidget(self.annotation_x_input)
+        xy.addWidget(self.annotation_y_input)
+        side_layout.addLayout(xy)
+
+        side_layout.addWidget(QLabel("字體大小"))
+        self.annotation_font_size_spin = QSpinBox()
+        self.annotation_font_size_spin.setRange(6, 72)
+        self.annotation_font_size_spin.setValue(12)
+        side_layout.addWidget(self.annotation_font_size_spin)
+
+        side_layout.addWidget(QLabel("覆蓋框 / 文字框寬高"))
+        wh = QHBoxLayout()
+        self.annotation_width_input = QLineEdit("220")
+        self.annotation_height_input = QLineEdit("32")
+        wh.addWidget(self.annotation_width_input)
+        wh.addWidget(self.annotation_height_input)
+        side_layout.addLayout(wh)
+
+        side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.annotation_password_input = QLineEdit()
+        self.annotation_password_input.setEchoMode(QLineEdit.Password)
+        side_layout.addWidget(self.annotation_password_input)
+
+        save_button = self.add_button(side_layout, "套用並另存 PDF", self.save_annotation_pdf, "primary")
+        save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        guide = QLabel("提示：點擊左側預覽可設定文字位置；也可直接把 PDF 拖入此分頁。完成後會自動開成新 Tab。")
+        guide.setObjectName("muted")
+        guide.setWordWrap(True)
+        side_layout.addWidget(guide)
+        side_layout.addStretch(1)
+        layout.addWidget(side)
         return tab
 
     def refresh_tool_file_list(self) -> None:
@@ -816,6 +997,139 @@ class VictorPdfToolsQt(QMainWindow):
         self.tool_file_items.clear()
         self.refresh_tool_file_list()
 
+    def drop_tool_files(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        image_paths = [Path(path) for path in paths if Path(path).suffix.lower() in IMAGE_SUFFIXES]
+        if pdf_paths:
+            self.add_tool_files_from_paths(pdf_paths, PDF_SUFFIXES)
+        if image_paths:
+            self.add_tool_files_from_paths(image_paths, IMAGE_SUFFIXES)
+        if not pdf_paths and not image_paths:
+            self.set_status("請拖放 PDF 或圖片檔案到工具清單。")
+
+    def load_annotation_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
+        if path:
+            self.set_annotation_pdf(Path(path))
+
+    def drop_annotation_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到標註分頁。")
+            return
+        self.set_annotation_pdf(pdf_paths[0])
+
+    def set_annotation_pdf(self, path: Path) -> None:
+        try:
+            reader = open_reader(path, self.annotation_password_input.text())
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.annotation_pdf_path = path
+        self.annotation_page_count = len(reader.pages)
+        self.annotation_page_spin.setMaximum(max(self.annotation_page_count, 1))
+        self.annotation_page_spin.setValue(1)
+        self.render_annotation_preview()
+        self.set_status(f"已載入 {path.name}，共 {self.annotation_page_count} 頁。")
+
+    def render_annotation_preview(self) -> None:
+        if self.annotation_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        if not PDF_RENDER_AVAILABLE or pdfium is None:
+            self.set_status("PDF 預覽元件未啟用，仍可手動輸入 X/Y。")
+            return
+        try:
+            page_number = min(max(self.annotation_page_spin.value(), 1), self.annotation_page_count)
+            self.annotation_page_spin.setValue(page_number)
+            document = pdfium.PdfDocument(str(self.annotation_pdf_path), password=self.annotation_password_input.text() or None)
+            page = document.get_page(page_number - 1)
+            page_width, page_height = page.get_size()
+            scale = min(ANNOT_PREVIEW_MAX_WIDTH / page_width, ANNOT_PREVIEW_MAX_HEIGHT / page_height, 1.25)
+            image = page.render(scale=scale).to_pil().convert("RGB")
+            page.close()
+            document.close()
+            self.annotation_page_size = (float(page_width), float(page_height))
+            self.annotation_preview_image = image
+            self.update_annotation_preview_display()
+        except Exception as exc:
+            self.show_error(exc)
+
+    def update_annotation_preview_display(self) -> None:
+        if self.annotation_preview_image is None:
+            self.annotation_preview_label.clear()
+            return
+        pixmap = QPixmap.fromImage(ImageQt(self.annotation_preview_image.copy()))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        page_width, page_height = self.annotation_page_size
+        image_width, image_height = self.annotation_preview_image.size
+        if page_width > 0 and page_height > 0:
+            try:
+                pdf_x = float(self.annotation_x_input.text())
+                pdf_y = float(self.annotation_y_input.text())
+            except ValueError:
+                pdf_x = 72.0
+                pdf_y = 720.0
+            x = pdf_x / page_width * image_width
+            y = (page_height - pdf_y) / page_height * image_height
+            pen = QPen(Qt.GlobalColor.darkCyan, 2)
+            painter.setPen(pen)
+            painter.drawEllipse(QPoint(int(x), int(y)), 5, 5)
+            painter.drawLine(int(x) - 12, int(y), int(x) + 12, int(y))
+            painter.drawLine(int(x), int(y) - 12, int(x), int(y) + 12)
+        painter.end()
+        self.annotation_preview_label.setPixmap(pixmap)
+        self.annotation_preview_label.resize(pixmap.size())
+
+    def set_annotation_position_from_click(self, point: QPoint) -> None:
+        page_width, page_height = self.annotation_page_size
+        if self.annotation_preview_image is None or page_width <= 0 or page_height <= 0:
+            return
+        image_width, image_height = self.annotation_preview_image.size
+        image_x = min(max(point.x(), 0), image_width)
+        image_y = min(max(point.y(), 0), image_height)
+        pdf_x = image_x / image_width * page_width
+        pdf_y = page_height - (image_y / image_height * page_height)
+        self.annotation_x_input.setText(f"{pdf_x:.1f}")
+        self.annotation_y_input.setText(f"{pdf_y:.1f}")
+        self.update_annotation_preview_display()
+        self.set_status(f"已設定文字位置：X {pdf_x:.1f}, Y {pdf_y:.1f}")
+
+    def save_annotation_pdf(self) -> None:
+        if self.annotation_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        text = self.annotation_text_input.toPlainText().strip()
+        if not text:
+            self.set_status("請輸入標註文字。")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "另存標註 PDF", "annotated.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+
+        def job() -> None:
+            add_text_overlay_annotation(
+                source=self.annotation_pdf_path,
+                target=target_path,
+                page_index=self.annotation_page_spin.value() - 1,
+                x=float(self.annotation_x_input.text()),
+                y=float(self.annotation_y_input.text()),
+                text=text,
+                font_size=self.annotation_font_size_spin.value(),
+                cover_original=self.annotation_cover_checkbox.isChecked(),
+                cover_width=float(self.annotation_width_input.text()),
+                cover_height=float(self.annotation_height_input.text()),
+                password=self.annotation_password_input.text(),
+            )
+
+        self.run_pdf_job(
+            job,
+            f"已套用文字標註：{target_path.name}",
+            on_success=lambda: self.open_pdf_as_new_tab(target_path),
+        )
+
     def run_tool_operation(self) -> None:
         if not self.tool_file_items:
             self.set_status("請先加入檔案。")
@@ -836,10 +1150,15 @@ class VictorPdfToolsQt(QMainWindow):
             return
         target_path = Path(target)
 
+        def on_success() -> None:
+            self.set_status(self._last_tool_status_message)
+            if operation in PDF_OUTPUT_OPERATIONS:
+                self.open_pdf_as_new_tab(target_path)
+
         self.run_pdf_job(
             lambda: self._execute_tool_operation(operation, source, target_path, password),
             "",
-            on_success=lambda: self.set_status(self._last_tool_status_message),
+            on_success=on_success,
         )
 
     def _execute_tool_operation(self, operation: str, source: Path, target_path: Path, password: str) -> None:
