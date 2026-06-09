@@ -20,6 +20,7 @@ from PySide6.QtWidgets import (
     QListWidget,
     QListWidgetItem,
     QMainWindow,
+    QMenu,
     QMessageBox,
     QPushButton,
     QScrollArea,
@@ -202,27 +203,40 @@ class PdfDropTabWidget(QTabWidget):
         return any(Path(url.toLocalFile()).suffix.lower() == ".pdf" for url in event.mimeData().urls())
 
 
+class MergeSourceList(QListWidget):
+    beforeInternalMove = Signal()
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if event.source() is self:
+            self.beforeInternalMove.emit()
+        super().dropEvent(event)
+
+
 class MergeFilesDialog(QDialog):
     def __init__(self, main_window: "VictorPdfToolsQt") -> None:
         super().__init__(main_window)
         self.main_window = main_window
+        self.undo_stack: list[list[tuple[str, list[PageItem]]]] = []
         self.setWindowTitle("合併文件")
         self.resize(760, 520)
 
         layout = QVBoxLayout(self)
-        hint = QLabel("選擇要合併的文件，然後拖拉圖示調整文件順序。")
-        hint.setObjectName("muted")
-        layout.addWidget(hint)
+        self.hint_label = QLabel("選擇要合併的文件，然後拖拉圖示調整文件順序。")
+        self.hint_label.setObjectName("muted")
+        self.hint_label.setWordWrap(True)
+        layout.addWidget(self.hint_label)
 
         controls = QHBoxLayout()
         main_window.add_button(controls, "加入目前 Tab", self.add_current_tab)
         main_window.add_button(controls, "加入所有已開 Tab", self.add_open_tabs)
         main_window.add_button(controls, "加入外部 PDF", self.add_external_pdf)
         main_window.add_button(controls, "移除選取", self.remove_selected, "danger")
+        main_window.add_button(controls, "復原", self.undo_last)
+        main_window.add_button(controls, "清空清單", self.clear_sources, "danger")
         controls.addStretch(1)
         layout.addLayout(controls)
 
-        self.source_list = QListWidget()
+        self.source_list = MergeSourceList()
         self.source_list.setDragEnabled(True)
         self.source_list.setAcceptDrops(True)
         self.source_list.setDropIndicatorShown(True)
@@ -236,6 +250,30 @@ class MergeFilesDialog(QDialog):
         self.source_list.setSpacing(14)
         self.source_list.setIconSize(ICON_SIZE)
         self.source_list.setGridSize(THUMB_SIZE)
+        self.source_list.setStyleSheet(
+            """
+            QListWidget {
+                border: 1px solid #c8c5bd;
+                background: #f7f7f4;
+                padding: 18px;
+            }
+            QListWidget::item {
+                background: #ffffff;
+                border: 1px solid #d2d2d2;
+                border-radius: 8px;
+                padding: 10px;
+                margin: 4px;
+            }
+            QListWidget::item:selected {
+                background: #d9f0ea;
+                border: 2px solid #128576;
+                color: #10201d;
+            }
+            """
+        )
+        self.source_list.beforeInternalMove.connect(self.push_undo)
+        self.source_list.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.source_list.customContextMenuRequested.connect(self.show_context_menu)
         layout.addWidget(self.source_list, 1)
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
@@ -243,20 +281,89 @@ class MergeFilesDialog(QDialog):
         buttons.rejected.connect(self.reject)
         layout.addWidget(buttons)
 
+        undo_action = QAction("復原", self)
+        undo_action.setShortcut("Ctrl+Z")
+        undo_action.triggered.connect(self.undo_last)
+        self.addAction(undo_action)
+
+        remove_action = QAction("移除選取", self)
+        remove_action.setShortcut("Delete")
+        remove_action.triggered.connect(self.remove_selected)
+        self.addAction(remove_action)
+
+    def snapshot_sources(self) -> list[tuple[str, list[PageItem]]]:
+        snapshot: list[tuple[str, list[PageItem]]] = []
+        for index in range(self.source_list.count()):
+            item = self.source_list.item(index)
+            title = item.text().split("\n", 1)[0]
+            snapshot.append((title, list(item.data(Qt.UserRole))))
+        return snapshot
+
+    def restore_snapshot(self, snapshot: list[tuple[str, list[PageItem]]]) -> None:
+        self.source_list.clear()
+        for title, items in snapshot:
+            self._add_source_item(title, items)
+        self.update_hint()
+
+    def push_undo(self) -> None:
+        self.undo_stack.append(self.snapshot_sources())
+
+    def undo_last(self) -> None:
+        if not self.undo_stack:
+            QMessageBox.information(self, "合併文件", "沒有可復原的動作。")
+            return
+        self.restore_snapshot(self.undo_stack.pop())
+
+    def update_hint(self) -> None:
+        count = self.source_list.count()
+        if count == 0:
+            self.hint_label.setText("尚未加入文件。可用上方按鈕加入，或拖入外部 PDF。")
+            return
+        self.hint_label.setText(
+            f"已加入 {count} 個文件。點選文件後可按「移除選取」、Delete 或右鍵移除；Ctrl+Z 可復原上一個動作。"
+        )
+
+    def show_context_menu(self, position) -> None:
+        item = self.source_list.itemAt(position)
+        if item is None:
+            return
+        if item not in self.source_list.selectedItems():
+            self.source_list.clearSelection()
+            item.setSelected(True)
+        menu = QMenu(self)
+        menu.addAction("移除選取", self.remove_selected)
+        menu.addAction("復原", self.undo_last)
+        menu.exec(self.source_list.mapToGlobal(position))
+
     def add_current_tab(self) -> None:
         grid = self.main_window.current_grid()
         if not isinstance(grid, PageGrid):
             return
-        self.add_grid_source(grid)
+        self.push_undo()
+        self.add_grid_source(grid, record_undo=False)
+        self.update_hint()
 
-    def add_open_tabs(self) -> None:
-        for index in range(self.main_window.document_tabs.count()):
-            grid = self.main_window.document_tabs.widget(index)
-            if isinstance(grid, PageGrid):
-                self.add_grid_source(grid)
+    def add_open_tabs(self, *, silent_if_empty: bool = False) -> None:
+        grids = [
+            self.main_window.document_tabs.widget(index)
+            for index in range(self.main_window.document_tabs.count())
+        ]
+        grids = [grid for grid in grids if isinstance(grid, PageGrid)]
+        if not any(self.main_window.workspaces.get(grid, {}).get("items") for grid in grids):
+            if not silent_if_empty:
+                QMessageBox.information(self, "合併文件", "目前沒有可加入的文件 Tab。")
+            return
+        self.push_undo()
+        for grid in grids:
+            self.add_grid_source(grid, record_undo=False)
+        self.update_hint()
 
     def add_external_pdf(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(self, "加入外部 PDF", "", "PDF files (*.pdf)")
+        if not files:
+            return
+        self.push_undo()
+        added = 0
         for raw_path in files:
             path = Path(raw_path)
             try:
@@ -265,18 +372,34 @@ class MergeFilesDialog(QDialog):
                 self.main_window.show_error(exc)
                 continue
             items = [PageItem(path, page_index, f"{path.name} - Page {page_index + 1}") for page_index in range(len(reader.pages))]
-            self.add_source(path.name, items)
+            self._add_source_item(path.name, items)
+            added += 1
+        if added == 0:
+            self.undo_stack.pop()
+        else:
+            self.update_hint()
 
-    def add_grid_source(self, grid: PageGrid) -> None:
+    def add_grid_source(self, grid: PageGrid, *, record_undo: bool = True) -> None:
         workspace = self.main_window.workspaces.get(grid)
         if not workspace or not workspace["items"]:
             return
+        if record_undo:
+            self.push_undo()
         title = self.main_window.document_tabs.tabText(self.main_window.document_tabs.indexOf(grid))
-        self.add_source(title, list(workspace["items"]))
+        self._add_source_item(title, list(workspace["items"]))
+        if record_undo:
+            self.update_hint()
 
-    def add_source(self, title: str, items: list[PageItem]) -> None:
+    def add_source(self, title: str, items: list[PageItem], *, record_undo: bool = True) -> None:
         if not items:
             return
+        if record_undo:
+            self.push_undo()
+        self._add_source_item(title, items)
+        if record_undo:
+            self.update_hint()
+
+    def _add_source_item(self, title: str, items: list[PageItem]) -> None:
         list_item = QListWidgetItem(self.main_window.placeholder_icon, f"{title}\n{len(items)} 頁")
         list_item.setData(Qt.UserRole, items)
         list_item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
@@ -284,8 +407,21 @@ class MergeFilesDialog(QDialog):
         self.source_list.addItem(list_item)
 
     def remove_selected(self) -> None:
-        for item in self.source_list.selectedItems():
+        selected = self.source_list.selectedItems()
+        if not selected:
+            QMessageBox.information(self, "合併文件", "請先點選要移除的文件。")
+            return
+        self.push_undo()
+        for item in selected:
             self.source_list.takeItem(self.source_list.row(item))
+        self.update_hint()
+
+    def clear_sources(self) -> None:
+        if self.source_list.count() == 0:
+            return
+        self.push_undo()
+        self.source_list.clear()
+        self.update_hint()
 
     def page_items(self) -> list[PageItem]:
         items: list[PageItem] = []
@@ -869,7 +1005,7 @@ class VictorPdfToolsQt(QMainWindow):
 
     def open_merge_files_dialog(self) -> None:
         dialog = MergeFilesDialog(self)
-        dialog.add_open_tabs()
+        dialog.add_open_tabs(silent_if_empty=True)
         if dialog.exec() != QDialog.Accepted:
             return
         merge_items = dialog.page_items()

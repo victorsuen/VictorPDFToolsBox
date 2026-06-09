@@ -177,6 +177,34 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual([item.pdf_path.name for item in items], ["second.pdf", "source.pdf", "source.pdf"])
         self.assertEqual([item.page_index for item in items], [0, 0, 1])
 
+    def test_merge_dialog_remove_selected_source(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.add_files_from_paths([str(self.second_source)])
+        dialog = MergeFilesDialog(window)
+        dialog.add_open_tabs()
+
+        dialog.source_list.item(0).setSelected(True)
+        dialog.remove_selected()
+
+        self.assertEqual(dialog.source_list.count(), 1)
+        self.assertEqual(dialog.source_list.item(0).text().split("\n", 1)[0], "second.pdf")
+
+    def test_merge_dialog_undo_restores_removed_source(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.add_files_from_paths([str(self.second_source)])
+        dialog = MergeFilesDialog(window)
+        dialog.add_open_tabs()
+
+        dialog.source_list.item(0).setSelected(True)
+        dialog.remove_selected()
+        dialog.undo_last()
+
+        self.assertEqual(dialog.source_list.count(), 2)
+        self.assertEqual(dialog.source_list.item(0).text().split("\n", 1)[0], "source.pdf")
+        self.assertEqual(dialog.source_list.item(1).text().split("\n", 1)[0], "second.pdf")
+
 
 if __name__ == "__main__":
     unittest.main()
