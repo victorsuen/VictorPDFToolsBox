@@ -247,6 +247,85 @@ def write_pdf_info(source: Path, target: Path, password: str = "") -> None:
     target.write_text("\n".join(lines), encoding="utf-8")
 
 
+IMAGE_EXPORT_FORMATS = {"png", "jpg", "jpeg", "webp"}
+
+
+def _image_extension(image_format: str) -> str:
+    normalized = (image_format or "png").lower()
+    if normalized in {"jpg", "jpeg"}:
+        return "jpg"
+    if normalized == "webp":
+        return "webp"
+    return "png"
+
+
+def _save_rendered_image(image: Image.Image, path: Path, image_format: str) -> None:
+    normalized = (image_format or "png").lower()
+    if normalized in {"jpg", "jpeg"}:
+        image.save(path, format="JPEG", quality=92)
+    elif normalized == "webp":
+        image.save(path, format="WEBP", quality=90)
+    else:
+        image.save(path, format="PNG")
+
+
+def pdf_to_images(
+    source: Path,
+    target: Path,
+    password: str = "",
+    image_format: str = "png",
+    dpi: int = 200,
+    pages_spec: str = "",
+) -> int:
+    if not PDF_RENDER_AVAILABLE or pdfium is None:
+        raise ValueError("PDF 轉圖片需要 pypdfium2 預覽元件。")
+    if dpi < 72 or dpi > 600:
+        raise ValueError("解析度請介於 72 至 600 DPI。")
+
+    reader = open_reader(source, password)
+    page_indexes = (
+        list(range(len(reader.pages)))
+        if not (pages_spec or "").strip()
+        else parse_pages(pages_spec, len(reader.pages))
+    )
+    if not page_indexes:
+        raise ValueError("沒有可輸出的頁面。")
+
+    scale = dpi / 72.0
+    extension = _image_extension(image_format)
+    stem = safe_output_name(source.stem)
+
+    def write_images(folder: Path) -> list[Path]:
+        folder.mkdir(parents=True, exist_ok=True)
+        generated: list[Path] = []
+        document = pdfium.PdfDocument(str(source), password=password or None)
+        try:
+            for output_index, page_index in enumerate(page_indexes, start=1):
+                page = document.get_page(page_index)
+                try:
+                    image = page.render(scale=scale).to_pil().convert("RGB")
+                finally:
+                    page.close()
+                filename = safe_output_name(f"{stem}-page-{page_index + 1:04d}.{extension}")
+                output_path = folder / filename
+                _save_rendered_image(image, output_path, image_format)
+                generated.append(output_path)
+        finally:
+            document.close()
+        return generated
+
+    if target.suffix.lower() == ".zip":
+        with tempfile.TemporaryDirectory() as temp_dir:
+            generated = write_images(Path(temp_dir))
+            with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+                for item in generated:
+                    archive.write(item, item.name)
+        return len(page_indexes)
+
+    generated = write_images(target)
+    return len(generated)
+
+
 def images_to_pdf(paths: list[Path], target: Path) -> None:
     if not paths:
         raise ValueError("請選擇圖片。")

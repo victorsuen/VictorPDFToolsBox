@@ -57,6 +57,7 @@ from pdf_core import (
     extract_pdf_text,
     images_to_pdf,
     merge_pdf_files,
+    pdf_to_images,
     open_reader,
     page_item_label,
     parse_pages,
@@ -81,6 +82,7 @@ TOOL_OPERATIONS = [
     ("compress", "基礎壓縮"),
     ("extract_text", "抽取文字"),
     ("images_to_pdf", "圖片轉 PDF"),
+    ("pdf_to_images", "PDF 轉圖片"),
     ("info", "PDF 資訊"),
     ("add_page_numbers", "加頁碼 / Footer"),
     ("watermark", "加水印 / 印章"),
@@ -105,7 +107,7 @@ PDF_OUTPUT_OPERATIONS = frozenset(
     }
 )
 
-FOLDER_REVEAL_OPERATIONS = frozenset({"split", "extract_text", "info"})
+FOLDER_REVEAL_OPERATIONS = frozenset({"split", "extract_text", "info", "pdf_to_images"})
 
 SETTINGS_ORG = "VictorSuen"
 SETTINGS_APP = "VictorPDFToolsBox"
@@ -867,6 +869,23 @@ class VictorPdfToolsQt(QMainWindow):
         self.tool_angle_input.addItems(["90", "180", "270"])
         form_layout.addWidget(self.tool_angle_input)
 
+        form_layout.addWidget(QLabel("圖片格式（PDF 轉圖片）"))
+        self.tool_image_format_combo = QComboBox()
+        self.tool_image_format_combo.addItem("PNG", "png")
+        self.tool_image_format_combo.addItem("JPG", "jpg")
+        self.tool_image_format_combo.addItem("WEBP", "webp")
+        form_layout.addWidget(self.tool_image_format_combo)
+
+        form_layout.addWidget(QLabel("圖片解析度 DPI"))
+        self.tool_image_dpi_combo = QComboBox()
+        for dpi in ("150", "200", "300"):
+            self.tool_image_dpi_combo.addItem(dpi)
+        self.tool_image_dpi_combo.setCurrentText("200")
+        form_layout.addWidget(self.tool_image_dpi_combo)
+
+        self.tool_images_zip_checkbox = QCheckBox("PDF 轉圖片時打包成 ZIP")
+        form_layout.addWidget(self.tool_images_zip_checkbox)
+
         form_layout.addWidget(QLabel("文字 / 模板"))
         self.tool_batch_text_input = QLineEdit("CONFIDENTIAL")
         form_layout.addWidget(self.tool_batch_text_input)
@@ -1347,18 +1366,35 @@ class VictorPdfToolsQt(QMainWindow):
         operation = self.tool_operation.currentData()
         password = self.tool_password_input.text()
         source = self.tool_file_items[0]
-        extension = ".txt" if operation in {"extract_text", "info"} else ".pdf"
-        if operation == "split":
-            extension = ".zip"
-        target, _ = QFileDialog.getSaveFileName(
-            self,
-            "另存輸出檔案",
-            safe_output_name(f"{operation}{extension}"),
-            f"Output files (*{extension})",
-        )
-        if not target:
-            return
-        target_path = Path(target)
+        if operation == "pdf_to_images":
+            if self.tool_images_zip_checkbox.isChecked():
+                target, _ = QFileDialog.getSaveFileName(
+                    self,
+                    "另存圖片 ZIP",
+                    safe_output_name("pdf-images.zip"),
+                    "ZIP files (*.zip)",
+                )
+                if not target:
+                    return
+                target_path = Path(target)
+            else:
+                folder = QFileDialog.getExistingDirectory(self, "選擇圖片輸出資料夾")
+                if not folder:
+                    return
+                target_path = Path(folder)
+        else:
+            extension = ".txt" if operation in {"extract_text", "info"} else ".pdf"
+            if operation == "split":
+                extension = ".zip"
+            target, _ = QFileDialog.getSaveFileName(
+                self,
+                "另存輸出檔案",
+                safe_output_name(f"{operation}{extension}"),
+                f"Output files (*{extension})",
+            )
+            if not target:
+                return
+            target_path = Path(target)
 
         def on_success() -> None:
             self.set_status(self._last_tool_status_message)
@@ -1385,6 +1421,20 @@ class VictorPdfToolsQt(QMainWindow):
         if operation == "images_to_pdf":
             images_to_pdf(self.tool_file_items, target_path)
             self._last_tool_status_message = f"已把 {len(self.tool_file_items)} 張圖片轉成 PDF。"
+            return
+        if operation == "pdf_to_images":
+            page_count = pdf_to_images(
+                source,
+                target_path,
+                password,
+                image_format=self.tool_image_format_combo.currentData(),
+                dpi=int(self.tool_image_dpi_combo.currentText()),
+                pages_spec=self.tool_pages_input.text(),
+            )
+            if target_path.suffix.lower() == ".zip":
+                self._last_tool_status_message = f"已輸出 {page_count} 張圖片並打包成 ZIP。"
+            else:
+                self._last_tool_status_message = f"已輸出 {page_count} 張圖片到資料夾。"
             return
         if operation == "extract":
             extract_pdf_pages(source, target_path, self.tool_pages_input.text(), password)

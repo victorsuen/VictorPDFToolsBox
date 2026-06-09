@@ -15,6 +15,8 @@ from flask import Flask, flash, redirect, render_template, request, send_file, u
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
 
+from pdf_core import pdf_to_images
+
 
 BASE_DIR = Path(__file__).resolve().parent
 WORK_DIR = BASE_DIR / "workspace"
@@ -52,6 +54,7 @@ TOOLS = [
     ToolCard("compress", "基礎壓縮", "壓縮內容 stream；不會上傳外部服務。", "PDF file"),
     ToolCard("extract_text", "抽取文字", "把 PDF 可讀文字抽出成 TXT。", "PDF file"),
     ToolCard("images_to_pdf", "圖片轉 PDF", "把 JPG / PNG / TIFF 等圖片合併成 PDF。", "Image files", True, True),
+    ToolCard("pdf_to_images", "PDF 轉圖片", "把 PDF 頁面輸出成 PNG 圖片，並打包成 ZIP。", "PDF file"),
     ToolCard("info", "PDF 資訊", "查看頁數、是否加密、文件 metadata。", "PDF file"),
 ]
 
@@ -261,6 +264,14 @@ def handle_extract_text() -> tuple[Path, str]:
     return target, "extracted-text.txt"
 
 
+def handle_pdf_to_images() -> tuple[Path, str]:
+    pdf = first_pdf()
+    target = output_path("pdf-images.zip")
+    page_spec = request.form.get("pages", "")
+    pdf_to_images(pdf, target, request.form.get("password") or "", pages_spec=page_spec)
+    return target, "pdf-images.zip"
+
+
 def handle_images_to_pdf() -> tuple[Path, str]:
     images = save_uploaded_files("files", IMAGE_EXTENSIONS)
     converted: list[Image.Image] = []
@@ -310,6 +321,7 @@ HANDLERS = {
     "compress": handle_compress,
     "extract_text": handle_extract_text,
     "images_to_pdf": handle_images_to_pdf,
+    "pdf_to_images": handle_pdf_to_images,
     "info": handle_info,
 }
 

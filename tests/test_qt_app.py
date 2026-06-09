@@ -221,7 +221,7 @@ class QtAppTests(unittest.TestCase):
         self.assertTrue(window.tool_open_output_folder_checkbox.isChecked())
 
     def test_folder_reveal_operations_include_zip_and_text_tools(self):
-        self.assertEqual(FOLDER_REVEAL_OPERATIONS, {"split", "extract_text", "info"})
+        self.assertEqual(FOLDER_REVEAL_OPERATIONS, {"split", "extract_text", "info", "pdf_to_images"})
 
     def test_reveal_output_skips_missing_path(self):
         with patch("qt_app.subprocess.Popen") as popen, patch("qt_app.os.startfile") as startfile:

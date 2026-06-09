@@ -25,6 +25,7 @@ from pdf_core import (
     extract_pdf_text,
     images_to_pdf,
     merge_pdf_files,
+    pdf_to_images,
     open_reader,
     page_item_label,
     parse_pages,
@@ -252,6 +253,7 @@ class VictorPdfToolsApp(BaseTk):
             ("基礎壓縮", "compress"),
             ("抽取文字", "extract_text"),
             ("圖片轉 PDF", "images_to_pdf"),
+            ("PDF 轉圖片", "pdf_to_images"),
             ("PDF 資訊", "info"),
             ("加頁碼 / Footer", "add_page_numbers"),
             ("加水印 / 印章", "watermark"),
@@ -912,6 +914,12 @@ class VictorPdfToolsApp(BaseTk):
 
     def run_operation(self) -> None:
         operation = self.operation.get()
+        if operation == "pdf_to_images":
+            target = filedialog.askdirectory(title="選擇圖片輸出資料夾")
+            if not target:
+                return
+            self.run_in_thread(lambda: self._run_operation(operation, Path(target)), "正在輸出圖片...")
+            return
         extension = ".txt" if operation in {"extract_text", "info"} else ".pdf"
         target = filedialog.asksaveasfilename(
             title="另存輸出檔案",
@@ -933,6 +941,10 @@ class VictorPdfToolsApp(BaseTk):
             return
         if operation == "images_to_pdf":
             images_to_pdf(self.file_items, target)
+            return
+        if operation == "pdf_to_images":
+            count = pdf_to_images(source, target, password, pages_spec=self.pages_var.get())
+            self.after(0, lambda: self.set_status(f"完成，已輸出 {count} 張圖片。"))
             return
         if operation == "extract":
             extract_pdf_pages(source, target, self.pages_var.get(), password)

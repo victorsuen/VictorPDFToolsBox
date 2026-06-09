@@ -12,6 +12,7 @@ from pdf_core import (
     build_annotation_da,
     clean_metadata,
     merge_pdf_files,
+    pdf_to_images,
     remove_blank_pages,
     split_pdf_to_zip,
     write_page_items_merged,
@@ -164,6 +165,34 @@ class PdfToolsTests(unittest.TestCase):
         merge_pdf_files([first, second], target)
 
         self.assertEqual(len(PdfReader(str(target)).pages), 2)
+
+    def test_pdf_to_images_writes_png_files(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        folder = Path(self.temp_dir.name) / "images"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        count = pdf_to_images(source, folder, image_format="png", dpi=72)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(len(list(folder.glob("*.png"))), 2)
+
+    def test_pdf_to_images_supports_page_ranges(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        folder = Path(self.temp_dir.name) / "images-range"
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        count = pdf_to_images(source, folder, image_format="jpg", dpi=72, pages_spec="1,3")
+
+        self.assertEqual(count, 2)
+        self.assertEqual(len(list(folder.glob("*.jpg"))), 2)
 
     def test_split_pdf_to_zip(self):
         source = Path(self.temp_dir.name) / "source.pdf"
