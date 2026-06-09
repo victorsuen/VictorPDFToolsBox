@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import os
+import subprocess
 import sys
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QDrag, QDragEnterEvent, QDropEvent, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -102,6 +104,27 @@ PDF_OUTPUT_OPERATIONS = frozenset(
         "clean_metadata",
     }
 )
+
+FOLDER_REVEAL_OPERATIONS = frozenset({"split", "extract_text", "info"})
+
+SETTINGS_ORG = "VictorSuen"
+SETTINGS_APP = "VictorPDFToolsBox"
+
+
+def reveal_output(path: Path) -> None:
+    target = path.resolve()
+    if not target.exists():
+        return
+    if sys.platform == "win32":
+        if target.is_dir():
+            os.startfile(str(target))
+        else:
+            subprocess.Popen(["explorer", "/select,", str(target)])
+        return
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", "-R", str(target)])
+        return
+    subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
 
 THUMB_SIZE = QSize(195, 292)
 ICON_SIZE = QSize(165, 215)
@@ -694,6 +717,7 @@ class VictorPdfToolsQt(QMainWindow):
         open_action = QAction("加入 PDF", self)
         open_action.triggered.connect(self.choose_pdf_files)
         self.addAction(open_action)
+        self.load_output_preferences()
 
     def install_shortcuts(self) -> None:
         shortcuts = [
@@ -755,6 +779,14 @@ class VictorPdfToolsQt(QMainWindow):
         self.add_button(side_layout, "下移", lambda: self.move_selected_page(1))
         save_button = self.add_button(side_layout, "儲存目前 Tab PDF", self.export_arranged_pdf, "primary")
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.open_pdf_after_save_checkbox = QCheckBox("儲存 PDF 後開成新 Tab")
+        self.open_pdf_after_save_checkbox.setChecked(True)
+        self.open_pdf_after_save_checkbox.toggled.connect(self.save_output_preferences)
+        side_layout.addWidget(self.open_pdf_after_save_checkbox)
+        self.open_folder_after_export_checkbox = QCheckBox("匯出後開啟輸出資料夾")
+        self.open_folder_after_export_checkbox.setChecked(True)
+        self.open_folder_after_export_checkbox.toggled.connect(self.save_output_preferences)
+        side_layout.addWidget(self.open_folder_after_export_checkbox)
 
         side_layout.addSpacing(12)
         side_layout.addWidget(QLabel("擷取頁碼範圍"))
@@ -852,7 +884,16 @@ class VictorPdfToolsQt(QMainWindow):
         run_button = self.add_button(form_layout, "處理並另存", self.run_tool_operation, "primary")
         run_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        hint = QLabel("提示：可把 PDF / 圖片直接拖入左側清單；合併 / 圖片轉 PDF 可加入多個檔案，其餘工具使用清單第一個 PDF。輸出 PDF 會自動開成新 Tab。")
+        self.tool_open_pdf_tab_checkbox = QCheckBox("PDF 輸出後開成新 Tab")
+        self.tool_open_pdf_tab_checkbox.setChecked(True)
+        self.tool_open_pdf_tab_checkbox.toggled.connect(self.save_output_preferences)
+        form_layout.addWidget(self.tool_open_pdf_tab_checkbox)
+        self.tool_open_output_folder_checkbox = QCheckBox("ZIP / TXT 輸出後開啟資料夾")
+        self.tool_open_output_folder_checkbox.setChecked(True)
+        self.tool_open_output_folder_checkbox.toggled.connect(self.save_output_preferences)
+        form_layout.addWidget(self.tool_open_output_folder_checkbox)
+
+        hint = QLabel("提示：可把 PDF / 圖片直接拖入左側清單；合併 / 圖片轉 PDF 可加入多個檔案，其餘工具使用清單第一個 PDF。")
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         form_layout.addWidget(hint)
@@ -1086,6 +1127,29 @@ class VictorPdfToolsQt(QMainWindow):
             draw.text((left + 4, top + 2), text, fill=text_color, font=font)
         return canvas
 
+    def output_settings(self) -> QSettings:
+        return QSettings(SETTINGS_ORG, SETTINGS_APP)
+
+    def load_output_preferences(self) -> None:
+        settings = self.output_settings()
+        self.open_pdf_after_save_checkbox.setChecked(
+            settings.value("open_pdf_after_save", True, type=bool)
+        )
+        self.open_folder_after_export_checkbox.setChecked(
+            settings.value("open_folder_after_export", True, type=bool)
+        )
+        self.tool_open_pdf_tab_checkbox.setChecked(settings.value("tool_open_pdf_tab", True, type=bool))
+        self.tool_open_output_folder_checkbox.setChecked(
+            settings.value("tool_open_output_folder", True, type=bool)
+        )
+
+    def save_output_preferences(self) -> None:
+        settings = self.output_settings()
+        settings.setValue("open_pdf_after_save", self.open_pdf_after_save_checkbox.isChecked())
+        settings.setValue("open_folder_after_export", self.open_folder_after_export_checkbox.isChecked())
+        settings.setValue("tool_open_pdf_tab", self.tool_open_pdf_tab_checkbox.isChecked())
+        settings.setValue("tool_open_output_folder", self.tool_open_output_folder_checkbox.isChecked())
+
     def refresh_tool_file_list(self) -> None:
         self.tool_file_list.clear()
         for path in self.tool_file_items:
@@ -1298,8 +1362,10 @@ class VictorPdfToolsQt(QMainWindow):
 
         def on_success() -> None:
             self.set_status(self._last_tool_status_message)
-            if operation in PDF_OUTPUT_OPERATIONS:
+            if operation in PDF_OUTPUT_OPERATIONS and self.tool_open_pdf_tab_checkbox.isChecked():
                 self.open_pdf_as_new_tab(target_path)
+            if operation in FOLDER_REVEAL_OPERATIONS and self.tool_open_output_folder_checkbox.isChecked():
+                reveal_output(target_path)
 
         self.run_pdf_job(
             lambda: self._execute_tool_operation(operation, source, target_path, password),
@@ -1685,11 +1751,18 @@ class VictorPdfToolsQt(QMainWindow):
         target, _ = QFileDialog.getSaveFileName(self, "儲存目前 Tab PDF", "arranged-pages.pdf", "PDF files (*.pdf)")
         if not target:
             return
+        target_path = Path(target)
+
+        def on_success() -> None:
+            if self.open_pdf_after_save_checkbox.isChecked():
+                self.open_pdf_as_new_tab(target_path)
+
         self.run_pdf_job(
             lambda: write_page_items_merged(
-                self.page_items, list(range(len(self.page_items))), Path(target), self.password_input.text()
+                self.page_items, list(range(len(self.page_items))), target_path, self.password_input.text()
             ),
             f"已儲存目前 Tab PDF：{target}",
+            on_success=on_success,
         )
 
     def extract_pages_merged(self) -> None:
@@ -1751,9 +1824,16 @@ class VictorPdfToolsQt(QMainWindow):
         folder = QFileDialog.getExistingDirectory(self, "選擇單獨匯出資料夾")
         if not folder:
             return
+        folder_path = Path(folder)
+
+        def on_success() -> None:
+            if self.open_folder_after_export_checkbox.isChecked():
+                reveal_output(folder_path)
+
         self.run_pdf_job(
-            lambda: write_page_items_separately(self.page_items, indexes, Path(folder), self.password_input.text()),
+            lambda: write_page_items_separately(self.page_items, indexes, folder_path, self.password_input.text()),
             f"已單獨匯出 {len(indexes)} 頁。",
+            on_success=on_success,
         )
 
     def run_pdf_job(self, job, success_message: str, on_success=None) -> None:

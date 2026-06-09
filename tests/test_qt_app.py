@@ -2,6 +2,7 @@ import os
 from pathlib import Path
 import tempfile
 import unittest
+from unittest.mock import patch
 
 from pypdf import PdfWriter
 
@@ -9,7 +10,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
 
-from qt_app import MergeFilesDialog, VictorPdfToolsQt
+from qt_app import FOLDER_REVEAL_OPERATIONS, MergeFilesDialog, VictorPdfToolsQt, reveal_output
 
 
 class QtAppTests(unittest.TestCase):
@@ -210,6 +211,32 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.annotation_pdf_path, self.source)
         self.assertEqual(window.annotation_page_count, 2)
         self.assertEqual(window.annotation_page_spin.maximum(), 2)
+
+    def test_output_preferences_default_enabled(self):
+        window = VictorPdfToolsQt()
+
+        self.assertTrue(window.open_pdf_after_save_checkbox.isChecked())
+        self.assertTrue(window.open_folder_after_export_checkbox.isChecked())
+        self.assertTrue(window.tool_open_pdf_tab_checkbox.isChecked())
+        self.assertTrue(window.tool_open_output_folder_checkbox.isChecked())
+
+    def test_folder_reveal_operations_include_zip_and_text_tools(self):
+        self.assertEqual(FOLDER_REVEAL_OPERATIONS, {"split", "extract_text", "info"})
+
+    def test_reveal_output_skips_missing_path(self):
+        with patch("qt_app.subprocess.Popen") as popen, patch("qt_app.os.startfile") as startfile:
+            reveal_output(Path(self.temp_dir.name) / "missing.zip")
+            popen.assert_not_called()
+            startfile.assert_not_called()
+
+    @patch("qt_app.sys.platform", "win32")
+    def test_reveal_output_selects_existing_file_on_windows(self):
+        target = Path(self.temp_dir.name) / "output.txt"
+        target.write_text("demo", encoding="utf-8")
+        with patch("qt_app.subprocess.Popen") as popen:
+            reveal_output(target)
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args.args[0], ["explorer", "/select,", str(target.resolve())])
 
     def test_annotation_preview_draws_overlay_text(self):
         window = VictorPdfToolsQt()
