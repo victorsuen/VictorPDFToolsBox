@@ -68,6 +68,63 @@ class TextBlock:
     height: float
     font_size: float
     font_name: str = ""
+    color_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0)
+
+
+def block_right(block: TextBlock) -> float:
+    return block.x + block.width
+
+
+def block_bottom(block: TextBlock) -> float:
+    return block.y - block.height
+
+
+def text_blocks_on_same_line(left: TextBlock, right: TextBlock) -> bool:
+    tolerance = max(left.font_size, right.font_size) * 0.6
+    return abs(left.y - right.y) <= tolerance
+
+
+def merge_text_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
+    if not blocks:
+        return []
+    sorted_blocks = sorted(blocks, key=lambda block: (-block.y, block.x))
+    lines: list[list[TextBlock]] = []
+    for block in sorted_blocks:
+        for line in lines:
+            if text_blocks_on_same_line(line[0], block):
+                line.append(block)
+                break
+        else:
+            lines.append([block])
+
+    merged: list[TextBlock] = []
+    for line in lines:
+        line = sorted(line, key=lambda block: block.x)
+        current = line[0]
+        for block in line[1:]:
+            gap = block.x - block_right(current)
+            max_gap = max(current.font_size, block.font_size) * 1.8
+            if gap <= max_gap:
+                separator = " " if gap > current.font_size * 0.25 else ""
+                left = min(current.x, block.x)
+                right = max(block_right(current), block_right(block))
+                top = max(current.y, block.y)
+                bottom = min(block_bottom(current), block_bottom(block))
+                current = TextBlock(
+                    text=f"{current.text}{separator}{block.text}",
+                    x=left,
+                    y=top,
+                    width=right - left,
+                    height=top - bottom,
+                    font_size=max(current.font_size, block.font_size),
+                    font_name=current.font_name or block.font_name,
+                    color_rgb=current.color_rgb,
+                )
+            else:
+                merged.append(current)
+                current = block
+        merged.append(current)
+    return sorted(merged, key=lambda block: (-block.y, block.x))
 
 
 def parse_pages(spec: str, page_count: int) -> list[int]:
@@ -301,7 +358,7 @@ def extract_page_text_blocks(source: Path, page_index: int, password: str = "") 
         blocks.append(TextBlock(normalized, x, y, width, height, size, font_name))
 
     reader.pages[page_index].extract_text(visitor_text=visitor_text)
-    return blocks
+    return merge_text_blocks(blocks)
 
 
 def replace_text_block_overlay(
@@ -314,6 +371,7 @@ def replace_text_block_overlay(
 ) -> None:
     if not replacement.strip():
         raise ValueError("請輸入替換文字。")
+    bold = "bold" in (block.font_name or "").lower()
     add_text_overlay_annotation(
         source=source,
         target=target,
@@ -323,10 +381,22 @@ def replace_text_block_overlay(
         text=replacement,
         font_size=max(int(round(block.font_size)), 8),
         cover_original=True,
-        cover_width=max(block.width, len(replacement) * block.font_size * 0.6),
-        cover_height=block.height,
+        cover_width=max(block.width + block.font_size * 0.8, len(replacement) * block.font_size * 0.65),
+        cover_height=max(block.height, block.font_size * 1.8),
         password=password,
+        font_key=font_key_for_pdf_font(block.font_name),
+        bold=bold,
+        color_rgb=block.color_rgb,
     )
+
+
+def font_key_for_pdf_font(font_name: str) -> str:
+    normalized = (font_name or "").lower()
+    if "times" in normalized or "roman" in normalized:
+        return "times"
+    if "courier" in normalized or "mono" in normalized:
+        return "courier"
+    return "helvetica"
 
 
 def ensure_ocr_available() -> None:

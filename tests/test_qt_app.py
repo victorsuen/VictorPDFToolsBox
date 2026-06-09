@@ -8,8 +8,10 @@ from pypdf import PdfWriter
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QApplication
 
+from pdf_core import TextBlock
 from qt_app import FOLDER_REVEAL_OPERATIONS, MergeFilesDialog, VictorPdfToolsQt, reveal_output
 
 
@@ -219,6 +221,18 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.text_edit_pdf_path, self.source)
         self.assertEqual(window.text_edit_page_count, 2)
         self.assertEqual(window.text_edit_page_validator.top(), 2)
+
+    def test_text_edit_preview_click_selects_block(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [TextBlock("Hello", 72, 300, 100, 20, 12)]
+        window.render_text_edit_preview()
+        left, top, right, bottom = window.text_block_to_image_rect(window.text_edit_blocks[0])
+        window.refresh_text_edit_blocks()
+
+        window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
+
+        self.assertEqual(window.text_edit_block_list.currentRow(), 0)
 
     def test_output_preferences_default_enabled(self):
         window = VictorPdfToolsQt()

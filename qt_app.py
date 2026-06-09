@@ -184,6 +184,19 @@ class AnnotationPreviewLabel(QLabel):
         super().mousePressEvent(event)
 
 
+class TextEditPreviewLabel(QLabel):
+    positionClicked = Signal(QPoint)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.setStyleSheet("background: #f6f8fb; border: 1px solid #dce3ec;")
+
+    def mousePressEvent(self, event) -> None:
+        self.positionClicked.emit(event.position().toPoint())
+        super().mousePressEvent(event)
+
+
 class PdfDropPanel(QWidget):
     filesDropped = Signal(list)
 
@@ -1195,9 +1208,8 @@ class VictorPdfToolsQt(QMainWindow):
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
-        self.text_edit_preview_label = QLabel()
-        self.text_edit_preview_label.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.text_edit_preview_label.setStyleSheet("background: #f6f8fb; border: 1px solid #dce3ec;")
+        self.text_edit_preview_label = TextEditPreviewLabel()
+        self.text_edit_preview_label.positionClicked.connect(self.select_text_edit_block_at_point)
         scroll.setWidget(self.text_edit_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -1299,12 +1311,22 @@ class VictorPdfToolsQt(QMainWindow):
     def render_text_edit_preview(self) -> None:
         if self.text_edit_pdf_path is None:
             return
-        item = PageItem(
-            self.text_edit_pdf_path,
-            int(self.text_edit_page_input.text() or "1") - 1,
-            self.text_edit_pdf_path.name,
-        )
-        self.text_edit_preview_image = self.render_page_image(item, scale=1.2, max_size=(760, 980))
+        page_index = int(self.text_edit_page_input.text() or "1") - 1
+        if PDF_RENDER_AVAILABLE and pdfium is not None:
+            document = pdfium.PdfDocument(str(self.text_edit_pdf_path), password=self.text_edit_password_input.text() or None)
+            try:
+                page = document.get_page(page_index)
+                try:
+                    page_width, page_height = page.get_size()
+                    scale = min(760 / page_width, 980 / page_height, 1.8)
+                    self.text_edit_preview_image = page.render(scale=scale).to_pil().convert("RGB")
+                finally:
+                    page.close()
+            finally:
+                document.close()
+        else:
+            item = PageItem(self.text_edit_pdf_path, page_index, self.text_edit_pdf_path.name)
+            self.text_edit_preview_image = self.placeholder_thumbnail(item)
         self.update_text_edit_preview()
 
     def on_text_edit_block_selected(self, row: int) -> None:
@@ -1340,6 +1362,48 @@ class VictorPdfToolsQt(QMainWindow):
         pixmap = QPixmap.fromImage(ImageQt(image))
         self.text_edit_preview_label.setPixmap(pixmap)
         self.text_edit_preview_label.resize(pixmap.size())
+
+    def current_text_edit_page_size(self) -> tuple[float, float]:
+        if self.text_edit_pdf_path is None:
+            return (0.0, 0.0)
+        reader = open_reader(self.text_edit_pdf_path, self.text_edit_password_input.text())
+        page = reader.pages[int(self.text_edit_page_input.text() or "1") - 1]
+        return (float(page.mediabox.width), float(page.mediabox.height))
+
+    def text_block_to_image_rect(self, block: TextBlock) -> tuple[float, float, float, float]:
+        if self.text_edit_preview_image is None:
+            return (0.0, 0.0, 0.0, 0.0)
+        page_width, page_height = self.current_text_edit_page_size()
+        if page_width <= 0 or page_height <= 0:
+            return (0.0, 0.0, 0.0, 0.0)
+        scale_x = self.text_edit_preview_image.width / page_width
+        scale_y = self.text_edit_preview_image.height / page_height
+        left = block.x * scale_x
+        bottom = self.text_edit_preview_image.height - block.y * scale_y
+        top = bottom - block.height * scale_y
+        right = left + block.width * scale_x
+        return (left, top, right, bottom)
+
+    def select_text_edit_block_at_point(self, point: QPoint) -> None:
+        if self.text_edit_preview_image is None:
+            return
+        best_index = -1
+        best_distance = float("inf")
+        for index, block in enumerate(self.text_edit_blocks):
+            left, top, right, bottom = self.text_block_to_image_rect(block)
+            margin = 6
+            if left - margin <= point.x() <= right + margin and top - margin <= point.y() <= bottom + margin:
+                center_x = (left + right) / 2
+                center_y = (top + bottom) / 2
+                distance = abs(point.x() - center_x) + abs(point.y() - center_y)
+                if distance < best_distance:
+                    best_distance = distance
+                    best_index = index
+        if best_index >= 0:
+            self.text_edit_block_list.setCurrentRow(best_index)
+            self.set_status("已從預覽選取文字片段。")
+        else:
+            self.set_status("此位置附近沒有偵測到文字片段。")
 
     def save_text_edit_pdf(self) -> None:
         if self.text_edit_pdf_path is None:

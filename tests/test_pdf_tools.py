@@ -16,6 +16,7 @@ from pdf_core import (
     build_annotation_da,
     clean_metadata,
     merge_pdf_files,
+    merge_text_blocks,
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
     pdf_to_images,
@@ -98,6 +99,17 @@ class PdfToolsTests(unittest.TestCase):
 
         annots = PdfReader(str(target)).pages[0].get("/Annots")
         self.assertEqual(len(annots), 2)
+
+    def test_merge_text_blocks_combines_same_line_fragments(self):
+        blocks = [
+            TextBlock("Hello", 10, 100, 30, 12, 10),
+            TextBlock("World", 45, 101, 30, 12, 10),
+            TextBlock("Next", 10, 70, 24, 12, 10),
+        ]
+
+        merged = merge_text_blocks(blocks)
+
+        self.assertEqual([block.text for block in merged], ["Hello World", "Next"])
 
     def test_add_page_numbers(self):
         source = Path(self.temp_dir.name) / "source.pdf"
