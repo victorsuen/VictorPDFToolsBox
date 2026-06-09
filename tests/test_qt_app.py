@@ -293,6 +293,21 @@ class QtAppTests(unittest.TestCase):
         self.assertIsNotNone(window.text_edit_preview_label.pixmap())
         self.assertFalse(window.text_edit_preview_label.pixmap().isNull())
 
+    def test_text_edit_clear_search_removes_query_and_keeps_preview(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [TextBlock("Invoice Number", 72, 320, 100, 20, 12)]
+        window.render_text_edit_preview()
+        window.refresh_text_edit_blocks()
+        window.text_edit_block_list.setCurrentRow(0)
+        window.text_edit_search_input.setText("invoice")
+
+        window.clear_text_edit_search()
+
+        self.assertEqual(window.text_edit_search_input.text(), "")
+        self.assertIsNotNone(window.text_edit_preview_label.pixmap())
+        self.assertFalse(window.text_edit_preview_label.pixmap().isNull())
+
     def test_text_edit_replacement_text_updates_preview(self):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)

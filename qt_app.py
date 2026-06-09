@@ -1238,6 +1238,7 @@ class VictorPdfToolsQt(QMainWindow):
         search_row.addWidget(self.text_edit_search_input, 1)
         self.add_button(search_row, "上一個", self.find_previous_text_edit_block)
         self.add_button(search_row, "下一個", self.find_next_text_edit_block)
+        self.add_button(search_row, "清除", self.clear_text_edit_search)
         side_layout.addLayout(search_row)
         search_options_row = QHBoxLayout()
         self.text_edit_case_sensitive_checkbox = QCheckBox("區分大小寫")
@@ -1386,6 +1387,14 @@ class VictorPdfToolsQt(QMainWindow):
 
     def find_previous_text_edit_block(self) -> None:
         self.find_text_edit_block(direction=-1)
+
+    def clear_text_edit_search(self) -> None:
+        if not self.text_edit_search_input.text():
+            self.set_status("搜尋文字已清空。")
+            return
+        self.text_edit_search_input.clear()
+        self.update_text_edit_preview(self.current_text_edit_block())
+        self.set_status("已清除搜尋文字與預覽高亮。")
 
     def find_text_edit_block(self, direction: int = 1) -> None:
         query = self.text_edit_search_input.text().strip()
