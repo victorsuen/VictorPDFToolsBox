@@ -67,6 +67,7 @@ from pdf_core import (
     parse_pages,
     pdfium,
     remove_blank_pages,
+    replace_text_block_content_stream,
     replace_text_block_overlay,
     rotate_pdf_pages,
     safe_output_name,
@@ -1236,6 +1237,12 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_replacement_input.setFixedHeight(80)
         side_layout.addWidget(self.text_edit_replacement_input)
 
+        side_layout.addWidget(QLabel("替換方式"))
+        self.text_edit_mode_combo = QComboBox()
+        self.text_edit_mode_combo.addItem("覆蓋替換（最穩定）", "overlay")
+        self.text_edit_mode_combo.addItem("直接改內容流（實驗：英文/數字同長度）", "content_stream")
+        side_layout.addWidget(self.text_edit_mode_combo)
+
         side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
         self.text_edit_password_input = QLineEdit()
         self.text_edit_password_input.setEchoMode(QLineEdit.Password)
@@ -1245,8 +1252,8 @@ class VictorPdfToolsQt(QMainWindow):
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
-            "Beta：此功能會先偵測文字層，選中片段後用白底覆蓋原字，再用接近原大小的新文字放上去。"
-            "若是掃描 PDF，請先用 OCR 轉可搜尋 PDF。"
+            "Beta：覆蓋替換最穩定；直接改內容流只適合簡單英文/數字且新舊長度相同，"
+            "可保留原文字樣式。掃描 PDF 請先用 OCR 轉可搜尋 PDF。"
         )
         guide.setObjectName("muted")
         guide.setWordWrap(True)
@@ -1419,9 +1426,13 @@ class VictorPdfToolsQt(QMainWindow):
         if not target:
             return
         target_path = Path(target)
+        mode = self.text_edit_mode_combo.currentData() or "overlay"
+        replacement_job = replace_text_block_overlay
+        if mode == "content_stream":
+            replacement_job = replace_text_block_content_stream
 
         self.run_pdf_job(
-            lambda: replace_text_block_overlay(
+            lambda: replacement_job(
                 self.text_edit_pdf_path,
                 target_path,
                 int(self.text_edit_page_input.text() or "1") - 1,

@@ -12,6 +12,9 @@ from PIL import Image
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
     ArrayObject,
+    ByteStringObject,
+    ContentStream,
+    DecodedStreamObject,
     DictionaryObject,
     FloatObject,
     NameObject,
@@ -388,6 +391,102 @@ def replace_text_block_overlay(
         bold=bold,
         color_rgb=block.color_rgb,
     )
+
+
+def validate_content_stream_replacement(original: str, replacement: str) -> tuple[str, str]:
+    old_text = re.sub(r"\s+", " ", original or "").strip()
+    new_text = replacement.strip()
+    if not old_text:
+        raise ValueError("沒有可替換的原文字。")
+    if not new_text:
+        raise ValueError("請輸入替換文字。")
+    if not re.fullmatch(r"[\x20-\x7E]+", old_text) or not re.fullmatch(r"[\x20-\x7E]+", new_text):
+        raise ValueError("直接改內容流目前只支援簡單英文、數字和半形符號。")
+    if len(old_text) != len(new_text):
+        raise ValueError("直接改內容流目前要求新舊文字長度相同，以避免版面走位。")
+    return old_text, new_text
+
+
+def replace_text_in_show_operand(operand, old_text: str, new_text: str) -> tuple[object, bool]:
+    if isinstance(operand, TextStringObject) and str(operand) == old_text:
+        return TextStringObject(new_text), True
+    if isinstance(operand, ByteStringObject):
+        try:
+            decoded = bytes(operand).decode("latin-1")
+        except Exception:
+            return operand, False
+        if decoded == old_text:
+            return ByteStringObject(new_text.encode("latin-1")), True
+    return operand, False
+
+
+def replace_text_in_array_operand(operand, old_text: str, new_text: str) -> tuple[object, bool]:
+    if not isinstance(operand, ArrayObject):
+        return operand, False
+    string_parts = [part for part in operand if isinstance(part, (TextStringObject, ByteStringObject))]
+    joined = "".join(str(part) if isinstance(part, TextStringObject) else bytes(part).decode("latin-1") for part in string_parts)
+    if joined != old_text:
+        return operand, False
+
+    replaced = ArrayObject()
+    offset = 0
+    for part in operand:
+        if isinstance(part, TextStringObject):
+            length = len(str(part))
+            replaced.append(TextStringObject(new_text[offset : offset + length]))
+            offset += length
+        elif isinstance(part, ByteStringObject):
+            length = len(bytes(part))
+            replaced.append(ByteStringObject(new_text[offset : offset + length].encode("latin-1")))
+            offset += length
+        else:
+            replaced.append(part)
+    return replaced, True
+
+
+def replace_text_block_content_stream(
+    source: Path,
+    target: Path,
+    page_index: int,
+    block: TextBlock,
+    replacement: str,
+    password: str = "",
+) -> None:
+    old_text, new_text = validate_content_stream_replacement(block.text, replacement)
+    reader = open_reader(source, password)
+    if page_index < 0 or page_index >= len(reader.pages):
+        raise ValueError("頁碼超出範圍。")
+
+    writer = PdfWriter()
+    replacements = 0
+    for index, page in enumerate(reader.pages):
+        page_copy = copy(page)
+        if index == page_index:
+            contents = page_copy.get_contents()
+            if contents is None:
+                raise ValueError("此頁沒有可修改的內容流。")
+            content = ContentStream(contents, reader)
+            new_operations = []
+            for operands, operator in content.operations:
+                operands = list(operands)
+                replaced = False
+                if operator in {b"Tj", b"'"} and operands:
+                    operands[0], replaced = replace_text_in_show_operand(operands[0], old_text, new_text)
+                elif operator == b'"' and len(operands) >= 3:
+                    operands[2], replaced = replace_text_in_show_operand(operands[2], old_text, new_text)
+                elif operator == b"TJ" and operands:
+                    operands[0], replaced = replace_text_in_array_operand(operands[0], old_text, new_text)
+                if replaced:
+                    replacements += 1
+                new_operations.append((operands, operator))
+            if replacements != 1:
+                raise ValueError("找不到唯一可直接修改的文字；請改用覆蓋方式。")
+            content.operations = new_operations
+            stream = DecodedStreamObject()
+            stream.set_data(content.get_data())
+            page_copy[NameObject("/Contents")] = stream
+        writer.add_page(page_copy)
+    write_pdf(writer, target)
 
 
 def font_key_for_pdf_font(font_name: str) -> str:

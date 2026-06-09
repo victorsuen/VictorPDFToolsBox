@@ -5,6 +5,7 @@ from unittest.mock import Mock, patch
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
+from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app import copy_pages, parse_pages
 from pdf_core import (
@@ -20,6 +21,7 @@ from pdf_core import (
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
     pdf_to_images,
+    replace_text_block_content_stream,
     replace_text_block_overlay,
     remove_blank_pages,
     split_pdf_to_zip,
@@ -99,6 +101,47 @@ class PdfToolsTests(unittest.TestCase):
 
         annots = PdfReader(str(target)).pages[0].get("/Annots")
         self.assertEqual(len(annots), 2)
+
+    def test_replace_text_block_content_stream_rewrites_simple_text(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=300, height=400)
+        stream = DecodedStreamObject()
+        stream.set_data(b"BT /F1 12 Tf 72 300 Td (Old123) Tj ET")
+        page[NameObject("/Contents")] = stream
+        page[NameObject("/Resources")] = DictionaryObject()
+        with source.open("wb") as output:
+            writer.write(output)
+
+        replace_text_block_content_stream(
+            source,
+            target,
+            0,
+            TextBlock("Old123", 72, 300, 80, 24, 12, "/Helvetica"),
+            "New456",
+        )
+
+        content = PdfReader(str(target)).pages[0].get_contents().get_data()
+        self.assertIn(b"New456", content)
+        self.assertNotIn(b"Old123", content)
+
+    def test_replace_text_block_content_stream_requires_same_length(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as output:
+            writer.write(output)
+
+        with self.assertRaises(ValueError):
+            replace_text_block_content_stream(
+                source,
+                target,
+                0,
+                TextBlock("Old123", 72, 300, 80, 24, 12, "/Helvetica"),
+                "Longer text",
+            )
 
     def test_merge_text_blocks_combines_same_line_fragments(self):
         blocks = [

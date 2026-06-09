@@ -221,6 +221,8 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.text_edit_pdf_path, self.source)
         self.assertEqual(window.text_edit_page_count, 2)
         self.assertEqual(window.text_edit_page_validator.top(), 2)
+        self.assertEqual(window.text_edit_mode_combo.currentData(), "overlay")
+        self.assertEqual(window.text_edit_mode_combo.itemData(1), "content_stream")
 
     def test_text_edit_preview_click_selects_block(self):
         window = VictorPdfToolsQt()
