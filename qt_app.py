@@ -1234,7 +1234,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_search_input = QLineEdit()
         self.text_edit_search_input.setPlaceholderText("輸入要尋找的文字")
         self.text_edit_search_input.returnPressed.connect(self.find_next_text_edit_block)
-        self.text_edit_search_input.textChanged.connect(lambda _text: self.update_text_edit_preview(self.current_text_edit_block()))
+        self.text_edit_search_input.textChanged.connect(lambda _text: self.update_text_edit_search_feedback())
         search_row.addWidget(self.text_edit_search_input, 1)
         self.add_button(search_row, "上一個", self.find_previous_text_edit_block)
         self.add_button(search_row, "下一個", self.find_next_text_edit_block)
@@ -1243,16 +1243,21 @@ class VictorPdfToolsQt(QMainWindow):
         search_options_row = QHBoxLayout()
         self.text_edit_case_sensitive_checkbox = QCheckBox("區分大小寫")
         self.text_edit_case_sensitive_checkbox.toggled.connect(
-            lambda _checked: self.update_text_edit_preview(self.current_text_edit_block())
+            lambda _checked: self.update_text_edit_search_feedback()
         )
         search_options_row.addWidget(self.text_edit_case_sensitive_checkbox)
         self.text_edit_whole_word_checkbox = QCheckBox("全字匹配")
         self.text_edit_whole_word_checkbox.toggled.connect(
-            lambda _checked: self.update_text_edit_preview(self.current_text_edit_block())
+            lambda _checked: self.update_text_edit_search_feedback()
         )
         search_options_row.addWidget(self.text_edit_whole_word_checkbox)
         search_options_row.addStretch(1)
         side_layout.addLayout(search_options_row)
+
+        self.text_edit_search_feedback = QLabel("輸入搜尋文字後會顯示目前頁符合數。")
+        self.text_edit_search_feedback.setObjectName("muted")
+        self.text_edit_search_feedback.setWordWrap(True)
+        side_layout.addWidget(self.text_edit_search_feedback)
 
         side_layout.addWidget(QLabel("偵測到的文字片段"))
         self.text_edit_block_list = QListWidget()
@@ -1381,6 +1386,7 @@ class VictorPdfToolsQt(QMainWindow):
             self.text_edit_block_list.addItem(item)
         if not self.text_edit_blocks:
             self.text_edit_block_info.setText("此頁沒有偵測到文字層。掃描 PDF 請先 OCR。")
+        self.update_text_edit_search_feedback()
 
     def find_next_text_edit_block(self) -> None:
         self.find_text_edit_block(direction=1)
@@ -1395,6 +1401,15 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_search_input.clear()
         self.update_text_edit_preview(self.current_text_edit_block())
         self.set_status("已清除搜尋文字與預覽高亮。")
+
+    def update_text_edit_search_feedback(self) -> None:
+        query = self.text_edit_search_input.text().strip()
+        if not query:
+            self.text_edit_search_feedback.setText("輸入搜尋文字後會顯示目前頁符合數。")
+        else:
+            match_count = sum(1 for block in self.text_edit_blocks if self.text_edit_block_matches_query(block, query))
+            self.text_edit_search_feedback.setText(f"目前頁符合：{match_count} 個文字片段。")
+        self.update_text_edit_preview(self.current_text_edit_block())
 
     def find_text_edit_block(self, direction: int = 1) -> None:
         query = self.text_edit_search_input.text().strip()

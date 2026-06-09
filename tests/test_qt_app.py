@@ -228,6 +228,7 @@ class QtAppTests(unittest.TestCase):
         self.assertFalse(window.text_edit_case_sensitive_checkbox.isChecked())
         self.assertFalse(window.text_edit_whole_word_checkbox.isChecked())
         self.assertIn("替換限制", window.text_edit_replacement_hint.text())
+        self.assertIn("符合數", window.text_edit_search_feedback.text())
 
     def test_text_edit_page_navigation_changes_page_within_bounds(self):
         window = VictorPdfToolsQt()
@@ -292,6 +293,20 @@ class QtAppTests(unittest.TestCase):
 
         self.assertIsNotNone(window.text_edit_preview_label.pixmap())
         self.assertFalse(window.text_edit_preview_label.pixmap().isNull())
+
+    def test_text_edit_search_feedback_counts_current_page_matches(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("Invoice Number", 72, 320, 100, 20, 12),
+            TextBlock("Invoice Total", 72, 290, 100, 20, 12),
+            TextBlock("Customer Name", 72, 260, 100, 20, 12),
+        ]
+        window.refresh_text_edit_blocks()
+
+        window.text_edit_search_input.setText("invoice")
+
+        self.assertIn("2", window.text_edit_search_feedback.text())
 
     def test_text_edit_clear_search_removes_query_and_keeps_preview(self):
         window = VictorPdfToolsQt()
