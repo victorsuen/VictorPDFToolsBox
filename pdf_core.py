@@ -490,6 +490,17 @@ def replace_text_block_content_stream(
     password: str = "",
 ) -> None:
     old_text, new_text = validate_content_stream_replacement(block.text, replacement)
+    replace_text_in_content_stream(source, target, page_index, old_text, new_text, password)
+
+
+def replace_text_in_content_stream(
+    source: Path,
+    target: Path,
+    page_index: int,
+    old_text: str,
+    new_text: str,
+    password: str = "",
+) -> None:
     reader = open_reader(source, password)
     if page_index < 0 or page_index >= len(reader.pages):
         raise ValueError("頁碼超出範圍。")
@@ -524,6 +535,31 @@ def replace_text_block_content_stream(
             page_copy[NameObject("/Contents")] = stream
         writer.add_page(page_copy)
     write_pdf(writer, target)
+
+
+def redact_text_block_secure(
+    source: Path,
+    target: Path,
+    page_index: int,
+    block: TextBlock,
+    password: str = "",
+) -> None:
+    old_text = re.sub(r"\s+", " ", block.text or "").strip()
+    if not old_text:
+        raise ValueError("沒有可遮蔽的原文字。")
+    if not re.fullmatch(r"[\x20-\x7E]+", old_text):
+        raise ValueError("安全遮蔽目前只支援簡單英文、數字和半形符號。")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        stripped_pdf = Path(temp_dir) / "redaction-content-removed.pdf"
+        replace_text_in_content_stream(
+            source,
+            stripped_pdf,
+            page_index,
+            old_text,
+            " " * len(old_text),
+            password,
+        )
+        redact_text_block_overlay(stripped_pdf, target, page_index, block)
 
 
 def font_key_for_pdf_font(font_name: str) -> str:

@@ -21,6 +21,7 @@ from pdf_core import (
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
     pdf_to_images,
+    redact_text_block_secure,
     redact_text_block_overlay,
     replace_text_block_content_stream,
     replace_text_block_overlay,
@@ -121,6 +122,29 @@ class PdfToolsTests(unittest.TestCase):
         annot = PdfReader(str(target)).pages[0].get("/Annots")[0].get_object()
         self.assertEqual(annot.get("/Subtype"), "/Square")
         self.assertEqual(list(annot.get("/IC")), [0, 0, 0])
+
+    def test_redact_text_block_secure_removes_simple_text_and_adds_black_box(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        page = writer.add_blank_page(width=300, height=400)
+        stream = DecodedStreamObject()
+        stream.set_data(b"BT /F1 12 Tf 72 300 Td (Secret) Tj ET")
+        page[NameObject("/Contents")] = stream
+        page[NameObject("/Resources")] = DictionaryObject()
+        with source.open("wb") as output:
+            writer.write(output)
+
+        redact_text_block_secure(
+            source,
+            target,
+            0,
+            TextBlock("Secret", 72, 300, 80, 24, 12, "/Helvetica"),
+        )
+
+        page = PdfReader(str(target)).pages[0]
+        self.assertNotIn(b"Secret", page.get_contents().get_data())
+        self.assertEqual(len(page.get("/Annots")), 1)
 
     def test_replace_text_block_content_stream_rewrites_simple_text(self):
         source = Path(self.temp_dir.name) / "source.pdf"

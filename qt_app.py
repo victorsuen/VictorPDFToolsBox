@@ -66,6 +66,7 @@ from pdf_core import (
     page_item_label,
     parse_pages,
     pdfium,
+    redact_text_block_secure,
     redact_text_block_overlay,
     remove_blank_pages,
     replace_text_block_content_stream,
@@ -1253,6 +1254,12 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_mode_combo.addItem("直接改內容流（實驗：英文/數字同長度）", "content_stream")
         side_layout.addWidget(self.text_edit_mode_combo)
 
+        side_layout.addWidget(QLabel("遮蔽方式"))
+        self.text_edit_redaction_mode_combo = QComboBox()
+        self.text_edit_redaction_mode_combo.addItem("視覺遮蔽（黑框覆蓋）", "visual")
+        self.text_edit_redaction_mode_combo.addItem("安全遮蔽（實驗：移除簡單文字）", "secure")
+        side_layout.addWidget(self.text_edit_redaction_mode_combo)
+
         side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
         self.text_edit_password_input = QLineEdit()
         self.text_edit_password_input.setEchoMode(QLineEdit.Password)
@@ -1264,7 +1271,7 @@ class VictorPdfToolsQt(QMainWindow):
         redact_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
-            "Beta：覆蓋替換最穩定；遮蔽會以黑框蓋住選取區塊；直接改內容流只適合簡單英文/數字且新舊長度相同，"
+            "Beta：覆蓋替換最穩定；安全遮蔽會嘗試移除簡單英文/數字底層文字再加黑框；直接改內容流只適合簡單英文/數字且新舊長度相同，"
             "可保留原文字樣式。掃描 PDF 請先用 OCR 轉可搜尋 PDF。"
         )
         guide.setObjectName("muted")
@@ -1495,8 +1502,11 @@ class VictorPdfToolsQt(QMainWindow):
         if not target:
             return
         target_path = Path(target)
+        redaction_job = redact_text_block_overlay
+        if (self.text_edit_redaction_mode_combo.currentData() or "visual") == "secure":
+            redaction_job = redact_text_block_secure
         self.run_pdf_job(
-            lambda: redact_text_block_overlay(
+            lambda: redaction_job(
                 self.text_edit_pdf_path,
                 target_path,
                 int(self.text_edit_page_input.text() or "1") - 1,
