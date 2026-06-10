@@ -1258,6 +1258,8 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_search_feedback.setObjectName("muted")
         self.text_edit_search_feedback.setWordWrap(True)
         side_layout.addWidget(self.text_edit_search_feedback)
+        count_all_button = self.add_button(side_layout, "計算整份文件符合數", self.count_all_text_search_matches)
+        count_all_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         side_layout.addWidget(QLabel("偵測到的文字片段"))
         self.text_edit_block_list = QListWidget()
@@ -1410,6 +1412,34 @@ class VictorPdfToolsQt(QMainWindow):
             match_count = sum(1 for block in self.text_edit_blocks if self.text_edit_block_matches_query(block, query))
             self.text_edit_search_feedback.setText(f"目前頁符合：{match_count} 個文字片段。")
         self.update_text_edit_preview(self.current_text_edit_block())
+
+    def count_all_text_search_matches(self) -> None:
+        if self.text_edit_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        query = self.text_edit_search_input.text().strip()
+        if not query:
+            self.set_status("請先輸入要計算的搜尋文字。")
+            return
+
+        try:
+            total = 0
+            for page_index in range(self.text_edit_page_count):
+                if page_index == int(self.text_edit_page_input.text() or "1") - 1:
+                    blocks = self.text_edit_blocks
+                else:
+                    blocks = extract_page_text_blocks(
+                        self.text_edit_pdf_path,
+                        page_index,
+                        self.text_edit_password_input.text(),
+                    )
+                total += sum(1 for block in blocks if self.text_edit_block_matches_query(block, query))
+        except Exception as exc:
+            self.show_error(exc)
+            return
+
+        self.text_edit_search_feedback.setText(f"整份文件符合：{total} 個文字片段。")
+        self.set_status(f"整份文件共有 {total} 個搜尋符合。")
 
     def find_text_edit_block(self, direction: int = 1) -> None:
         query = self.text_edit_search_input.text().strip()

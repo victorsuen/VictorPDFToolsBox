@@ -308,6 +308,25 @@ class QtAppTests(unittest.TestCase):
 
         self.assertIn("2", window.text_edit_search_feedback.text())
 
+    def test_text_edit_count_all_search_matches_counts_document(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("Invoice Number", 72, 320, 100, 20, 12),
+            TextBlock("Customer Name", 72, 260, 100, 20, 12),
+        ]
+        window.refresh_text_edit_blocks()
+        window.text_edit_search_input.setText("invoice")
+        next_page_blocks = [
+            TextBlock("Invoice Total", 72, 300, 100, 20, 12),
+            TextBlock("Invoice Date", 72, 270, 100, 20, 12),
+        ]
+
+        with patch("qt_app.extract_page_text_blocks", return_value=next_page_blocks):
+            window.count_all_text_search_matches()
+
+        self.assertIn("3", window.text_edit_search_feedback.text())
+
     def test_text_edit_clear_search_removes_query_and_keeps_preview(self):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)
