@@ -221,8 +221,9 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.text_edit_pdf_path, self.source)
         self.assertEqual(window.text_edit_page_count, 2)
         self.assertEqual(window.text_edit_page_validator.top(), 2)
-        self.assertEqual(window.text_edit_mode_combo.currentData(), "overlay")
-        self.assertEqual(window.text_edit_mode_combo.itemData(1), "content_stream")
+        self.assertEqual(window.text_edit_mode_combo.currentData(), "seamless")
+        self.assertEqual(window.text_edit_mode_combo.itemData(1), "overlay")
+        self.assertEqual(window.text_edit_mode_combo.itemData(2), "content_stream")
         self.assertEqual(window.text_edit_redaction_mode_combo.currentData(), "visual")
         self.assertEqual(window.text_edit_redaction_mode_combo.itemData(1), "secure")
         self.assertFalse(window.text_edit_case_sensitive_checkbox.isChecked())
@@ -375,7 +376,7 @@ class QtAppTests(unittest.TestCase):
         window.text_edit_blocks = [TextBlock("Old", 72, 320, 30, 20, 12, "/Helvetica")]
         window.refresh_text_edit_blocks()
         window.text_edit_block_list.setCurrentRow(0)
-        window.text_edit_mode_combo.setCurrentIndex(1)
+        window.text_edit_mode_combo.setCurrentIndex(window.text_edit_mode_combo.findData("content_stream"))
 
         window.text_edit_replacement_input.setPlainText("Long")
         self.assertIn("長度不同", window.text_edit_replacement_hint.text())
@@ -489,7 +490,10 @@ class QtAppTests(unittest.TestCase):
         self.assertTrue(window.tool_open_output_folder_checkbox.isChecked())
 
     def test_folder_reveal_operations_include_zip_and_text_tools(self):
-        self.assertEqual(FOLDER_REVEAL_OPERATIONS, {"split", "extract_text", "ocr_text", "info", "pdf_to_images"})
+        self.assertEqual(
+            FOLDER_REVEAL_OPERATIONS,
+            {"split", "split_advanced", "extract_text", "ocr_text", "info", "pdf_to_images"},
+        )
 
     def test_reveal_output_skips_missing_path(self):
         with patch("qt_app.subprocess.Popen") as popen, patch("qt_app.os.startfile") as startfile:
@@ -747,6 +751,82 @@ class QtAppTests(unittest.TestCase):
             [float(box.left), float(box.bottom), float(box.right), float(box.top)],
             [40.0, 50.0, 220.0, 320.0],
         )
+
+
+    def test_tool_split_advanced_creates_zip(self):
+        window = VictorPdfToolsQt()
+        window.tool_file_items = [self.source]
+        window.tool_operation.setCurrentIndex(window.tool_operation.findData("split_advanced"))
+        window.tool_split_mode_combo.setCurrentIndex(window.tool_split_mode_combo.findData("every"))
+        window.tool_split_value_input.setText("1")
+        target = Path(self.temp_dir.name) / "advanced.zip"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "ZIP files (*.zip)")):
+            with patch("qt_app.reveal_output"):
+                window.run_tool_operation()
+
+        self.assertTrue(target.exists())
+
+    def test_tool_bates_numbering_writes_pdf(self):
+        window = VictorPdfToolsQt()
+        window.tool_file_items = [self.source]
+        window.tool_operation.setCurrentIndex(window.tool_operation.findData("bates"))
+        window.tool_bates_prefix_input.setText("DOC-")
+        window.tool_bates_start_input.setText("5")
+        window.tool_bates_digits_combo.setCurrentText("4")
+        target = Path(self.temp_dir.name) / "bates.pdf"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch.object(window, "open_pdf_as_new_tab"):
+                window.run_tool_operation()
+
+        self.assertTrue(target.exists())
+        first = PdfReader(str(target)).pages[0].get("/Annots")[0].get_object()
+        self.assertEqual(str(first.get("/Contents")), "DOC-0005")
+
+    def test_tool_encrypt_permissions_writes_protected_pdf(self):
+        window = VictorPdfToolsQt()
+        window.tool_file_items = [self.source]
+        window.tool_operation.setCurrentIndex(window.tool_operation.findData("encrypt_permissions"))
+        window.tool_new_password_input.setText("owner999")
+        window.tool_perm_print_checkbox.setChecked(False)
+        target = Path(self.temp_dir.name) / "protected.pdf"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch.object(window, "open_pdf_as_new_tab"):
+                window.run_tool_operation()
+
+        self.assertTrue(target.exists())
+        self.assertTrue(PdfReader(str(target)).is_encrypted)
+
+
+    def test_text_edit_save_seamless_mode_uses_seamless_replacement(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock(
+                "Old",
+                72,
+                320,
+                30,
+                20,
+                12,
+                "Helvetica",
+                bbox=(72.0, 300.0, 102.0, 325.0),
+                page_font_name="helv",
+            )
+        ]
+        window.refresh_text_edit_blocks()
+        window.text_edit_block_list.setCurrentRow(0)
+        window.text_edit_replacement_input.setPlainText("New")
+        target = Path(self.temp_dir.name) / "seamless-edited.pdf"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch("qt_app.replace_text_block_seamless") as seamless:
+                with patch.object(window, "open_pdf_as_new_tab"):
+                    window.save_text_edit_pdf()
+
+        seamless.assert_called_once()
 
 
 def _white_image(width: int, height: int):

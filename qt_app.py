@@ -43,16 +43,19 @@ from pdf_core import (
     OCR_LANGUAGE_OPTIONS,
     PDF_RENDER_AVAILABLE,
     PDF_SUFFIXES,
+    PYMUPDF_AVAILABLE,
     BookmarkItem,
     MarkupAnnotation,
     PageItem,
     TextBlock,
+    add_bates_numbering,
     add_page_numbers,
     ANNOTATION_COLOR_PRESETS,
     add_text_overlay_annotation,
     add_watermark,
     apply_markup_annotations,
     apply_outline,
+    BATES_POSITIONS,
     crop_pdf_pages,
     extract_outline,
     rgb_to_hex,
@@ -61,6 +64,7 @@ from pdf_core import (
     decrypt_pdf,
     delete_pdf_pages,
     encrypt_pdf,
+    encrypt_pdf_with_permissions,
     extract_pdf_pages,
     extract_page_text_blocks,
     extract_pdf_text,
@@ -78,10 +82,13 @@ from pdf_core import (
     redact_text_block_secure,
     redact_text_block_overlay,
     remove_blank_pages,
+    PYMUPDF_AVAILABLE,
+    replace_text_block_seamless,
     replace_text_block_content_stream,
     replace_text_block_overlay,
     rotate_pdf_pages,
     safe_output_name,
+    split_pdf_advanced,
     split_pdf_to_zip,
     text_matches_query,
     write_page_items_merged,
@@ -92,10 +99,13 @@ from pdf_core import (
 TOOL_OPERATIONS = [
     ("merge", "合併 PDF"),
     ("split", "逐頁拆分 (ZIP)"),
+    ("split_advanced", "進階拆分 (多檔 ZIP)"),
     ("extract", "抽取頁碼"),
     ("delete", "刪除頁碼"),
     ("rotate", "旋轉頁面"),
     ("encrypt", "加密 PDF"),
+    ("encrypt_permissions", "加密 + 權限控制"),
+    ("bates", "Bates 編號"),
     ("decrypt", "解除密碼"),
     ("compress", "基礎壓縮"),
     ("extract_text", "抽取文字"),
@@ -117,6 +127,8 @@ PDF_OUTPUT_OPERATIONS = frozenset(
         "delete",
         "rotate",
         "encrypt",
+        "encrypt_permissions",
+        "bates",
         "decrypt",
         "compress",
         "images_to_pdf",
@@ -128,7 +140,9 @@ PDF_OUTPUT_OPERATIONS = frozenset(
     }
 )
 
-FOLDER_REVEAL_OPERATIONS = frozenset({"split", "extract_text", "ocr_text", "info", "pdf_to_images"})
+FOLDER_REVEAL_OPERATIONS = frozenset(
+    {"split", "split_advanced", "extract_text", "ocr_text", "info", "pdf_to_images"}
+)
 
 SETTINGS_ORG = "VictorSuen"
 SETTINGS_APP = "VictorPDFToolsBox"
@@ -1084,6 +1098,47 @@ class VictorPdfToolsQt(QMainWindow):
             self.tool_blank_threshold_combo.addItem(value)
         self.tool_blank_threshold_combo.setCurrentText("25")
         form_layout.addWidget(self.tool_blank_threshold_combo)
+
+        form_layout.addWidget(QLabel("進階拆分方式"))
+        split_row = QHBoxLayout()
+        self.tool_split_mode_combo = QComboBox()
+        self.tool_split_mode_combo.addItem("每 N 頁一檔", "every")
+        self.tool_split_mode_combo.addItem("依範圍各存一檔", "ranges")
+        split_row.addWidget(self.tool_split_mode_combo, 1)
+        self.tool_split_value_input = QLineEdit("1")
+        self.tool_split_value_input.setPlaceholderText("每檔頁數，或範圍如 1-3,4-6")
+        split_row.addWidget(self.tool_split_value_input, 1)
+        form_layout.addLayout(split_row)
+
+        form_layout.addWidget(QLabel("Bates 編號（前綴 / 起始 / 位數）"))
+        bates_row = QHBoxLayout()
+        self.tool_bates_prefix_input = QLineEdit()
+        self.tool_bates_prefix_input.setPlaceholderText("前綴，如 ABC-")
+        bates_row.addWidget(self.tool_bates_prefix_input, 2)
+        self.tool_bates_start_input = QLineEdit("1")
+        self.tool_bates_start_input.setFixedWidth(56)
+        bates_row.addWidget(self.tool_bates_start_input)
+        self.tool_bates_digits_combo = QComboBox()
+        for digits in ("4", "5", "6", "7", "8"):
+            self.tool_bates_digits_combo.addItem(digits)
+        self.tool_bates_digits_combo.setCurrentText("6")
+        bates_row.addWidget(self.tool_bates_digits_combo)
+        form_layout.addLayout(bates_row)
+        self.tool_bates_position_combo = QComboBox()
+        for value, label in BATES_POSITIONS.items():
+            self.tool_bates_position_combo.addItem(label, value)
+        form_layout.addWidget(self.tool_bates_position_combo)
+
+        form_layout.addWidget(QLabel("權限控制（加密 + 權限控制）"))
+        self.tool_perm_print_checkbox = QCheckBox("允許列印")
+        self.tool_perm_print_checkbox.setChecked(True)
+        form_layout.addWidget(self.tool_perm_print_checkbox)
+        self.tool_perm_copy_checkbox = QCheckBox("允許複製文字 / 圖形")
+        self.tool_perm_copy_checkbox.setChecked(True)
+        form_layout.addWidget(self.tool_perm_copy_checkbox)
+        self.tool_perm_modify_checkbox = QCheckBox("允許修改 / 填表")
+        self.tool_perm_modify_checkbox.setChecked(True)
+        form_layout.addWidget(self.tool_perm_modify_checkbox)
 
         run_button = self.add_button(form_layout, "處理並另存", self.run_tool_operation, "primary")
         run_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -2079,7 +2134,8 @@ class VictorPdfToolsQt(QMainWindow):
 
         side_layout.addWidget(QLabel("替換方式"))
         self.text_edit_mode_combo = QComboBox()
-        self.text_edit_mode_combo.addItem("覆蓋替換（最穩定）", "overlay")
+        self.text_edit_mode_combo.addItem("無痕替換（保留原字型，推薦）", "seamless")
+        self.text_edit_mode_combo.addItem("覆蓋替換（白底覆蓋）", "overlay")
         self.text_edit_mode_combo.addItem("直接改內容流（實驗：英文/數字同長度）", "content_stream")
         self.text_edit_mode_combo.currentIndexChanged.connect(
             lambda _index: self.update_text_edit_replacement_hint()
@@ -2110,8 +2166,9 @@ class VictorPdfToolsQt(QMainWindow):
         redact_all_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
-            "Beta：覆蓋替換最穩定；安全遮蔽會嘗試移除簡單英文/數字底層文字再加黑框；直接改內容流只適合簡單英文/數字且新舊長度相同，"
-            "可保留原文字樣式。掃描 PDF 請先用 OCR 轉可搜尋 PDF。"
+            "Beta：預設「無痕替換」會先移除原文字再以相同字型/大小/顏色寫回，效果最接近 Adobe Pro；"
+            "若 PDF 較複雜可改「覆蓋替換」。安全遮蔽會嘗試移除簡單英文/數字底層文字再加黑框；"
+            "直接改內容流只適合半形英文/數字且新舊同長度。掃描 PDF 請先用 OCR 轉可搜尋 PDF。"
         )
         guide.setObjectName("muted")
         guide.setWordWrap(True)
@@ -2560,7 +2617,9 @@ class VictorPdfToolsQt(QMainWindow):
             return
         self.text_edit_replacement_input.setPlainText(block.text)
         self.text_edit_block_info.setText(
-            f"位置 X {block.x:.1f}, Y {block.y:.1f}；估計字體大小 {block.font_size:.1f}；字型 {block.font_name or '未知'}"
+            f"位置 X {block.x:.1f}, Y {block.y:.1f}；字體 {block.font_size:.1f}pt；"
+            f"字型 {block.font_name or '未知'}"
+            + (f"；頁面字型 {block.page_font_name}" if block.page_font_name else "")
         )
         self.update_text_edit_replacement_hint()
         self.update_text_edit_preview(block)
@@ -2581,7 +2640,17 @@ class VictorPdfToolsQt(QMainWindow):
         replacement = self.text_edit_replacement_input.toPlainText().strip()
         original_length = len(original)
         replacement_length = len(replacement)
-        if (self.text_edit_mode_combo.currentData() or "overlay") != "content_stream":
+        mode = self.text_edit_mode_combo.currentData() or "seamless"
+        if mode == "seamless":
+            if not PYMUPDF_AVAILABLE:
+                self.text_edit_replacement_hint.setText("無痕替換需要 PyMuPDF；請改用覆蓋替換。")
+                return
+            self.text_edit_replacement_hint.setText(
+                f"無痕替換：原文 {original_length} 字 → 新文字 {replacement_length} 字；"
+                f"會以 {block.font_name or '偵測字型'} / {block.font_size:.1f}pt 寫回。"
+            )
+            return
+        if mode != "content_stream":
             self.text_edit_replacement_hint.setText(
                 f"覆蓋替換：原文 {original_length} 字，新文字 {replacement_length} 字，可不同長度。"
             )
@@ -2629,19 +2698,32 @@ class VictorPdfToolsQt(QMainWindow):
                 scale_y,
                 image.height,
             )
+            mode = self.text_edit_mode_combo.currentData() or "seamless"
             if replacement:
-                draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#cbd5e1", width=1)
+                if mode != "seamless":
+                    draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#cbd5e1", width=1)
                 preview_font_size = max(selected_block.font_size * scale_y * 0.92, 8)
-                font = self.annotation_preview_font(
-                    preview_font_size,
-                    "bold" in (selected_block.font_name or "").lower(),
-                    font_key_for_pdf_font(selected_block.font_name),
-                )
-                draw.text((left + 3, top + 2), replacement, fill="#111827", font=font)
+                font = self.text_edit_preview_font(selected_block, preview_font_size)
+                text_color = rgb_to_hex(selected_block.color_rgb)
+                draw.text((left + 2, top + 1), replacement, fill=text_color, font=font)
             draw.rectangle((left, top, right, bottom), outline="#0f766e", width=3)
         pixmap = QPixmap.fromImage(ImageQt(image))
         self.text_edit_preview_label.setPixmap(pixmap)
         self.text_edit_preview_label.resize(pixmap.size())
+
+    def text_edit_preview_font(
+        self,
+        block: TextBlock,
+        font_size_pt: float,
+    ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
+        size = max(int(font_size_pt), 8)
+        if block.font_file:
+            try:
+                return ImageFont.truetype(block.font_file, size=size)
+            except Exception:
+                pass
+        bold = bool(block.font_flags & 16) or "bold" in (block.font_name or "").lower()
+        return self.annotation_preview_font(font_size_pt, bold, font_key_for_pdf_font(block.font_name))
 
     def text_replacement_preview_rect(
         self,
@@ -2651,6 +2733,16 @@ class VictorPdfToolsQt(QMainWindow):
         scale_y: float,
         image_height: int,
     ) -> tuple[float, float, float, float]:
+        if block.bbox != (0.0, 0.0, 0.0, 0.0):
+            x0, y0, x1, y1 = block.bbox
+            left = x0 * scale_x
+            top = image_height - y1 * scale_y
+            right = x1 * scale_x
+            bottom = image_height - y0 * scale_y
+            if replacement and len(replacement) > len(block.text.strip()):
+                extra = (len(replacement) - len(block.text.strip())) * block.font_size * 0.55 * scale_x
+                right += extra
+            return (left, top, right, bottom)
         if replacement:
             cover_width = max(block.width + block.font_size * 0.8, len(replacement) * block.font_size * 0.65)
             cover_height = max(block.height, block.font_size * 1.8)
@@ -2721,9 +2813,11 @@ class VictorPdfToolsQt(QMainWindow):
         if not target:
             return
         target_path = Path(target)
-        mode = self.text_edit_mode_combo.currentData() or "overlay"
-        replacement_job = replace_text_block_overlay
-        if mode == "content_stream":
+        mode = self.text_edit_mode_combo.currentData() or "seamless"
+        replacement_job = replace_text_block_seamless
+        if mode == "overlay":
+            replacement_job = replace_text_block_overlay
+        elif mode == "content_stream":
             replacement_job = replace_text_block_content_stream
 
         self.run_pdf_job(
@@ -3041,7 +3135,7 @@ class VictorPdfToolsQt(QMainWindow):
                 target_path = Path(folder)
         else:
             extension = ".txt" if operation in {"extract_text", "ocr_text", "info"} else ".pdf"
-            if operation == "split":
+            if operation in {"split", "split_advanced"}:
                 extension = ".zip"
             target, _ = QFileDialog.getSaveFileName(
                 self,
@@ -3075,6 +3169,12 @@ class VictorPdfToolsQt(QMainWindow):
             page_count = split_pdf_to_zip(source, target_path, password)
             self._last_tool_status_message = f"已拆分 {page_count} 頁並打包成 ZIP。"
             return
+        if operation == "split_advanced":
+            mode = self.tool_split_mode_combo.currentData() or "every"
+            value = self.tool_split_value_input.text()
+            file_count = split_pdf_advanced(source, target_path, mode, value, password)
+            self._last_tool_status_message = f"已依設定拆分成 {file_count} 個檔案並打包成 ZIP。"
+            return
         if operation == "images_to_pdf":
             images_to_pdf(self.tool_file_items, target_path)
             self._last_tool_status_message = f"已把 {len(self.tool_file_items)} 張圖片轉成 PDF。"
@@ -3107,6 +3207,28 @@ class VictorPdfToolsQt(QMainWindow):
             )
         elif operation == "encrypt":
             encrypt_pdf(source, target_path, self.tool_new_password_input.text(), password)
+        elif operation == "encrypt_permissions":
+            encrypt_pdf_with_permissions(
+                source,
+                target_path,
+                owner_password=self.tool_new_password_input.text(),
+                allow_print=self.tool_perm_print_checkbox.isChecked(),
+                allow_copy=self.tool_perm_copy_checkbox.isChecked(),
+                allow_modify=self.tool_perm_modify_checkbox.isChecked(),
+                password=password,
+            )
+        elif operation == "bates":
+            page_count = add_bates_numbering(
+                source,
+                target_path,
+                prefix=self.tool_bates_prefix_input.text(),
+                start=int(self.tool_bates_start_input.text() or "1"),
+                digits=int(self.tool_bates_digits_combo.currentText()),
+                position=self.tool_bates_position_combo.currentData() or "bottom-right",
+                password=password,
+            )
+            self._last_tool_status_message = f"已為 {page_count} 頁加上 Bates 編號。"
+            return
         elif operation == "decrypt":
             decrypt_pdf(source, target_path, password)
         elif operation == "compress":

@@ -13,12 +13,17 @@ from pdf_core import (
     MarkupAnnotation,
     PageItem,
     TextBlock,
+    add_bates_numbering,
     add_page_numbers,
     apply_markup_annotations,
     apply_outline,
     build_markup_annotation,
     crop_pdf_pages,
+    encrypt_pdf_with_permissions,
     extract_outline,
+    extract_page_text_blocks,
+    parse_page_groups,
+    split_pdf_advanced,
     add_text_overlay_annotation,
     add_watermark,
     build_annotation_da,
@@ -33,6 +38,7 @@ from pdf_core import (
     redact_text_block_overlay,
     replace_text_block_content_stream,
     replace_text_block_overlay,
+    replace_text_block_seamless,
     remove_blank_pages,
     split_pdf_to_zip,
     text_matches_query,
@@ -561,6 +567,139 @@ class PdfToolsTests(unittest.TestCase):
 
         with self.assertRaises(ValueError):
             crop_pdf_pages(source, target, (200, 60, 50, 300))
+
+    def test_parse_page_groups_splits_each_part(self):
+        self.assertEqual(parse_page_groups("1-3,4-6,7", 7), [[0, 1, 2], [3, 4, 5], [6]])
+
+    def test_split_pdf_advanced_every_n_pages(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "split.zip"
+        writer = PdfWriter()
+        for _ in range(5):
+            writer.add_blank_page(width=200, height=200)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        count = split_pdf_advanced(source, target, "every", "2")
+
+        self.assertEqual(count, 3)  # 2 + 2 + 1
+        self.assertTrue(target.exists())
+
+    def test_split_pdf_advanced_by_ranges(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "split.zip"
+        writer = PdfWriter()
+        for _ in range(6):
+            writer.add_blank_page(width=200, height=200)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        count = split_pdf_advanced(source, target, "ranges", "1-2,3-6")
+
+        self.assertEqual(count, 2)
+
+    def test_split_pdf_advanced_rejects_bad_size(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "split.zip"
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        with self.assertRaises(ValueError):
+            split_pdf_advanced(source, target, "every", "0")
+
+    def test_add_bates_numbering_stamps_each_page(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "bates.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        count = add_bates_numbering(source, target, prefix="ABC-", start=1, digits=6)
+
+        self.assertEqual(count, 2)
+        reader = PdfReader(str(target))
+        first = reader.pages[0].get("/Annots")[0].get_object()
+        self.assertEqual(str(first.get("/Contents")), "ABC-000001")
+        second = reader.pages[1].get("/Annots")[0].get_object()
+        self.assertEqual(str(second.get("/Contents")), "ABC-000002")
+
+    def test_encrypt_pdf_with_permissions_sets_owner_password(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "protected.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        encrypt_pdf_with_permissions(
+            source, target, owner_password="owner123", allow_print=False, allow_copy=False
+        )
+
+        reader = PdfReader(str(target))
+        self.assertTrue(reader.is_encrypted)
+        # opens without a user password
+        reader.decrypt("")
+        self.assertEqual(len(reader.pages), 1)
+
+    def test_encrypt_pdf_with_permissions_requires_owner_password(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "protected.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        with self.assertRaises(ValueError):
+            encrypt_pdf_with_permissions(source, target, owner_password="")
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_extract_page_text_blocks_pymupdf_includes_font_metadata(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "pymupdf-source.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((72, 100), "Sample Text", fontname="helv", fontsize=12)
+        doc.save(str(source))
+        doc.close()
+
+        blocks = extract_page_text_blocks(source, 0)
+
+        self.assertEqual(len(blocks), 1)
+        self.assertEqual(blocks[0].text, "Sample Text")
+        self.assertGreater(blocks[0].font_size, 0)
+        self.assertNotEqual(blocks[0].bbox, (0.0, 0.0, 0.0, 0.0))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_replace_text_block_seamless_rewrites_text(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "pymupdf-edit.pdf"
+        target = Path(self.temp_dir.name) / "pymupdf-edited.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((72, 100), "Old Label", fontname="helv", fontsize=12)
+        page.insert_text((72, 130), "Keep", fontname="helv", fontsize=12)
+        doc.save(str(source))
+        doc.close()
+
+        block = next(item for item in extract_page_text_blocks(source, 0) if item.text == "Old Label")
+        replace_text_block_seamless(source, target, 0, block, "New Label")
+
+        text = fitz.open(str(target))[0].get_text()
+        self.assertIn("New Label", text)
+        self.assertNotIn("Old Label", text)
+        self.assertIn("Keep", text)
 
     def setUp(self):
         import tempfile

@@ -10,6 +10,7 @@ from pathlib import Path
 
 from PIL import Image
 from pypdf import PdfReader, PdfWriter
+from pypdf.constants import UserAccessPermissions
 from pypdf.generic import (
     ArrayObject,
     BooleanObject,
@@ -45,6 +46,14 @@ except Exception:
 
     OCR_AVAILABLE = False
 
+try:
+    import fitz
+
+    PYMUPDF_AVAILABLE = True
+except Exception:
+    fitz = None
+    PYMUPDF_AVAILABLE = False
+
 PDF_SUFFIXES = {".pdf"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
 OCR_LANGUAGE_OPTIONS = {
@@ -74,6 +83,10 @@ class TextBlock:
     font_size: float
     font_name: str = ""
     color_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0)
+    bbox: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    font_flags: int = 0
+    page_font_name: str = ""
+    font_file: str = ""
 
 
 def block_right(block: TextBlock) -> float:
@@ -82,6 +95,22 @@ def block_right(block: TextBlock) -> float:
 
 def block_bottom(block: TextBlock) -> float:
     return block.y - block.height
+
+
+def _merge_block_bbox(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> tuple[float, float, float, float]:
+    if left == (0.0, 0.0, 0.0, 0.0):
+        return right
+    if right == (0.0, 0.0, 0.0, 0.0):
+        return left
+    return (
+        min(left[0], right[0]),
+        min(left[1], right[1]),
+        max(left[2], right[2]),
+        max(left[3], right[3]),
+    )
 
 
 def text_blocks_on_same_line(left: TextBlock, right: TextBlock) -> bool:
@@ -124,6 +153,10 @@ def merge_text_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
                     font_size=max(current.font_size, block.font_size),
                     font_name=current.font_name or block.font_name,
                     color_rgb=current.color_rgb,
+                    bbox=_merge_block_bbox(current.bbox, block.bbox),
+                    font_flags=current.font_flags or block.font_flags,
+                    page_font_name=current.page_font_name or block.page_font_name,
+                    font_file=current.font_file or block.font_file,
                 )
             else:
                 merged.append(current)
@@ -341,7 +374,157 @@ def write_pdf_info(source: Path, target: Path, password: str = "") -> None:
     target.write_text("\n".join(lines), encoding="utf-8")
 
 
-def extract_page_text_blocks(source: Path, page_index: int, password: str = "") -> list[TextBlock]:
+def ensure_pymupdf_available() -> None:
+    if not PYMUPDF_AVAILABLE or fitz is None:
+        raise ValueError("無痕文字替換需要 PyMuPDF（pymupdf）。")
+
+
+def normalize_font_key(font_name: str) -> str:
+    normalized = re.sub(r"^[A-Z0-9]{6}\+", "", font_name or "", flags=re.IGNORECASE)
+    return re.sub(r"[^a-z0-9]+", "", normalized.lower())
+
+
+def int_color_to_rgb(color: int) -> tuple[float, float, float]:
+    if color == 0:
+        return (0.0, 0.0, 0.0)
+    return (
+        ((color >> 16) & 255) / 255.0,
+        ((color >> 8) & 255) / 255.0,
+        (color & 255) / 255.0,
+    )
+
+
+WINDOWS_FONT_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "arial": ("arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf"),
+    "helvetica": ("arial.ttf", "arialbd.ttf", "ariali.ttf", "arialbi.ttf"),
+    "timesnewroman": ("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"),
+    "timesroman": ("times.ttf", "timesbd.ttf", "timesi.ttf", "timesbi.ttf"),
+    "courier": ("cour.ttf", "courbd.ttf", "couri.ttf", "courbi.ttf"),
+    "couriernew": ("cour.ttf", "courbd.ttf", "couri.ttf", "courbi.ttf"),
+    "microsoftyahei": ("msyh.ttc", "msyhbd.ttc"),
+    "yahei": ("msyh.ttc", "msyhbd.ttc"),
+    "mingliu": ("mingliu.ttc", "mingliub.ttc"),
+    "pmingliu": ("mingliu.ttc", "mingliub.ttc"),
+    "simsun": ("simsun.ttc", "simsunb.ttf"),
+    "nsimsun": ("simsun.ttc", "simsunb.ttf"),
+    "simhei": ("simhei.ttf",),
+    "calibri": ("calibri.ttf", "calibrib.ttf", "calibrii.ttf", "calibriz.ttf"),
+    "tahoma": ("tahoma.ttf", "tahomabd.ttf"),
+    "verdana": ("verdana.ttf", "verdanab.ttf", "verdanai.ttf", "verdanaz.ttf"),
+}
+
+
+def _font_file_variant_index(bold: bool, italic: bool) -> int:
+    if bold and italic:
+        return 3
+    if bold:
+        return 1
+    if italic:
+        return 2
+    return 0
+
+
+def resolve_system_font_file(font_name: str, font_flags: int = 0) -> str:
+    key = normalize_font_key(font_name)
+    candidates = None
+    for pattern, files in WINDOWS_FONT_CANDIDATES.items():
+        if pattern in key or key in pattern:
+            candidates = files
+            break
+    if candidates is None:
+        if any(token in key for token in ("song", "ming", "kai", "hei", "yahei", "gothic", "mincho")):
+            candidates = ("msyh.ttc", "mingliu.ttc", "simsun.ttc")
+        else:
+            candidates = WINDOWS_FONT_CANDIDATES["arial"]
+    bold = bool(font_flags & 16)
+    italic = bool(font_flags & 2)
+    index = _font_file_variant_index(bold, italic)
+    fonts_dir = Path("C:/Windows/Fonts")
+    for offset in (0, 1, 2, 3):
+        candidate_index = min(index + offset, len(candidates) - 1)
+        path = fonts_dir / candidates[candidate_index]
+        if path.exists():
+            return str(path)
+    fallback = fonts_dir / candidates[0]
+    if fallback.exists():
+        return str(fallback)
+    return ""
+
+
+def match_page_font_name(span_font: str, page_fonts: list[tuple]) -> str:
+    span_key = normalize_font_key(span_font)
+    if not span_key:
+        return ""
+    best_name = ""
+    best_score = 0
+    for _xref, _ext, _kind, basefont, name, _encoding in page_fonts:
+        for candidate in (basefont, name):
+            candidate_key = normalize_font_key(str(candidate))
+            if not candidate_key:
+                continue
+            if candidate_key == span_key:
+                return str(name)
+            if candidate_key in span_key or span_key in candidate_key:
+                score = min(len(candidate_key), len(span_key))
+                if score > best_score:
+                    best_score = score
+                    best_name = str(name)
+    return best_name
+
+
+def span_to_text_block(span: dict, page_fonts: list[tuple]) -> TextBlock:
+    text = (span.get("text") or "").replace("\u00a0", " ").strip()
+    bbox = tuple(float(value) for value in span.get("bbox", (0, 0, 0, 0)))
+    origin = span.get("origin") or (bbox[0], bbox[3])
+    font_name = str(span.get("font") or "")
+    font_flags = int(span.get("flags") or 0)
+    font_size = float(span.get("size") or 12)
+    page_font_name = match_page_font_name(font_name, page_fonts)
+    font_file = resolve_system_font_file(font_name, font_flags)
+    width = max(bbox[2] - bbox[0], font_size * 2.0)
+    height = max(bbox[3] - bbox[1], font_size * 1.2)
+    return TextBlock(
+        text=text,
+        x=float(origin[0]),
+        y=float(origin[1]),
+        width=width,
+        height=height,
+        font_size=font_size,
+        font_name=font_name,
+        color_rgb=int_color_to_rgb(int(span.get("color") or 0)),
+        bbox=bbox,
+        font_flags=font_flags,
+        page_font_name=page_font_name,
+        font_file=font_file,
+    )
+
+
+def extract_page_text_blocks_pymupdf(source: Path, page_index: int, password: str = "") -> list[TextBlock]:
+    ensure_pymupdf_available()
+    document = fitz.open(str(source))
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        if page_index < 0 or page_index >= document.page_count:
+            raise ValueError("頁碼超出範圍。")
+        page = document[page_index]
+        page_fonts = page.get_fonts()
+        blocks: list[TextBlock] = []
+        for block in page.get_text("dict").get("blocks", []):
+            if block.get("type") != 0:
+                continue
+            for line in block.get("lines", []):
+                for span in line.get("spans", []):
+                    item = span_to_text_block(span, page_fonts)
+                    if item.text:
+                        blocks.append(item)
+        return merge_text_blocks(blocks)
+    finally:
+        document.close()
+
+
+def extract_page_text_blocks_pypdf(source: Path, page_index: int, password: str = "") -> list[TextBlock]:
     reader = open_reader(source, password)
     if page_index < 0 or page_index >= len(reader.pages):
         raise ValueError("頁碼超出範圍。")
@@ -364,6 +547,105 @@ def extract_page_text_blocks(source: Path, page_index: int, password: str = "") 
 
     reader.pages[page_index].extract_text(visitor_text=visitor_text)
     return merge_text_blocks(blocks)
+
+
+def extract_page_text_blocks(source: Path, page_index: int, password: str = "") -> list[TextBlock]:
+    if PYMUPDF_AVAILABLE:
+        try:
+            return extract_page_text_blocks_pymupdf(source, page_index, password)
+        except Exception:
+            pass
+    return extract_page_text_blocks_pypdf(source, page_index, password)
+
+
+def text_block_redaction_rect(block: TextBlock, replacement: str = "") -> "fitz.Rect":
+    ensure_pymupdf_available()
+    padding = max(block.font_size * 0.15, 1.5)
+    if block.bbox != (0.0, 0.0, 0.0, 0.0):
+        rect = fitz.Rect(block.bbox)
+    else:
+        rect = fitz.Rect(
+            block.x,
+            block.y - block.height,
+            block.x + block.width,
+            block.y + max(block.font_size * 0.35, 4.0),
+        )
+    rect = rect + (-padding, -padding, padding, padding)
+    if replacement:
+        extra_width = max(len(replacement) - len(block.text.strip()), 0) * block.font_size * 0.55
+        if extra_width > 0:
+            rect.x1 += extra_width + padding
+    return rect
+
+
+def _insert_text_with_block_style(page, block: TextBlock, replacement: str, rect: "fitz.Rect") -> None:
+    fontsize = max(block.font_size, 6.0)
+    color = block.color_rgb
+    kwargs: dict = {"fontsize": fontsize, "color": color, "align": fitz.TEXT_ALIGN_LEFT}
+    if block.page_font_name:
+        kwargs["fontname"] = block.page_font_name
+    elif block.font_file:
+        kwargs["fontfile"] = block.font_file
+    else:
+        kwargs["fontname"] = "helv"
+
+    overflow = page.insert_textbox(rect, replacement, **kwargs)
+    if overflow >= 0:
+        return
+
+    point = fitz.Point(block.x, block.y)
+    insert_kwargs = {"fontsize": fontsize, "color": color}
+    if block.page_font_name:
+        insert_kwargs["fontname"] = block.page_font_name
+    elif block.font_file:
+        insert_kwargs["fontfile"] = block.font_file
+    else:
+        insert_kwargs["fontname"] = "helv"
+    page.insert_text(point, replacement, **insert_kwargs)
+
+
+def replace_text_block_seamless(
+    source: Path,
+    target: Path,
+    page_index: int,
+    block: TextBlock,
+    replacement: str,
+    password: str = "",
+) -> None:
+    """Remove the original text run and rewrite with matched font/size/color."""
+
+    if not replacement.strip():
+        raise ValueError("請輸入替換文字。")
+    ensure_pymupdf_available()
+
+    document = fitz.open(str(source))
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        if page_index < 0 or page_index >= document.page_count:
+            raise ValueError("頁碼超出範圍。")
+
+        page = document[page_index]
+        replacement_text = replacement.strip()
+        rect = text_block_redaction_rect(block, replacement_text)
+
+        needle = block.text.strip()
+        if needle:
+            matches = page.search_for(needle)
+            if matches:
+                rect = matches[0]
+                if replacement_text and len(replacement_text) > len(needle):
+                    extra = (len(replacement_text) - len(needle)) * block.font_size * 0.55
+                    rect.x1 += extra + max(block.font_size * 0.15, 1.5)
+
+        page.add_redact_annot(rect, fill=(1, 1, 1))
+        page.apply_redactions()
+
+        _insert_text_with_block_style(page, block, replacement_text, rect)
+        document.save(str(target), garbage=4, deflate=True)
+    finally:
+        document.close()
 
 
 def replace_text_block_overlay(
@@ -1331,3 +1613,204 @@ def crop_pdf_pages(
         raise ValueError("裁切範圍與頁面沒有重疊，未輸出任何頁面。")
     write_pdf(writer, target)
     return cropped
+
+
+# --- advanced split ----------------------------------------------------------
+
+def parse_page_groups(spec: str, page_count: int) -> list[list[int]]:
+    """Parse a spec where each comma-separated part becomes its own group.
+
+    Example: ``"1-3,4-6,7"`` -> ``[[0,1,2], [3,4,5], [6]]``.
+    """
+
+    spec = (spec or "").strip()
+    if not spec:
+        raise ValueError("請輸入範圍，例如 1-3,4-6,7-9。")
+    groups: list[list[int]] = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part:
+            start_text, end_text = part.split("-", 1)
+            start, end = int(start_text), int(end_text)
+            if start > end:
+                raise ValueError(f"頁碼範圍不正確：{part}")
+            pages = list(range(start - 1, end))
+        else:
+            pages = [int(part) - 1]
+        for page in pages:
+            if page < 0 or page >= page_count:
+                raise ValueError(f"頁碼超出範圍：{page + 1}，目前共有 {page_count} 頁。")
+        groups.append(pages)
+    if not groups:
+        raise ValueError("沒有有效的拆分範圍。")
+    return groups
+
+
+def split_pdf_advanced(
+    source: Path,
+    target_zip: Path,
+    mode: str,
+    value: str,
+    password: str = "",
+) -> int:
+    """Split a PDF into multiple files inside a ZIP.
+
+    ``mode="every"`` groups every ``value`` pages into one file. ``mode="ranges"``
+    treats ``value`` as a comma list where each part becomes one output file.
+    Returns the number of output PDFs.
+    """
+
+    reader = open_reader(source, password)
+    page_count = len(reader.pages)
+    if page_count == 0:
+        raise ValueError("PDF 沒有頁面可拆分。")
+
+    if mode == "every":
+        try:
+            size = int(str(value).strip())
+        except (TypeError, ValueError):
+            raise ValueError("請輸入每檔頁數（正整數）。")
+        if size < 1:
+            raise ValueError("每檔頁數必須至少為 1。")
+        groups = [list(range(start, min(start + size, page_count))) for start in range(0, page_count, size)]
+    elif mode == "ranges":
+        groups = parse_page_groups(value, page_count)
+    else:
+        raise ValueError(f"未知的拆分模式：{mode}")
+
+    stem = safe_output_name(source.stem)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        generated: list[Path] = []
+        for part_index, pages in enumerate(groups, start=1):
+            if not pages:
+                continue
+            writer = PdfWriter()
+            for page_index in pages:
+                writer.add_page(reader.pages[page_index])
+            first = pages[0] + 1
+            last = pages[-1] + 1
+            label = f"{first}" if first == last else f"{first}-{last}"
+            part = temp_path / safe_output_name(f"{part_index:03d}-{stem}-pages-{label}.pdf")
+            write_pdf(writer, part)
+            generated.append(part)
+        if not generated:
+            raise ValueError("沒有可輸出的拆分檔案。")
+        with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in generated:
+                archive.write(item, item.name)
+    return len(generated)
+
+
+# --- Bates numbering ---------------------------------------------------------
+
+BATES_POSITIONS = {
+    "bottom-right": "右下",
+    "bottom-left": "左下",
+    "top-right": "右上",
+    "top-left": "左上",
+}
+
+
+def add_bates_numbering(
+    source: Path,
+    target: Path,
+    prefix: str = "",
+    start: int = 1,
+    digits: int = 6,
+    suffix: str = "",
+    position: str = "bottom-right",
+    password: str = "",
+) -> int:
+    """Stamp sequential Bates numbers (e.g. ABC-000001) on every page."""
+
+    if digits < 1 or digits > 12:
+        raise ValueError("位數請介於 1 至 12。")
+    if position not in BATES_POSITIONS:
+        raise ValueError("不支援的 Bates 位置。")
+
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    for index, page in enumerate(writer.pages):
+        number = start + index
+        text = f"{prefix}{number:0{digits}d}{suffix}"
+        width = float(page.mediabox.width)
+        height = float(page.mediabox.height)
+        rect_width = max(120.0, len(text) * 8.0)
+        margin = 24.0
+        if position.endswith("right"):
+            x = max(width - rect_width - margin, margin)
+        else:
+            x = margin
+        if position.startswith("bottom"):
+            y = margin
+        else:
+            y = max(height - margin - 18.0, margin)
+        annotation = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/FreeText"),
+                NameObject("/Rect"): ArrayObject(
+                    [FloatObject(x), FloatObject(y), FloatObject(x + rect_width), FloatObject(y + 20)]
+                ),
+                NameObject("/Contents"): TextStringObject(text),
+                NameObject("/DA"): TextStringObject("/Helv 10 Tf 0.1 0.1 0.1 rg"),
+                NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        add_annotation_to_page(writer, page, annotation)
+    write_pdf(writer, target)
+    return len(writer.pages)
+
+
+# --- permission control ------------------------------------------------------
+
+def encrypt_pdf_with_permissions(
+    source: Path,
+    target: Path,
+    owner_password: str,
+    allow_print: bool = True,
+    allow_copy: bool = True,
+    allow_modify: bool = True,
+    user_password: str = "",
+    password: str = "",
+) -> None:
+    """Encrypt with an owner password and restrict printing/copying/modifying.
+
+    ``user_password`` (empty by default) lets recipients open the file without a
+    password while still being bound by the permission flags.
+    """
+
+    if not owner_password:
+        raise ValueError("請輸入擁有者密碼（用來鎖定權限）。")
+
+    reader = open_reader(source, password)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+
+    permissions = UserAccessPermissions(0)
+    if allow_print:
+        permissions |= UserAccessPermissions.PRINT | UserAccessPermissions.PRINT_TO_REPRESENTATION
+    if allow_copy:
+        permissions |= (
+            UserAccessPermissions.EXTRACT | UserAccessPermissions.EXTRACT_TEXT_AND_GRAPHICS
+        )
+    if allow_modify:
+        permissions |= (
+            UserAccessPermissions.MODIFY
+            | UserAccessPermissions.ADD_OR_MODIFY
+            | UserAccessPermissions.FILL_FORM_FIELDS
+            | UserAccessPermissions.ASSEMBLE_DOC
+        )
+
+    writer.encrypt(
+        user_password=user_password,
+        owner_password=owner_password,
+        permissions_flag=permissions,
+    )
+    write_pdf(writer, target)
