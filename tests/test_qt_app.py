@@ -517,6 +517,17 @@ class QtAppTests(unittest.TestCase):
         self.assertIsNotNone(window.annotation_preview_label.pixmap())
         self.assertFalse(window.annotation_preview_label.pixmap().isNull())
 
+    def test_organize_grid_has_drag_enabled(self):
+        from PySide6.QtWidgets import QListWidget
+
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        grid = window.page_grid
+
+        self.assertTrue(grid.dragEnabled())
+        self.assertTrue(grid.acceptDrops())
+        self.assertEqual(grid.dragDropMode(), QListWidget.DragDrop)
+
     def test_organize_drag_insertion_indicator(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])

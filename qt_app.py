@@ -242,12 +242,6 @@ class PageGrid(QListWidget):
     def __init__(self) -> None:
         super().__init__()
         self._drop_indicator_row = -1
-        self.setAcceptDrops(True)
-        self.setDragEnabled(True)
-        self.setDropIndicatorShown(False)
-        self.setDefaultDropAction(Qt.MoveAction)
-        self.setDragDropMode(QListWidget.DragDrop)
-        self.setDragDropOverwriteMode(False)
         self.setSelectionMode(QListWidget.ExtendedSelection)
         self.setViewMode(QListWidget.IconMode)
         self.setMovement(QListWidget.Static)
@@ -257,6 +251,14 @@ class PageGrid(QListWidget):
         self.setIconSize(ICON_SIZE)
         self.setGridSize(THUMB_SIZE)
         self.setUniformItemSizes(True)
+        # Drag/drop settings must come AFTER setViewMode/setMovement, otherwise
+        # switching to IconMode resets them (drag would silently stay disabled).
+        self.setAcceptDrops(True)
+        self.setDragEnabled(True)
+        self.setDropIndicatorShown(False)
+        self.setDefaultDropAction(Qt.MoveAction)
+        self.setDragDropMode(QListWidget.DragDrop)
+        self.setDragDropOverwriteMode(False)
         self.setStyleSheet(
             """
             QListWidget {
