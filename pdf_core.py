@@ -12,6 +12,7 @@ from PIL import Image
 from pypdf import PdfReader, PdfWriter
 from pypdf.generic import (
     ArrayObject,
+    BooleanObject,
     ByteStringObject,
     ContentStream,
     DecodedStreamObject,
@@ -19,6 +20,7 @@ from pypdf.generic import (
     FloatObject,
     NameObject,
     NumberObject,
+    RectangleObject,
     TextStringObject,
 )
 
@@ -1079,3 +1081,253 @@ def apply_outline(source: Path, target: Path, items: list[BookmarkItem], passwor
             del parents[deeper]
 
     write_pdf(writer, target)
+
+
+# --- markup annotations (highlight / shapes / sticky notes) ------------------
+
+MARKUP_KINDS = (
+    "highlight",
+    "underline",
+    "strikeout",
+    "rect",
+    "ellipse",
+    "line",
+    "arrow",
+    "note",
+)
+
+MARKUP_SUBTYPES = {
+    "highlight": "/Highlight",
+    "underline": "/Underline",
+    "strikeout": "/StrikeOut",
+    "rect": "/Square",
+    "ellipse": "/Circle",
+    "line": "/Line",
+    "arrow": "/Line",
+    "note": "/Text",
+}
+
+MARKUP_COLOR_PRESETS: dict[str, tuple[float, float, float]] = {
+    "yellow": (1.0, 0.92, 0.23),
+    "green": (0.45, 0.86, 0.45),
+    "blue": (0.40, 0.74, 1.0),
+    "pink": (1.0, 0.58, 0.79),
+    "red": (0.88, 0.16, 0.16),
+    "black": (0.0, 0.0, 0.0),
+}
+
+
+@dataclass(frozen=True)
+class MarkupAnnotation:
+    """A markup placed on a page, in PDF user space (origin bottom-left).
+
+    For rectangle-like markups (highlight/underline/strikeout/rect/ellipse) the
+    two points are opposite corners. For line/arrow they are the endpoints. For
+    a sticky note only (x0, y0) is used as the anchor point.
+    """
+
+    kind: str
+    x0: float
+    y0: float
+    x1: float
+    y1: float
+    color_rgb: tuple[float, float, float] = (1.0, 0.92, 0.23)
+    contents: str = ""
+
+
+def _normalized_rect(x0: float, y0: float, x1: float, y1: float) -> tuple[float, float, float, float]:
+    return (min(x0, x1), min(y0, y1), max(x0, x1), max(y0, y1))
+
+
+def _color_array(color_rgb: tuple[float, float, float]) -> ArrayObject:
+    red, green, blue = color_rgb
+    return ArrayObject([FloatObject(red), FloatObject(green), FloatObject(blue)])
+
+
+def build_markup_annotation(markup: MarkupAnnotation) -> DictionaryObject:
+    kind = markup.kind
+    if kind not in MARKUP_SUBTYPES:
+        raise ValueError(f"未知的標註類型：{kind}")
+    color = _color_array(markup.color_rgb)
+
+    if kind in {"highlight", "underline", "strikeout"}:
+        left, bottom, right, top = _normalized_rect(markup.x0, markup.y0, markup.x1, markup.y1)
+        quad = ArrayObject(
+            [
+                FloatObject(left),
+                FloatObject(top),
+                FloatObject(right),
+                FloatObject(top),
+                FloatObject(left),
+                FloatObject(bottom),
+                FloatObject(right),
+                FloatObject(bottom),
+            ]
+        )
+        annotation = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject(MARKUP_SUBTYPES[kind]),
+                NameObject("/Rect"): ArrayObject(
+                    [FloatObject(left), FloatObject(bottom), FloatObject(right), FloatObject(top)]
+                ),
+                NameObject("/QuadPoints"): quad,
+                NameObject("/C"): color,
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        if markup.contents:
+            annotation[NameObject("/Contents")] = TextStringObject(markup.contents)
+        return annotation
+
+    if kind in {"rect", "ellipse"}:
+        left, bottom, right, top = _normalized_rect(markup.x0, markup.y0, markup.x1, markup.y1)
+        annotation = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject(MARKUP_SUBTYPES[kind]),
+                NameObject("/Rect"): ArrayObject(
+                    [FloatObject(left), FloatObject(bottom), FloatObject(right), FloatObject(top)]
+                ),
+                NameObject("/C"): color,
+                NameObject("/BS"): DictionaryObject(
+                    {NameObject("/W"): NumberObject(2), NameObject("/S"): NameObject("/S")}
+                ),
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        if markup.contents:
+            annotation[NameObject("/Contents")] = TextStringObject(markup.contents)
+        return annotation
+
+    if kind in {"line", "arrow"}:
+        left, bottom, right, top = _normalized_rect(markup.x0, markup.y0, markup.x1, markup.y1)
+        padding = 6.0
+        annotation = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/Line"),
+                NameObject("/L"): ArrayObject(
+                    [
+                        FloatObject(markup.x0),
+                        FloatObject(markup.y0),
+                        FloatObject(markup.x1),
+                        FloatObject(markup.y1),
+                    ]
+                ),
+                NameObject("/Rect"): ArrayObject(
+                    [
+                        FloatObject(left - padding),
+                        FloatObject(bottom - padding),
+                        FloatObject(right + padding),
+                        FloatObject(top + padding),
+                    ]
+                ),
+                NameObject("/C"): color,
+                NameObject("/BS"): DictionaryObject({NameObject("/W"): NumberObject(2)}),
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        if kind == "arrow":
+            annotation[NameObject("/LE")] = ArrayObject([NameObject("/None"), NameObject("/OpenArrow")])
+        if markup.contents:
+            annotation[NameObject("/Contents")] = TextStringObject(markup.contents)
+        return annotation
+
+    # sticky note
+    size = 18.0
+    annotation = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/Text"),
+            NameObject("/Rect"): ArrayObject(
+                [
+                    FloatObject(markup.x0),
+                    FloatObject(markup.y0 - size),
+                    FloatObject(markup.x0 + size),
+                    FloatObject(markup.y0),
+                ]
+            ),
+            NameObject("/Contents"): TextStringObject(markup.contents or "備註"),
+            NameObject("/Name"): NameObject("/Comment"),
+            NameObject("/Open"): BooleanObject(False),
+            NameObject("/C"): color,
+            NameObject("/F"): NumberObject(4),
+        }
+    )
+    return annotation
+
+
+def apply_markup_annotations(
+    source: Path,
+    target: Path,
+    markups: list[tuple[int, MarkupAnnotation]],
+    password: str = "",
+) -> int:
+    if not markups:
+        raise ValueError("請先加入至少一個標註。")
+    reader = open_reader(source, password)
+    page_count = len(reader.pages)
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    applied = 0
+    for page_index, markup in markups:
+        if page_index < 0 or page_index >= page_count:
+            continue
+        add_annotation_to_page(writer, writer.pages[page_index], build_markup_annotation(markup))
+        applied += 1
+    if applied == 0:
+        raise ValueError("沒有可套用的標註。")
+    write_pdf(writer, target)
+    return applied
+
+
+# --- page cropping -----------------------------------------------------------
+
+def crop_pdf_pages(
+    source: Path,
+    target: Path,
+    rect: tuple[float, float, float, float],
+    pages_spec: str = "",
+    password: str = "",
+) -> int:
+    """Crop selected pages to ``rect`` (left, bottom, right, top) in PDF points.
+
+    The rectangle is the area to keep and is clamped to each page's media box.
+    """
+
+    left, bottom, right, top = rect
+    if right <= left or top <= bottom:
+        raise ValueError("裁切範圍無效，請重新框選或輸入正確數值。")
+
+    reader = open_reader(source, password)
+    page_count = len(reader.pages)
+    selected = (
+        set(parse_pages(pages_spec, page_count))
+        if (pages_spec or "").strip()
+        else set(range(page_count))
+    )
+    if not selected:
+        raise ValueError("沒有要裁切的頁面。")
+
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+    cropped = 0
+    for index, page in enumerate(writer.pages):
+        if index not in selected:
+            continue
+        media = page.mediabox
+        new_left = max(left, float(media.left))
+        new_bottom = max(bottom, float(media.bottom))
+        new_right = min(right, float(media.right))
+        new_top = min(top, float(media.top))
+        if new_right <= new_left or new_top <= new_bottom:
+            continue
+        box = RectangleObject([new_left, new_bottom, new_right, new_top])
+        page.cropbox = box
+        page.trimbox = box
+        cropped += 1
+    if cropped == 0:
+        raise ValueError("裁切範圍與頁面沒有重疊，未輸出任何頁面。")
+    write_pdf(writer, target)
+    return cropped

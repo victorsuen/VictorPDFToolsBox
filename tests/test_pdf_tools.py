@@ -10,10 +10,14 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 from app import copy_pages, parse_pages
 from pdf_core import (
     BookmarkItem,
+    MarkupAnnotation,
     PageItem,
     TextBlock,
     add_page_numbers,
+    apply_markup_annotations,
     apply_outline,
+    build_markup_annotation,
+    crop_pdf_pages,
     extract_outline,
     add_text_overlay_annotation,
     add_watermark,
@@ -456,6 +460,107 @@ class PdfToolsTests(unittest.TestCase):
             writer.write(stream)
 
         self.assertEqual(extract_outline(source), [])
+
+    def test_build_markup_annotation_highlight_has_quadpoints(self):
+        annotation = build_markup_annotation(
+            MarkupAnnotation("highlight", 10, 20, 110, 40, (1.0, 0.9, 0.2))
+        )
+        self.assertEqual(annotation.get("/Subtype"), "/Highlight")
+        self.assertEqual(len(annotation.get("/QuadPoints")), 8)
+        self.assertEqual([float(v) for v in annotation.get("/C")], [1.0, 0.9, 0.2])
+
+    def test_build_markup_annotation_arrow_has_line_ending(self):
+        annotation = build_markup_annotation(MarkupAnnotation("arrow", 10, 20, 80, 90))
+        self.assertEqual(annotation.get("/Subtype"), "/Line")
+        self.assertEqual([str(v) for v in annotation.get("/LE")], ["/None", "/OpenArrow"])
+        self.assertEqual([float(v) for v in annotation.get("/L")], [10.0, 20.0, 80.0, 90.0])
+
+    def test_build_markup_annotation_note_uses_contents(self):
+        annotation = build_markup_annotation(
+            MarkupAnnotation("note", 50, 60, 50, 60, contents="檢查這裡")
+        )
+        self.assertEqual(annotation.get("/Subtype"), "/Text")
+        self.assertEqual(str(annotation.get("/Contents")), "檢查這裡")
+
+    def test_apply_markup_annotations_adds_per_page(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        markups = [
+            (0, MarkupAnnotation("highlight", 10, 10, 100, 30)),
+            (0, MarkupAnnotation("rect", 20, 40, 120, 90)),
+            (1, MarkupAnnotation("note", 50, 60, 50, 60, contents="hi")),
+        ]
+        applied = apply_markup_annotations(source, target, markups)
+
+        reader = PdfReader(str(target))
+        self.assertEqual(applied, 3)
+        self.assertEqual(len(reader.pages[0].get("/Annots")), 2)
+        self.assertEqual(len(reader.pages[1].get("/Annots")), 1)
+
+    def test_apply_markup_annotations_requires_items(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        with self.assertRaises(ValueError):
+            apply_markup_annotations(source, target, [])
+
+    def test_crop_pdf_pages_sets_cropbox(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        cropped = crop_pdf_pages(source, target, (50, 60, 200, 300), pages_spec="1")
+
+        reader = PdfReader(str(target))
+        self.assertEqual(cropped, 1)
+        box = reader.pages[0].cropbox
+        self.assertEqual(
+            [float(box.left), float(box.bottom), float(box.right), float(box.top)],
+            [50.0, 60.0, 200.0, 300.0],
+        )
+        # untouched page keeps the full media box
+        self.assertEqual(float(reader.pages[1].cropbox.right), 300.0)
+
+    def test_crop_pdf_pages_clamps_to_media_box(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        crop_pdf_pages(source, target, (-20, -20, 999, 999))
+
+        box = PdfReader(str(target)).pages[0].cropbox
+        self.assertEqual(
+            [float(box.left), float(box.bottom), float(box.right), float(box.top)],
+            [0.0, 0.0, 300.0, 400.0],
+        )
+
+    def test_crop_pdf_pages_rejects_invalid_rect(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        with self.assertRaises(ValueError):
+            crop_pdf_pages(source, target, (200, 60, 50, 300))
 
     def setUp(self):
         import tempfile

@@ -650,6 +650,110 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(dialog.source_list.item(0).text().split("\n", 1)[0], "source.pdf")
         self.assertEqual(dialog.source_list.item(1).text().split("\n", 1)[0], "second.pdf")
 
+    def test_markup_add_rect_records_item_on_current_page(self):
+        window = VictorPdfToolsQt()
+        window.set_markup_pdf(self.source)
+        window.markup_page_size = (300.0, 400.0)
+        window.markup_preview_image = _white_image(300, 400)
+        window.markup_page_input.setText("1")
+        window.markup_tool_combo.setCurrentIndex(0)  # highlight
+
+        window.add_markup_from_rect(QPoint(30, 40), QPoint(150, 80))
+
+        self.assertEqual(len(window.markup_items), 1)
+        page_index, markup = window.markup_items[0]
+        self.assertEqual(page_index, 0)
+        self.assertEqual(markup.kind, "highlight")
+        self.assertGreater(markup.x1, markup.x0)
+
+    def test_markup_note_uses_point_click(self):
+        window = VictorPdfToolsQt()
+        window.set_markup_pdf(self.source)
+        window.markup_page_size = (300.0, 400.0)
+        window.markup_preview_image = _white_image(300, 400)
+        note_index = window.markup_tool_combo.findData("note")
+        window.markup_tool_combo.setCurrentIndex(note_index)
+        window.markup_note_input.setText("看這裡")
+
+        window.add_markup_from_point(QPoint(60, 60))
+
+        self.assertEqual(len(window.markup_items), 1)
+        _page_index, markup = window.markup_items[0]
+        self.assertEqual(markup.kind, "note")
+        self.assertEqual(markup.contents, "看這裡")
+
+    def test_markup_delete_and_clear(self):
+        window = VictorPdfToolsQt()
+        window.set_markup_pdf(self.source)
+        window.markup_page_size = (300.0, 400.0)
+        window.markup_preview_image = _white_image(300, 400)
+        window.add_markup_from_rect(QPoint(10, 10), QPoint(80, 40))
+        window.add_markup_from_rect(QPoint(10, 60), QPoint(80, 90))
+
+        window.markup_list.setCurrentRow(0)
+        window.delete_selected_markup()
+        self.assertEqual(len(window.markup_items), 1)
+
+        window.clear_markups()
+        self.assertEqual(window.markup_items, [])
+
+    def test_markup_save_applies_annotations(self):
+        window = VictorPdfToolsQt()
+        window.set_markup_pdf(self.source)
+        window.markup_page_size = (300.0, 400.0)
+        window.markup_preview_image = _white_image(300, 400)
+        window.add_markup_from_rect(QPoint(10, 10), QPoint(120, 40))
+        target = Path(self.temp_dir.name) / "marked.pdf"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch.object(window, "open_pdf_as_new_tab"):
+                window.save_markup_pdf()
+
+        self.assertTrue(target.exists())
+        self.assertEqual(len(PdfReader(str(target)).pages[0].get("/Annots")), 1)
+
+    def test_crop_drag_sets_rect_inputs(self):
+        window = VictorPdfToolsQt()
+        window.set_crop_pdf(self.source)
+        window.crop_page_size = (300.0, 400.0)
+        window.crop_preview_image = _white_image(300, 400)
+
+        window.set_crop_rect_from_drag(QPoint(60, 100), QPoint(240, 300))
+
+        self.assertIsNotNone(window.crop_rect)
+        left, bottom, right, top = window.crop_rect
+        self.assertAlmostEqual(left, 60.0, places=1)
+        self.assertAlmostEqual(right, 240.0, places=1)
+        # widget y is top-down, PDF y is bottom-up
+        self.assertAlmostEqual(top, 300.0, places=1)
+        self.assertAlmostEqual(bottom, 100.0, places=1)
+
+    def test_crop_save_writes_cropbox(self):
+        window = VictorPdfToolsQt()
+        window.set_crop_pdf(self.source)
+        window.crop_page_size = (300.0, 400.0)
+        window.crop_preview_image = _white_image(300, 400)
+        window.set_crop_rect((40.0, 50.0, 220.0, 320.0))
+        window.crop_scope_combo.setCurrentIndex(window.crop_scope_combo.findData("all"))
+        target = Path(self.temp_dir.name) / "cropped.pdf"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch.object(window, "open_pdf_as_new_tab"):
+                window.save_crop_pdf()
+
+        self.assertTrue(target.exists())
+        box = PdfReader(str(target)).pages[0].cropbox
+        self.assertEqual(
+            [float(box.left), float(box.bottom), float(box.right), float(box.top)],
+            [40.0, 50.0, 220.0, 320.0],
+        )
+
+
+def _white_image(width: int, height: int):
+    from PIL import Image
+
+    return Image.new("RGB", (width, height), "white")
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -7,7 +7,7 @@ from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QByteArray, QMimeData, QPoint, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtCore import QByteArray, QMimeData, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QColor, QDrag, QDragEnterEvent, QDropEvent, QIcon, QIntValidator, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -39,17 +39,21 @@ from PySide6.QtWidgets import (
 
 from pdf_core import (
     IMAGE_SUFFIXES,
+    MARKUP_COLOR_PRESETS,
     OCR_LANGUAGE_OPTIONS,
     PDF_RENDER_AVAILABLE,
     PDF_SUFFIXES,
     BookmarkItem,
+    MarkupAnnotation,
     PageItem,
     TextBlock,
     add_page_numbers,
     ANNOTATION_COLOR_PRESETS,
     add_text_overlay_annotation,
     add_watermark,
+    apply_markup_annotations,
     apply_outline,
+    crop_pdf_pages,
     extract_outline,
     rgb_to_hex,
     clean_metadata,
@@ -204,6 +208,55 @@ class TextEditPreviewLabel(QLabel):
     def mousePressEvent(self, event) -> None:
         self.positionClicked.emit(event.position().toPoint())
         super().mousePressEvent(event)
+
+
+class MarkupPreviewLabel(QLabel):
+    """Preview label that supports rubber-band rectangle drawing and clicks."""
+
+    rectDrawn = Signal(QPoint, QPoint)
+    pointClicked = Signal(QPoint)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
+        self.setStyleSheet("background: #f6f8fb; border: 1px solid #dce3ec;")
+        self.band_color = QColor(18, 133, 118)
+        self._start: QPoint | None = None
+        self._current: QPoint | None = None
+
+    def mousePressEvent(self, event) -> None:
+        self._start = event.position().toPoint()
+        self._current = self._start
+        self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._start is not None:
+            self._current = event.position().toPoint()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._start is not None:
+            start = self._start
+            end = event.position().toPoint()
+            self._start = None
+            self._current = None
+            self.update()
+            if (start - end).manhattanLength() <= 4:
+                self.pointClicked.emit(end)
+            else:
+                self.rectDrawn.emit(start, end)
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._start is not None and self._current is not None:
+            painter = QPainter(self)
+            pen = QPen(self.band_color, 2, Qt.DashLine)
+            painter.setPen(pen)
+            painter.drawRect(QRect(self._start, self._current).normalized())
+            painter.end()
 
 
 class PdfDropPanel(QWidget):
@@ -726,6 +779,17 @@ class VictorPdfToolsQt(QMainWindow):
         self.bookmark_pdf_path: Path | None = None
         self.bookmark_page_count = 0
         self.bookmark_items: list[BookmarkItem] = []
+        self.markup_pdf_path: Path | None = None
+        self.markup_page_count = 0
+        self.markup_page_size = (0.0, 0.0)
+        self.markup_preview_image: Image.Image | None = None
+        self.markup_items: list[tuple[int, MarkupAnnotation]] = []
+        self.markup_color_rgb = MARKUP_COLOR_PRESETS["yellow"]
+        self.crop_pdf_path: Path | None = None
+        self.crop_page_count = 0
+        self.crop_page_size = (0.0, 0.0)
+        self.crop_preview_image: Image.Image | None = None
+        self.crop_rect: tuple[float, float, float, float] | None = None
         self.text_edit_preview_image: Image.Image | None = None
         self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
@@ -817,6 +881,8 @@ class VictorPdfToolsQt(QMainWindow):
         tabs.addTab(self.build_organize_tab(), "組織 / 擷取")
         tabs.addTab(self.build_tools_tab(), "常用 PDF 工具")
         tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
+        tabs.addTab(self.build_markup_tab(), "螢光 / 圖形註解")
+        tabs.addTab(self.build_crop_tab(), "裁切頁面")
         tabs.addTab(self.build_text_edit_tab(), "文字編輯 Beta")
         tabs.addTab(self.build_bookmark_tab(), "書籤 / 目錄")
         layout.addWidget(tabs, 1)
@@ -1265,6 +1331,662 @@ class VictorPdfToolsQt(QMainWindow):
             text_color = rgb_to_hex(style["color_rgb"])
             draw.text((left + 4, top + 2), text, fill=text_color, font=font)
         return canvas
+
+    # --- markup annotations (highlight / shapes / sticky notes) --------------
+    MARKUP_TOOL_OPTIONS = [
+        ("highlight", "螢光標示"),
+        ("underline", "底線"),
+        ("strikeout", "刪除線"),
+        ("rect", "矩形框"),
+        ("ellipse", "橢圓框"),
+        ("line", "直線"),
+        ("arrow", "箭頭"),
+        ("note", "便利貼"),
+    ]
+
+    MARKUP_COLOR_OPTIONS = [
+        ("yellow", "黃色"),
+        ("green", "綠色"),
+        ("blue", "藍色"),
+        ("pink", "粉紅"),
+        ("red", "紅色"),
+        ("black", "黑色"),
+        ("custom", "自訂..."),
+    ]
+
+    def build_markup_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_markup_pdf)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(14)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        top = QHBoxLayout()
+        self.add_button(top, "載入 PDF", self.load_markup_pdf)
+        top.addWidget(QLabel("頁碼"))
+        self.markup_page_input = QLineEdit("1")
+        self.markup_page_input.setFixedWidth(56)
+        self.markup_page_validator = QIntValidator(1, 1, self)
+        self.markup_page_input.setValidator(self.markup_page_validator)
+        self.markup_page_input.editingFinished.connect(self.render_markup_preview)
+        top.addWidget(self.markup_page_input)
+        self.add_button(top, "上一頁", lambda: self.change_markup_page(-1))
+        self.add_button(top, "下一頁", lambda: self.change_markup_page(1))
+        self.add_button(top, "更新預覽", self.render_markup_preview)
+        top.addStretch(1)
+        left.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.markup_preview_label = MarkupPreviewLabel()
+        self.markup_preview_label.rectDrawn.connect(self.add_markup_from_rect)
+        self.markup_preview_label.pointClicked.connect(self.add_markup_from_point)
+        scroll.setWidget(self.markup_preview_label)
+        left.addWidget(scroll, 1)
+        layout.addLayout(left, 1)
+
+        side = QFrame()
+        side.setObjectName("panel")
+        side.setFixedWidth(330)
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(10)
+
+        side_layout.addWidget(QLabel("標註工具"))
+        self.markup_tool_combo = QComboBox()
+        for value, label in self.MARKUP_TOOL_OPTIONS:
+            self.markup_tool_combo.addItem(label, value)
+        side_layout.addWidget(self.markup_tool_combo)
+
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("顏色"))
+        self.markup_color_combo = QComboBox()
+        for value, label in self.MARKUP_COLOR_OPTIONS:
+            self.markup_color_combo.addItem(label, value)
+        self.markup_color_combo.currentIndexChanged.connect(self.on_markup_color_preset_changed)
+        color_row.addWidget(self.markup_color_combo, 1)
+        self.markup_color_button = QPushButton("選色")
+        self.markup_color_button.setFixedWidth(56)
+        self.markup_color_button.clicked.connect(self.choose_markup_color)
+        color_row.addWidget(self.markup_color_button)
+        side_layout.addLayout(color_row)
+
+        side_layout.addWidget(QLabel("便利貼 / 註解文字（選填）"))
+        self.markup_note_input = QLineEdit()
+        self.markup_note_input.setPlaceholderText("便利貼或圖形的備註文字")
+        side_layout.addWidget(self.markup_note_input)
+
+        side_layout.addWidget(QLabel("已加入的標註"))
+        self.markup_list = QListWidget()
+        self.markup_list.setFixedHeight(180)
+        side_layout.addWidget(self.markup_list)
+
+        list_buttons = QHBoxLayout()
+        self.add_button(list_buttons, "刪除選取", self.delete_selected_markup, "danger")
+        self.add_button(list_buttons, "清空", self.clear_markups)
+        side_layout.addLayout(list_buttons)
+
+        side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.markup_password_input = QLineEdit()
+        self.markup_password_input.setEchoMode(QLineEdit.Password)
+        side_layout.addWidget(self.markup_password_input)
+
+        save_button = self.add_button(side_layout, "套用並另存 PDF", self.save_markup_pdf, "primary")
+        save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        guide = QLabel(
+            "提示：選好工具與顏色後，在左側預覽上拖曳框選範圍即可加入標註；"
+            "便利貼用單擊放置。可跨頁加入多個標註，最後一次另存。"
+        )
+        guide.setObjectName("muted")
+        guide.setWordWrap(True)
+        side_layout.addWidget(guide)
+        side_layout.addStretch(1)
+        layout.addWidget(side)
+        return tab
+
+    def load_markup_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
+        if path:
+            self.set_markup_pdf(Path(path))
+
+    def drop_markup_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到註解分頁。")
+            return
+        self.set_markup_pdf(pdf_paths[0])
+
+    def set_markup_pdf(self, path: Path) -> None:
+        try:
+            reader = open_reader(path, self.markup_password_input.text())
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.markup_pdf_path = path
+        self.markup_page_count = len(reader.pages)
+        self.markup_items = []
+        self.refresh_markup_list()
+        self.markup_page_validator.setRange(1, max(self.markup_page_count, 1))
+        self.markup_page_input.setText("1")
+        self.render_markup_preview()
+        self.set_status(f"已載入 {path.name}，共 {self.markup_page_count} 頁。")
+
+    def change_markup_page(self, delta: int) -> None:
+        if self.markup_pdf_path is None:
+            return
+        current = int(self.markup_page_input.text() or "1")
+        target = min(max(current + delta, 1), max(self.markup_page_count, 1))
+        if target != current:
+            self.markup_page_input.setText(str(target))
+            self.render_markup_preview()
+
+    def current_markup_page_index(self) -> int:
+        return int(self.markup_page_input.text() or "1") - 1
+
+    def render_markup_preview(self) -> None:
+        if self.markup_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        if not PDF_RENDER_AVAILABLE or pdfium is None:
+            self.set_status("PDF 預覽元件未啟用。")
+            return
+        try:
+            page_number = min(max(int(self.markup_page_input.text() or "1"), 1), self.markup_page_count)
+            self.markup_page_input.setText(str(page_number))
+            document = pdfium.PdfDocument(str(self.markup_pdf_path), password=self.markup_password_input.text() or None)
+            page = document.get_page(page_number - 1)
+            page_width, page_height = page.get_size()
+            scale = min(ANNOT_PREVIEW_MAX_WIDTH / page_width, ANNOT_PREVIEW_MAX_HEIGHT / page_height, 1.25)
+            image = page.render(scale=scale).to_pil().convert("RGB")
+            page.close()
+            document.close()
+            self.markup_page_size = (float(page_width), float(page_height))
+            self.markup_preview_image = image
+            self.update_markup_preview_display()
+        except Exception as exc:
+            self.show_error(exc)
+
+    def update_markup_preview_display(self) -> None:
+        if self.markup_preview_image is None:
+            self.markup_preview_label.clear()
+            return
+        page_width, page_height = self.markup_page_size
+        canvas = self.markup_preview_image.convert("RGBA")
+        overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+        draw = ImageDraw.Draw(overlay)
+        image_width, image_height = canvas.size
+        scale_x = image_width / page_width if page_width else 1.0
+        scale_y = image_height / page_height if page_height else 1.0
+        current_page = self.current_markup_page_index()
+
+        def to_image(x: float, y: float) -> tuple[float, float]:
+            return (x * scale_x, image_height - y * scale_y)
+
+        for page_index, markup in self.markup_items:
+            if page_index != current_page:
+                continue
+            red, green, blue = (int(max(0.0, min(c, 1.0)) * 255) for c in markup.color_rgb)
+            ix0, iy0 = to_image(markup.x0, markup.y0)
+            ix1, iy1 = to_image(markup.x1, markup.y1)
+            box = (min(ix0, ix1), min(iy0, iy1), max(ix0, ix1), max(iy0, iy1))
+            if markup.kind == "highlight":
+                draw.rectangle(box, fill=(red, green, blue, 90))
+            elif markup.kind == "underline":
+                draw.line((box[0], box[3], box[2], box[3]), fill=(red, green, blue, 255), width=3)
+            elif markup.kind == "strikeout":
+                mid = (box[1] + box[3]) / 2
+                draw.line((box[0], mid, box[2], mid), fill=(red, green, blue, 255), width=3)
+            elif markup.kind == "rect":
+                draw.rectangle(box, outline=(red, green, blue, 255), width=2)
+            elif markup.kind == "ellipse":
+                draw.ellipse(box, outline=(red, green, blue, 255), width=2)
+            elif markup.kind in {"line", "arrow"}:
+                draw.line((ix0, iy0, ix1, iy1), fill=(red, green, blue, 255), width=2)
+                if markup.kind == "arrow":
+                    self._draw_arrow_head(draw, ix0, iy0, ix1, iy1, (red, green, blue, 255))
+            elif markup.kind == "note":
+                draw.rectangle((ix0, iy0 - 16, ix0 + 16, iy0), fill=(red, green, blue, 230), outline=(60, 60, 60, 255))
+                draw.text((ix0 + 4, iy0 - 15), "N", fill=(20, 20, 20, 255))
+
+        merged = Image.alpha_composite(canvas, overlay).convert("RGB")
+        pixmap = QPixmap.fromImage(ImageQt(merged))
+        self.markup_preview_label.setPixmap(pixmap)
+        self.markup_preview_label.resize(pixmap.size())
+
+    def _draw_arrow_head(self, draw, x0: float, y0: float, x1: float, y1: float, color) -> None:
+        import math
+
+        angle = math.atan2(y1 - y0, x1 - x0)
+        length = 12
+        for offset in (math.pi - 0.5, math.pi + 0.5):
+            hx = x1 + length * math.cos(angle + offset)
+            hy = y1 + length * math.sin(angle + offset)
+            draw.line((x1, y1, hx, hy), fill=color, width=2)
+
+    def markup_image_point_to_pdf(self, point: QPoint) -> tuple[float, float]:
+        page_width, page_height = self.markup_page_size
+        image = self.markup_preview_image
+        if image is None or page_width <= 0 or page_height <= 0:
+            return (0.0, 0.0)
+        image_width, image_height = image.size
+        ix = min(max(point.x(), 0), image_width)
+        iy = min(max(point.y(), 0), image_height)
+        pdf_x = ix / image_width * page_width
+        pdf_y = page_height - (iy / image_height * page_height)
+        return (pdf_x, pdf_y)
+
+    def markup_current_color(self) -> tuple[float, float, float]:
+        preset = self.markup_color_combo.currentData()
+        if preset in MARKUP_COLOR_PRESETS:
+            return MARKUP_COLOR_PRESETS[preset]
+        return self.markup_color_rgb
+
+    def on_markup_color_preset_changed(self) -> None:
+        preset = self.markup_color_combo.currentData()
+        if preset == "custom":
+            self.choose_markup_color()
+            return
+        if preset in MARKUP_COLOR_PRESETS:
+            self.markup_color_rgb = MARKUP_COLOR_PRESETS[preset]
+
+    def choose_markup_color(self) -> None:
+        current = QColor.fromRgbF(*self.markup_color_rgb)
+        chosen = QColorDialog.getColor(current, self, "選擇標註顏色")
+        if not chosen.isValid():
+            return
+        self.markup_color_rgb = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        custom_index = self.markup_color_combo.findData("custom")
+        if custom_index >= 0:
+            self.markup_color_combo.setCurrentIndex(custom_index)
+
+    def add_markup_from_rect(self, start: QPoint, end: QPoint) -> None:
+        if self.markup_preview_image is None:
+            self.set_status("請先載入 PDF 並更新預覽。")
+            return
+        kind = self.markup_tool_combo.currentData() or "highlight"
+        if kind == "note":
+            self.add_markup_from_point(start)
+            return
+        x0, y0 = self.markup_image_point_to_pdf(start)
+        x1, y1 = self.markup_image_point_to_pdf(end)
+        markup = MarkupAnnotation(
+            kind=kind,
+            x0=x0,
+            y0=y0,
+            x1=x1,
+            y1=y1,
+            color_rgb=self.markup_current_color(),
+            contents=self.markup_note_input.text().strip(),
+        )
+        self.markup_items.append((self.current_markup_page_index(), markup))
+        self.refresh_markup_list()
+        self.update_markup_preview_display()
+        self.set_status(f"已加入標註：{self._markup_label(markup)}")
+
+    def add_markup_from_point(self, point: QPoint) -> None:
+        if self.markup_preview_image is None:
+            self.set_status("請先載入 PDF 並更新預覽。")
+            return
+        kind = self.markup_tool_combo.currentData() or "highlight"
+        if kind != "note":
+            self.set_status("此工具需要拖曳框選範圍；便利貼才用單擊放置。")
+            return
+        x0, y0 = self.markup_image_point_to_pdf(point)
+        markup = MarkupAnnotation(
+            kind="note",
+            x0=x0,
+            y0=y0,
+            x1=x0,
+            y1=y0,
+            color_rgb=self.markup_current_color(),
+            contents=self.markup_note_input.text().strip() or "備註",
+        )
+        self.markup_items.append((self.current_markup_page_index(), markup))
+        self.refresh_markup_list()
+        self.update_markup_preview_display()
+        self.set_status("已加入便利貼。")
+
+    def _markup_label(self, markup: MarkupAnnotation) -> str:
+        names = dict(self.MARKUP_TOOL_OPTIONS)
+        return names.get(markup.kind, markup.kind)
+
+    def refresh_markup_list(self) -> None:
+        self.markup_list.clear()
+        for page_index, markup in self.markup_items:
+            label = f"第 {page_index + 1} 頁 · {self._markup_label(markup)}"
+            if markup.contents and markup.kind == "note":
+                label += f"：{markup.contents[:12]}"
+            self.markup_list.addItem(label)
+
+    def delete_selected_markup(self) -> None:
+        row = self.markup_list.currentRow()
+        if row < 0 or row >= len(self.markup_items):
+            self.set_status("請先選取要刪除的標註。")
+            return
+        self.markup_items.pop(row)
+        self.refresh_markup_list()
+        self.update_markup_preview_display()
+        self.set_status("已刪除標註。")
+
+    def clear_markups(self) -> None:
+        if not self.markup_items:
+            return
+        self.markup_items = []
+        self.refresh_markup_list()
+        self.update_markup_preview_display()
+        self.set_status("已清空標註。")
+
+    def save_markup_pdf(self) -> None:
+        if self.markup_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        if not self.markup_items:
+            self.set_status("請先加入至少一個標註。")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "另存註解 PDF", "marked-up.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        markups = list(self.markup_items)
+        applied = {"value": 0}
+
+        def job() -> None:
+            applied["value"] = apply_markup_annotations(
+                self.markup_pdf_path,
+                target_path,
+                markups,
+                self.markup_password_input.text(),
+            )
+
+        self.run_pdf_job(
+            job,
+            "",
+            on_success=lambda: (
+                self.open_pdf_as_new_tab(target_path),
+                self.set_status(f"已套用 {applied['value']} 個標註並另存：{target_path.name}"),
+            ),
+        )
+
+    # --- page cropping -------------------------------------------------------
+    def build_crop_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_crop_pdf)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(14)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        top = QHBoxLayout()
+        self.add_button(top, "載入 PDF", self.load_crop_pdf)
+        top.addWidget(QLabel("頁碼"))
+        self.crop_page_input = QLineEdit("1")
+        self.crop_page_input.setFixedWidth(56)
+        self.crop_page_validator = QIntValidator(1, 1, self)
+        self.crop_page_input.setValidator(self.crop_page_validator)
+        self.crop_page_input.editingFinished.connect(self.render_crop_preview)
+        top.addWidget(self.crop_page_input)
+        self.add_button(top, "上一頁", lambda: self.change_crop_page(-1))
+        self.add_button(top, "下一頁", lambda: self.change_crop_page(1))
+        self.add_button(top, "更新預覽", self.render_crop_preview)
+        top.addStretch(1)
+        left.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        self.crop_preview_label = MarkupPreviewLabel()
+        self.crop_preview_label.band_color = QColor(214, 69, 65)
+        self.crop_preview_label.rectDrawn.connect(self.set_crop_rect_from_drag)
+        scroll.setWidget(self.crop_preview_label)
+        left.addWidget(scroll, 1)
+        layout.addLayout(left, 1)
+
+        side = QFrame()
+        side.setObjectName("panel")
+        side.setFixedWidth(320)
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(10)
+
+        intro = QLabel("在左側預覽上拖曳框選「要保留」的區域，或直接輸入裁切框數值（PDF 點，原點在左下角）。")
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        side_layout.addWidget(intro)
+
+        side_layout.addWidget(QLabel("裁切框 左 / 下 / 右 / 上"))
+        rect_row = QHBoxLayout()
+        self.crop_left_input = QLineEdit()
+        self.crop_bottom_input = QLineEdit()
+        self.crop_right_input = QLineEdit()
+        self.crop_top_input = QLineEdit()
+        for widget in (self.crop_left_input, self.crop_bottom_input, self.crop_right_input, self.crop_top_input):
+            widget.setPlaceholderText("0")
+            widget.textChanged.connect(self.on_crop_inputs_changed)
+            rect_row.addWidget(widget)
+        side_layout.addLayout(rect_row)
+
+        side_layout.addWidget(QLabel("套用範圍"))
+        self.crop_scope_combo = QComboBox()
+        self.crop_scope_combo.addItem("目前頁", "current")
+        self.crop_scope_combo.addItem("全部頁", "all")
+        self.crop_scope_combo.addItem("自訂頁碼", "spec")
+        self.crop_scope_combo.currentIndexChanged.connect(self.on_crop_scope_changed)
+        side_layout.addWidget(self.crop_scope_combo)
+
+        self.crop_pages_input = QLineEdit()
+        self.crop_pages_input.setPlaceholderText("例如 1-3,5")
+        self.crop_pages_input.setEnabled(False)
+        side_layout.addWidget(self.crop_pages_input)
+
+        self.add_button(side_layout, "重設為整頁", self.reset_crop_rect)
+
+        side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.crop_password_input = QLineEdit()
+        self.crop_password_input.setEchoMode(QLineEdit.Password)
+        side_layout.addWidget(self.crop_password_input)
+
+        save_button = self.add_button(side_layout, "裁切並另存 PDF", self.save_crop_pdf, "primary")
+        save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        side_layout.addStretch(1)
+        layout.addWidget(side)
+        return tab
+
+    def load_crop_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
+        if path:
+            self.set_crop_pdf(Path(path))
+
+    def drop_crop_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到裁切分頁。")
+            return
+        self.set_crop_pdf(pdf_paths[0])
+
+    def set_crop_pdf(self, path: Path) -> None:
+        try:
+            reader = open_reader(path, self.crop_password_input.text())
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.crop_pdf_path = path
+        self.crop_page_count = len(reader.pages)
+        self.crop_rect = None
+        self.crop_page_validator.setRange(1, max(self.crop_page_count, 1))
+        self.crop_page_input.setText("1")
+        self.render_crop_preview()
+        self.reset_crop_rect()
+        self.set_status(f"已載入 {path.name}，共 {self.crop_page_count} 頁。")
+
+    def change_crop_page(self, delta: int) -> None:
+        if self.crop_pdf_path is None:
+            return
+        current = int(self.crop_page_input.text() or "1")
+        target = min(max(current + delta, 1), max(self.crop_page_count, 1))
+        if target != current:
+            self.crop_page_input.setText(str(target))
+            self.render_crop_preview()
+
+    def render_crop_preview(self) -> None:
+        if self.crop_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        if not PDF_RENDER_AVAILABLE or pdfium is None:
+            self.set_status("PDF 預覽元件未啟用。")
+            return
+        try:
+            page_number = min(max(int(self.crop_page_input.text() or "1"), 1), self.crop_page_count)
+            self.crop_page_input.setText(str(page_number))
+            document = pdfium.PdfDocument(str(self.crop_pdf_path), password=self.crop_password_input.text() or None)
+            page = document.get_page(page_number - 1)
+            page_width, page_height = page.get_size()
+            scale = min(ANNOT_PREVIEW_MAX_WIDTH / page_width, ANNOT_PREVIEW_MAX_HEIGHT / page_height, 1.25)
+            image = page.render(scale=scale).to_pil().convert("RGB")
+            page.close()
+            document.close()
+            self.crop_page_size = (float(page_width), float(page_height))
+            self.crop_preview_image = image
+            self.update_crop_preview_display()
+        except Exception as exc:
+            self.show_error(exc)
+
+    def update_crop_preview_display(self) -> None:
+        if self.crop_preview_image is None:
+            self.crop_preview_label.clear()
+            return
+        page_width, page_height = self.crop_page_size
+        canvas = self.crop_preview_image.convert("RGBA")
+        image_width, image_height = canvas.size
+        if self.crop_rect is not None and page_width > 0 and page_height > 0:
+            left, bottom, right, top = self.crop_rect
+            scale_x = image_width / page_width
+            scale_y = image_height / page_height
+            ix0 = left * scale_x
+            ix1 = right * scale_x
+            iy0 = image_height - top * scale_y
+            iy1 = image_height - bottom * scale_y
+            overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 120))
+            clear = ImageDraw.Draw(overlay)
+            clear.rectangle((ix0, iy0, ix1, iy1), fill=(0, 0, 0, 0))
+            canvas = Image.alpha_composite(canvas, overlay)
+            outline = ImageDraw.Draw(canvas)
+            outline.rectangle((ix0, iy0, ix1, iy1), outline=(214, 69, 65, 255), width=2)
+        merged = canvas.convert("RGB")
+        pixmap = QPixmap.fromImage(ImageQt(merged))
+        self.crop_preview_label.setPixmap(pixmap)
+        self.crop_preview_label.resize(pixmap.size())
+
+    def crop_image_point_to_pdf(self, point: QPoint) -> tuple[float, float]:
+        page_width, page_height = self.crop_page_size
+        image = self.crop_preview_image
+        if image is None or page_width <= 0 or page_height <= 0:
+            return (0.0, 0.0)
+        image_width, image_height = image.size
+        ix = min(max(point.x(), 0), image_width)
+        iy = min(max(point.y(), 0), image_height)
+        pdf_x = ix / image_width * page_width
+        pdf_y = page_height - (iy / image_height * page_height)
+        return (pdf_x, pdf_y)
+
+    def set_crop_rect_from_drag(self, start: QPoint, end: QPoint) -> None:
+        if self.crop_preview_image is None:
+            self.set_status("請先載入 PDF 並更新預覽。")
+            return
+        x0, y0 = self.crop_image_point_to_pdf(start)
+        x1, y1 = self.crop_image_point_to_pdf(end)
+        left, right = min(x0, x1), max(x0, x1)
+        bottom, top = min(y0, y1), max(y0, y1)
+        self.set_crop_rect((left, bottom, right, top))
+        self.set_status(f"裁切框：左 {left:.0f} 下 {bottom:.0f} 右 {right:.0f} 上 {top:.0f}")
+
+    def set_crop_rect(self, rect: tuple[float, float, float, float], update_inputs: bool = True) -> None:
+        self.crop_rect = rect
+        if update_inputs:
+            left, bottom, right, top = rect
+            for widget, value in (
+                (self.crop_left_input, left),
+                (self.crop_bottom_input, bottom),
+                (self.crop_right_input, right),
+                (self.crop_top_input, top),
+            ):
+                widget.blockSignals(True)
+                widget.setText(f"{value:.1f}")
+                widget.blockSignals(False)
+        self.update_crop_preview_display()
+
+    def on_crop_inputs_changed(self) -> None:
+        rect = self.crop_rect_from_inputs()
+        if rect is not None:
+            self.crop_rect = rect
+            self.update_crop_preview_display()
+
+    def crop_rect_from_inputs(self) -> tuple[float, float, float, float] | None:
+        try:
+            left = float(self.crop_left_input.text())
+            bottom = float(self.crop_bottom_input.text())
+            right = float(self.crop_right_input.text())
+            top = float(self.crop_top_input.text())
+        except ValueError:
+            return None
+        return (left, bottom, right, top)
+
+    def reset_crop_rect(self) -> None:
+        page_width, page_height = self.crop_page_size
+        if page_width <= 0 or page_height <= 0:
+            return
+        self.set_crop_rect((0.0, 0.0, page_width, page_height))
+
+    def on_crop_scope_changed(self) -> None:
+        self.crop_pages_input.setEnabled(self.crop_scope_combo.currentData() == "spec")
+
+    def save_crop_pdf(self) -> None:
+        if self.crop_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        rect = self.crop_rect_from_inputs()
+        if rect is None:
+            self.set_status("裁切框數值無效，請重新框選或輸入數字。")
+            return
+        scope = self.crop_scope_combo.currentData()
+        if scope == "current":
+            pages_spec = str(self.current_crop_page_index() + 1)
+        elif scope == "spec":
+            pages_spec = self.crop_pages_input.text().strip()
+            if not pages_spec:
+                self.set_status("請輸入要裁切的頁碼範圍。")
+                return
+        else:
+            pages_spec = ""
+        target, _ = QFileDialog.getSaveFileName(self, "另存裁切 PDF", "cropped.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        cropped = {"value": 0}
+
+        def job() -> None:
+            cropped["value"] = crop_pdf_pages(
+                self.crop_pdf_path,
+                target_path,
+                rect,
+                pages_spec,
+                self.crop_password_input.text(),
+            )
+
+        self.run_pdf_job(
+            job,
+            "",
+            on_success=lambda: (
+                self.open_pdf_as_new_tab(target_path),
+                self.set_status(f"已裁切 {cropped['value']} 頁並另存：{target_path.name}"),
+            ),
+        )
+
+    def current_crop_page_index(self) -> int:
+        return int(self.crop_page_input.text() or "1") - 1
 
     def build_text_edit_tab(self) -> QWidget:
         tab = PdfDropPanel()
