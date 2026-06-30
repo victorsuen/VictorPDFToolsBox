@@ -517,49 +517,60 @@ class QtAppTests(unittest.TestCase):
         self.assertIsNotNone(window.annotation_preview_label.pixmap())
         self.assertFalse(window.annotation_preview_label.pixmap().isNull())
 
-    def test_organize_grid_uses_internal_move_drag(self):
+    def test_organize_grid_manual_reorder_setup(self):
         from PySide6.QtWidgets import QListWidget
 
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
         grid = window.page_grid
 
-        self.assertTrue(grid.dragEnabled())
+        # Internal reorder is manual; Qt DnD is only for external file drops.
         self.assertTrue(grid.acceptDrops())
-        self.assertEqual(grid.dragDropMode(), QListWidget.InternalMove)
+        self.assertFalse(grid.dragEnabled())
+        self.assertEqual(grid.dragDropMode(), QListWidget.DropOnly)
 
-    def test_grid_items_carry_stable_tokens(self):
-        from qt_app import PAGE_TOKEN_ROLE
-
+    def test_insertion_index_at_uses_item_position(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
         grid = window.page_grid
+        grid.resize(900, 700)
+        grid.show()
+        self.app.processEvents()
 
-        tokens = [grid.item(row).data(PAGE_TOKEN_ROLE) for row in range(grid.count())]
-        self.assertEqual(tokens, [0, 1])
-        self.assertEqual(grid.current_token_order(), [0, 1])
+        rect0 = grid.visualItemRect(grid.item(0))
+        left_point = QPoint(rect0.left() + 2, rect0.center().y())
+        right_point = QPoint(rect0.right() - 2, rect0.center().y())
+        self.assertEqual(grid.insertion_index_at(left_point), 0)
+        self.assertEqual(grid.insertion_index_at(right_point), 1)
 
-    def test_apply_drag_reorder_updates_model_order(self):
+    def test_manual_drag_emits_reorder_request(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
         grid = window.page_grid
+        grid.resize(900, 700)
+        grid.show()
+        self.app.processEvents()
         before = [item.page_index for item in window.page_items]
 
-        # Simulate Qt's native move result: page at row 0 moved to the end.
-        window.apply_drag_reorder([1, 0], grid)
+        captured = []
+        grid.reorderRequested.connect(lambda rows, target: captured.append((rows, target)))
 
-        after = [item.page_index for item in window.page_items]
-        self.assertEqual(after, list(reversed(before)))
+        # Simulate a manual drag of page 0 dropped after page 1.
+        grid._dragging = True
+        grid._drag_rows = [0]
+        rect1 = grid.visualItemRect(grid.item(1))
 
-    def test_apply_drag_reorder_ignores_invalid_tokens(self):
-        window = VictorPdfToolsQt()
-        window.add_files_from_paths([str(self.source)])
-        grid = window.page_grid
-        before = [item.page_index for item in window.page_items]
+        from PySide6.QtCore import QPointF
 
-        window.apply_drag_reorder([0, 0, 1], grid)
+        class _Evt:
+            def position(self_inner):
+                return QPointF(rect1.right() - 2, rect1.center().y())
 
-        self.assertEqual([item.page_index for item in window.page_items], before)
+        grid.mouseReleaseEvent(_Evt())
+
+        self.assertEqual(captured, [([0], 2)])
+        # The connected handler should have reordered the model.
+        self.assertEqual([item.page_index for item in window.page_items], list(reversed(before)))
 
     def test_bookmark_add_edit_and_reorder(self):
         window = VictorPdfToolsQt()
