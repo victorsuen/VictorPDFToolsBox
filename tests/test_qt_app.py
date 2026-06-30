@@ -517,7 +517,7 @@ class QtAppTests(unittest.TestCase):
         self.assertIsNotNone(window.annotation_preview_label.pixmap())
         self.assertFalse(window.annotation_preview_label.pixmap().isNull())
 
-    def test_organize_grid_has_drag_enabled(self):
+    def test_organize_grid_uses_internal_move_drag(self):
         from PySide6.QtWidgets import QListWidget
 
         window = VictorPdfToolsQt()
@@ -526,49 +526,40 @@ class QtAppTests(unittest.TestCase):
 
         self.assertTrue(grid.dragEnabled())
         self.assertTrue(grid.acceptDrops())
-        self.assertEqual(grid.dragDropMode(), QListWidget.DragDrop)
+        self.assertEqual(grid.dragDropMode(), QListWidget.InternalMove)
 
-    def test_internal_page_drag_detected_without_source_identity(self):
-        from PySide6.QtCore import QByteArray, QMimeData
+    def test_grid_items_carry_stable_tokens(self):
+        from qt_app import PAGE_TOKEN_ROLE
 
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
         grid = window.page_grid
 
-        class _Evt:
-            def __init__(self, mime):
-                self._mime = mime
+        tokens = [grid.item(row).data(PAGE_TOKEN_ROLE) for row in range(grid.count())]
+        self.assertEqual(tokens, [0, 1])
+        self.assertEqual(grid.current_token_order(), [0, 1])
 
-            def mimeData(self):
-                return self._mime
-
-        page_mime = QMimeData()
-        page_mime.setData(grid.PAGE_DRAG_MIME, QByteArray(b"0"))
-        self.assertTrue(grid.is_internal_page_drag(_Evt(page_mime)))
-
-        other_mime = QMimeData()
-        other_mime.setText("hello")
-        self.assertFalse(grid.is_internal_page_drag(_Evt(other_mime)))
-
-    def test_organize_drag_insertion_indicator(self):
+    def test_apply_drag_reorder_updates_model_order(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
         grid = window.page_grid
+        before = [item.page_index for item in window.page_items]
 
-        self.assertEqual(grid._drop_indicator_row, -1)
-        self.assertIsNone(grid.insertion_line_geometry(-1))
+        # Simulate Qt's native move result: page at row 0 moved to the end.
+        window.apply_drag_reorder([1, 0], grid)
 
-        grid.set_drop_indicator_row(1)
-        self.assertEqual(grid._drop_indicator_row, 1)
-        geometry = grid.insertion_line_geometry(1)
-        self.assertIsNotNone(geometry)
-        self.assertEqual(len(geometry), 3)
+        after = [item.page_index for item in window.page_items]
+        self.assertEqual(after, list(reversed(before)))
 
-        end_geometry = grid.insertion_line_geometry(grid.count())
-        self.assertIsNotNone(end_geometry)
+    def test_apply_drag_reorder_ignores_invalid_tokens(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        grid = window.page_grid
+        before = [item.page_index for item in window.page_items]
 
-        grid.set_drop_indicator_row(-1)
-        self.assertIsNone(grid.insertion_line_geometry(grid._drop_indicator_row))
+        window.apply_drag_reorder([0, 0, 1], grid)
+
+        self.assertEqual([item.page_index for item in window.page_items], before)
 
     def test_bookmark_add_edit_and_reorder(self):
         window = VictorPdfToolsQt()

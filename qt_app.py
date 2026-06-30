@@ -147,6 +147,10 @@ def reveal_output(path: Path) -> None:
 
 THUMB_SIZE = QSize(195, 292)
 ICON_SIZE = QSize(165, 215)
+# Stable per-page token stored on each grid item. Unlike the PageItem object in
+# Qt.UserRole, a plain int survives Qt's internal drag-move serialization, so we
+# can recover the new page order after a native reorder.
+PAGE_TOKEN_ROLE = Qt.UserRole + 1
 ANNOT_PREVIEW_MAX_WIDTH = 760
 ANNOT_PREVIEW_MAX_HEIGHT = 760
 ANNOT_PREVIEW_OFFSET = 12
@@ -236,28 +240,31 @@ class PdfDropPanel(QWidget):
 
 class PageGrid(QListWidget):
     filesDropped = Signal(list)
-    reorderRequested = Signal(list, int)
-    PAGE_DRAG_MIME = "application/x-victor-pdf-pages"
+    # Emitted after a native internal drag-move with the page tokens in their
+    # new visual order (see PAGE_TOKEN_ROLE).
+    pagesReordered = Signal(list)
 
     def __init__(self) -> None:
         super().__init__()
-        self._drop_indicator_row = -1
         self.setSelectionMode(QListWidget.ExtendedSelection)
         self.setViewMode(QListWidget.IconMode)
-        self.setMovement(QListWidget.Static)
+        self.setMovement(QListWidget.Snap)
         self.setResizeMode(QListWidget.Adjust)
         self.setWrapping(True)
         self.setSpacing(24)
         self.setIconSize(ICON_SIZE)
         self.setGridSize(THUMB_SIZE)
         self.setUniformItemSizes(True)
-        # Drag/drop settings must come AFTER setViewMode/setMovement, otherwise
-        # switching to IconMode resets them (drag would silently stay disabled).
+        # Use Qt's native internal-move machinery for reordering. This is the
+        # battle-tested path: the view starts the drag, shows the insertion
+        # indicator, and performs the move itself; we only resync our model
+        # afterwards. A previous custom DragDrop + Static + custom startDrag
+        # setup silently failed to route drop events, so drops were rejected.
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
-        self.setDropIndicatorShown(False)
+        self.setDropIndicatorShown(True)
         self.setDefaultDropAction(Qt.MoveAction)
-        self.setDragDropMode(QListWidget.DragDrop)
+        self.setDragDropMode(QListWidget.InternalMove)
         self.setDragDropOverwriteMode(False)
         self.setStyleSheet(
             """
@@ -281,127 +288,39 @@ class PageGrid(QListWidget):
             """
         )
 
-    def startDrag(self, supported_actions) -> None:
-        source_rows = sorted(self.row(item) for item in self.selectedItems())
-        if not source_rows:
-            return
-        drag = QDrag(self)
-        mime = QMimeData()
-        mime.setData(self.PAGE_DRAG_MIME, QByteArray(",".join(str(row) for row in source_rows).encode("ascii")))
-        drag.setMimeData(mime)
-        drag.setPixmap(self.drag_pixmap_for_rows(source_rows))
-        drag.setHotSpot(QPoint(drag.pixmap().width() // 2, drag.pixmap().height() // 2))
-        drag.exec(Qt.MoveAction)
-
-    def drag_pixmap_for_rows(self, source_rows: list[int]) -> QPixmap:
-        first_item = self.item(source_rows[0])
-        pixmap = first_item.icon().pixmap(ICON_SIZE)
-        preview = pixmap.scaled(105, 136, Qt.KeepAspectRatio, Qt.SmoothTransformation)
-        if len(source_rows) > 1:
-            stacked = QPixmap(preview.width() + 18, preview.height() + 18)
-            stacked.fill(Qt.transparent)
-            from PySide6.QtGui import QPainter
-
-            painter = QPainter(stacked)
-            painter.drawPixmap(18, 18, preview)
-            painter.drawPixmap(0, 0, preview)
-            painter.end()
-            return stacked
-        return preview
-
-    def is_internal_page_drag(self, event) -> bool:
-        # NOTE: do NOT compare event.source() is self here. PySide can hand back
-        # a different Python wrapper for the same underlying widget during real
-        # drag delivery, so identity checks intermittently fail and drops get
-        # rejected. The custom MIME type is unique to this grid, so it alone is
-        # a reliable signal that this is one of our internal page drags.
-        return event.mimeData().hasFormat(self.PAGE_DRAG_MIME)
-
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if self.is_internal_page_drag(event):
-            event.setDropAction(Qt.MoveAction)
-            event.accept()
-            return
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
             return
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:
-        if self.is_internal_page_drag(event):
-            event.setDropAction(Qt.MoveAction)
-            event.accept()
-            self.set_drop_indicator_row(self.row_from_point(event.position().toPoint()))
-            return
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
             return
         super().dragMoveEvent(event)
 
-    def dragLeaveEvent(self, event) -> None:
-        self.set_drop_indicator_row(-1)
-        super().dragLeaveEvent(event)
-
     def dropEvent(self, event: QDropEvent) -> None:
-        self.set_drop_indicator_row(-1)
         if event.mimeData().hasUrls():
             paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
             self.filesDropped.emit(paths)
             event.acceptProposedAction()
             return
-        if self.is_internal_page_drag(event):
-            raw_rows = bytes(event.mimeData().data(self.PAGE_DRAG_MIME)).decode("ascii")
-            source_rows = sorted(int(row) for row in raw_rows.split(",") if row)
-            if not source_rows:
-                event.ignore()
-                return
-            self.reorderRequested.emit(source_rows, self.drop_target_row(event))
-            event.acceptProposedAction()
-            return
+        # Let Qt perform the actual internal move, then read back the new order
+        # via the stable per-page tokens and ask the window to resync the model.
         super().dropEvent(event)
+        tokens = self.current_token_order()
+        if tokens:
+            self.pagesReordered.emit(tokens)
 
-    def set_drop_indicator_row(self, row: int) -> None:
-        if row != self._drop_indicator_row:
-            self._drop_indicator_row = row
-            self.viewport().update()
-
-    def insertion_line_geometry(self, row: int) -> tuple[int, int, int] | None:
-        if row is None or row < 0 or self.count() == 0:
-            return None
-        gap = max(self.spacing() // 2, 4)
-        if row >= self.count():
-            rect = self.visualItemRect(self.item(self.count() - 1))
-            x = rect.right() + gap
-        else:
-            rect = self.visualItemRect(self.item(row))
-            x = rect.left() - gap
-        return x, rect.top(), rect.bottom()
-
-    def paintEvent(self, event) -> None:
-        super().paintEvent(event)
-        geometry = self.insertion_line_geometry(self._drop_indicator_row)
-        if geometry is None:
-            return
-        x, top, bottom = geometry
-        painter = QPainter(self.viewport())
-        pen = QPen(QColor("#128576"))
-        pen.setWidth(3)
-        painter.setPen(pen)
-        painter.drawLine(x, top, x, bottom)
-        painter.end()
-
-    def drop_target_row(self, event: QDropEvent) -> int:
-        return self.row_from_point(event.position().toPoint())
-
-    def row_from_point(self, point: QPoint) -> int:
-        item = self.itemAt(point)
-        if item is None:
-            return self.count()
-        row = self.row(item)
-        rect = self.visualItemRect(item)
-        if point.y() > rect.center().y() or point.x() > rect.center().x():
-            return row + 1
-        return row
+    def current_token_order(self) -> list[int]:
+        tokens: list[int] = []
+        for row in range(self.count()):
+            token = self.item(row).data(PAGE_TOKEN_ROLE)
+            if token is None:
+                return []
+            tokens.append(int(token))
+        return tokens
 
 
 class PdfDropTabWidget(QTabWidget):
@@ -851,7 +770,7 @@ class VictorPdfToolsQt(QMainWindow):
         controls.addWidget(self.stats_label)
         left_layout.addLayout(controls)
 
-        drag_hint = QLabel("提示：直接拖曳縮圖即可隨時調整頁面順序，拖曳時會顯示綠色插入位置線；可多選一起搬移。")
+        drag_hint = QLabel("提示：直接拖曳縮圖即可隨時調整頁面順序，拖曳時會顯示插入位置線；可多選一起搬移。")
         drag_hint.setObjectName("muted")
         drag_hint.setWordWrap(True)
         left_layout.addWidget(drag_hint)
@@ -2430,7 +2349,7 @@ class VictorPdfToolsQt(QMainWindow):
     def create_document_tab(self, title: str) -> PageGrid:
         grid = PageGrid()
         grid.filesDropped.connect(self.add_files_from_paths)
-        grid.reorderRequested.connect(lambda rows, target, page_grid=grid: self.reorder_pages(rows, target, page_grid))
+        grid.pagesReordered.connect(lambda tokens, page_grid=grid: self.apply_drag_reorder(tokens, page_grid))
         grid.itemSelectionChanged.connect(self.update_stats)
         grid.itemDoubleClicked.connect(lambda list_item, page_grid=grid: self.preview_page_item(page_grid, list_item))
         self.workspaces[grid] = {"items": [], "cache": {}, "pending": [], "generation": 0, "undo": []}
@@ -2576,6 +2495,7 @@ class VictorPdfToolsQt(QMainWindow):
             list_item = QListWidgetItem(icon, self.page_card_label(index, item))
             list_item.setTextAlignment(Qt.AlignHCenter | Qt.AlignTop)
             list_item.setData(Qt.UserRole, item)
+            list_item.setData(PAGE_TOKEN_ROLE, index)
             list_item.setSizeHint(THUMB_SIZE)
             grid.addItem(list_item)
             if index in selected_indexes:
@@ -2611,6 +2531,29 @@ class VictorPdfToolsQt(QMainWindow):
         item = list_item.data(Qt.UserRole)
         index = grid.row(list_item)
         PagePreviewDialog(self, item, f"Page {index + 1} - {item.pdf_path.name}").exec()
+
+    def apply_drag_reorder(self, tokens: list[int], grid: PageGrid | None = None) -> None:
+        grid = grid or self.current_grid()
+        if grid is None:
+            return
+        workspace = self.workspaces.get(grid)
+        if not workspace:
+            return
+        items = workspace["items"]
+        # tokens are the item indexes from the last rebuild, in their new order.
+        if sorted(tokens) != list(range(len(items))):
+            # Order could not be recovered reliably; restore a clean grid.
+            self.rebuild_grid(grid=grid)
+            return
+        new_items = [items[token] for token in tokens]
+        if new_items == items:
+            return
+        self.push_undo_state("移動頁面", grid)
+        workspace["items"] = new_items
+        if grid is self.current_grid():
+            self.page_items = new_items
+        self.rebuild_grid(grid=grid)
+        self.set_status("頁面順序已更新。")
 
     def reorder_pages(self, source_rows: list[int], target_row: int, grid: PageGrid | None = None) -> None:
         grid = grid or self.current_grid()
