@@ -517,6 +517,26 @@ class QtAppTests(unittest.TestCase):
         self.assertIsNotNone(window.annotation_preview_label.pixmap())
         self.assertFalse(window.annotation_preview_label.pixmap().isNull())
 
+    def test_organize_drag_insertion_indicator(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        grid = window.page_grid
+
+        self.assertEqual(grid._drop_indicator_row, -1)
+        self.assertIsNone(grid.insertion_line_geometry(-1))
+
+        grid.set_drop_indicator_row(1)
+        self.assertEqual(grid._drop_indicator_row, 1)
+        geometry = grid.insertion_line_geometry(1)
+        self.assertIsNotNone(geometry)
+        self.assertEqual(len(geometry), 3)
+
+        end_geometry = grid.insertion_line_geometry(grid.count())
+        self.assertIsNotNone(end_geometry)
+
+        grid.set_drop_indicator_row(-1)
+        self.assertIsNone(grid.insertion_line_geometry(grid._drop_indicator_row))
+
     def test_bookmark_add_edit_and_reorder(self):
         window = VictorPdfToolsQt()
         window.set_bookmark_pdf(self.source)

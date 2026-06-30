@@ -241,9 +241,10 @@ class PageGrid(QListWidget):
 
     def __init__(self) -> None:
         super().__init__()
+        self._drop_indicator_row = -1
         self.setAcceptDrops(True)
         self.setDragEnabled(True)
-        self.setDropIndicatorShown(True)
+        self.setDropIndicatorShown(False)
         self.setDefaultDropAction(Qt.MoveAction)
         self.setDragDropMode(QListWidget.DragDrop)
         self.setDragDropOverwriteMode(False)
@@ -320,13 +321,19 @@ class PageGrid(QListWidget):
         if event.source() is self and event.mimeData().hasFormat(self.PAGE_DRAG_MIME):
             event.setDropAction(Qt.MoveAction)
             event.accept()
+            self.set_drop_indicator_row(self.row_from_point(event.position().toPoint()))
             return
         if event.mimeData().hasUrls():
             event.acceptProposedAction()
             return
         super().dragMoveEvent(event)
 
+    def dragLeaveEvent(self, event) -> None:
+        self.set_drop_indicator_row(-1)
+        super().dragLeaveEvent(event)
+
     def dropEvent(self, event: QDropEvent) -> None:
+        self.set_drop_indicator_row(-1)
         if event.mimeData().hasUrls():
             paths = [url.toLocalFile() for url in event.mimeData().urls() if url.toLocalFile()]
             self.filesDropped.emit(paths)
@@ -342,6 +349,36 @@ class PageGrid(QListWidget):
             event.acceptProposedAction()
             return
         super().dropEvent(event)
+
+    def set_drop_indicator_row(self, row: int) -> None:
+        if row != self._drop_indicator_row:
+            self._drop_indicator_row = row
+            self.viewport().update()
+
+    def insertion_line_geometry(self, row: int) -> tuple[int, int, int] | None:
+        if row is None or row < 0 or self.count() == 0:
+            return None
+        gap = max(self.spacing() // 2, 4)
+        if row >= self.count():
+            rect = self.visualItemRect(self.item(self.count() - 1))
+            x = rect.right() + gap
+        else:
+            rect = self.visualItemRect(self.item(row))
+            x = rect.left() - gap
+        return x, rect.top(), rect.bottom()
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        geometry = self.insertion_line_geometry(self._drop_indicator_row)
+        if geometry is None:
+            return
+        x, top, bottom = geometry
+        painter = QPainter(self.viewport())
+        pen = QPen(QColor("#128576"))
+        pen.setWidth(3)
+        painter.setPen(pen)
+        painter.drawLine(x, top, x, bottom)
+        painter.end()
 
     def drop_target_row(self, event: QDropEvent) -> int:
         return self.row_from_point(event.position().toPoint())
@@ -803,6 +840,11 @@ class VictorPdfToolsQt(QMainWindow):
         controls.addStretch(1)
         controls.addWidget(self.stats_label)
         left_layout.addLayout(controls)
+
+        drag_hint = QLabel("提示：直接拖曳縮圖即可隨時調整頁面順序，拖曳時會顯示綠色插入位置線；可多選一起搬移。")
+        drag_hint.setObjectName("muted")
+        drag_hint.setWordWrap(True)
+        left_layout.addWidget(drag_hint)
 
         self.document_tabs = PdfDropTabWidget()
         self.document_tabs.filesDropped.connect(self.add_files_from_paths)
