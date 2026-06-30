@@ -42,12 +42,15 @@ from pdf_core import (
     OCR_LANGUAGE_OPTIONS,
     PDF_RENDER_AVAILABLE,
     PDF_SUFFIXES,
+    BookmarkItem,
     PageItem,
     TextBlock,
     add_page_numbers,
     ANNOTATION_COLOR_PRESETS,
     add_text_overlay_annotation,
     add_watermark,
+    apply_outline,
+    extract_outline,
     rgb_to_hex,
     clean_metadata,
     compress_pdf,
@@ -657,6 +660,9 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_pdf_path: Path | None = None
         self.text_edit_page_count = 0
         self.text_edit_blocks: list[TextBlock] = []
+        self.bookmark_pdf_path: Path | None = None
+        self.bookmark_page_count = 0
+        self.bookmark_items: list[BookmarkItem] = []
         self.text_edit_preview_image: Image.Image | None = None
         self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
@@ -749,6 +755,7 @@ class VictorPdfToolsQt(QMainWindow):
         tabs.addTab(self.build_tools_tab(), "常用 PDF 工具")
         tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
         tabs.addTab(self.build_text_edit_tab(), "文字編輯 Beta")
+        tabs.addTab(self.build_bookmark_tab(), "書籤 / 目錄")
         layout.addWidget(tabs, 1)
         self.setCentralWidget(root)
 
@@ -1321,6 +1328,246 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(guide)
         layout.addWidget(side)
         return tab
+
+    def build_bookmark_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_bookmark_pdf)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(14)
+
+        left = QVBoxLayout()
+        top = QHBoxLayout()
+        self.add_button(top, "載入 PDF", self.load_bookmark_pdf)
+        self.add_button(top, "重新讀取原始書籤", self.reload_bookmarks)
+        top.addStretch(1)
+        left.addLayout(top)
+
+        left.addWidget(QLabel("書籤 / 目錄結構"))
+        self.bookmark_list = QListWidget()
+        self.bookmark_list.currentRowChanged.connect(self.on_bookmark_selected)
+        left.addWidget(self.bookmark_list, 1)
+
+        self.bookmark_status_label = QLabel("載入 PDF 後可檢視、編輯並重建書籤。")
+        self.bookmark_status_label.setObjectName("muted")
+        self.bookmark_status_label.setWordWrap(True)
+        left.addWidget(self.bookmark_status_label)
+        layout.addLayout(left, 1)
+
+        side = QFrame()
+        side.setObjectName("panel")
+        side.setFixedWidth(320)
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(10)
+
+        side_layout.addWidget(QLabel("書籤標題"))
+        self.bookmark_title_input = QLineEdit()
+        self.bookmark_title_input.setPlaceholderText("例如：第一章 簡介")
+        side_layout.addWidget(self.bookmark_title_input)
+
+        page_row = QHBoxLayout()
+        page_row.addWidget(QLabel("目標頁碼"))
+        self.bookmark_page_input = QLineEdit("1")
+        self.bookmark_page_input.setFixedWidth(64)
+        self.bookmark_page_validator = QIntValidator(1, 1, self)
+        self.bookmark_page_input.setValidator(self.bookmark_page_validator)
+        page_row.addWidget(self.bookmark_page_input)
+        page_row.addStretch(1)
+        side_layout.addLayout(page_row)
+
+        side_layout.addWidget(QLabel("階層"))
+        self.bookmark_level_combo = QComboBox()
+        self.bookmark_level_combo.addItem("主層", 0)
+        self.bookmark_level_combo.addItem("子層", 1)
+        self.bookmark_level_combo.addItem("次子層", 2)
+        side_layout.addWidget(self.bookmark_level_combo)
+
+        self.add_button(side_layout, "新增書籤", self.add_bookmark_item)
+        self.add_button(side_layout, "更新選取書籤", self.update_selected_bookmark)
+        self.add_button(side_layout, "刪除選取書籤", self.delete_selected_bookmark, "danger")
+
+        move_row = QHBoxLayout()
+        self.add_button(move_row, "上移", lambda: self.move_bookmark_item(-1))
+        self.add_button(move_row, "下移", lambda: self.move_bookmark_item(1))
+        self.add_button(move_row, "升階", lambda: self.indent_bookmark_item(-1))
+        self.add_button(move_row, "降階", lambda: self.indent_bookmark_item(1))
+        side_layout.addLayout(move_row)
+
+        self.add_button(side_layout, "清空全部書籤", self.clear_bookmarks, "danger")
+
+        side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.bookmark_password_input = QLineEdit()
+        self.bookmark_password_input.setEchoMode(QLineEdit.Password)
+        side_layout.addWidget(self.bookmark_password_input)
+
+        save_button = self.add_button(side_layout, "套用書籤並另存 PDF", self.save_bookmark_pdf, "primary")
+        save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        guide = QLabel(
+            "可讀取現有 PDF 書籤、新增/編輯/排序，並用階層建立巢狀目錄。套用後會以新書籤重建並另存新檔。"
+        )
+        guide.setObjectName("muted")
+        guide.setWordWrap(True)
+        side_layout.addWidget(guide)
+        side_layout.addStretch(1)
+        layout.addWidget(side)
+        return tab
+
+    def load_bookmark_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
+        if path:
+            self.set_bookmark_pdf(Path(path))
+
+    def drop_bookmark_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到書籤分頁。")
+            return
+        self.set_bookmark_pdf(pdf_paths[0])
+
+    def set_bookmark_pdf(self, path: Path) -> None:
+        try:
+            reader = open_reader(path, self.bookmark_password_input.text())
+            self.bookmark_page_count = len(reader.pages)
+            self.bookmark_items = extract_outline(path, self.bookmark_password_input.text())
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.bookmark_pdf_path = path
+        self.bookmark_page_validator.setRange(1, max(self.bookmark_page_count, 1))
+        self.refresh_bookmark_list()
+        self.set_status(f"已載入 {path.name}，共 {len(self.bookmark_items)} 個書籤。")
+
+    def reload_bookmarks(self) -> None:
+        if self.bookmark_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        try:
+            self.bookmark_items = extract_outline(
+                self.bookmark_pdf_path, self.bookmark_password_input.text()
+            )
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.refresh_bookmark_list()
+        self.set_status(f"已重新讀取原始書籤，共 {len(self.bookmark_items)} 個。")
+
+    def refresh_bookmark_list(self) -> None:
+        self.bookmark_list.blockSignals(True)
+        self.bookmark_list.clear()
+        for item in self.bookmark_items:
+            prefix = "　" * item.level
+            label = f"{prefix}{item.title}  (p.{item.page_index + 1})"
+            list_item = QListWidgetItem(label)
+            self.bookmark_list.addItem(list_item)
+        self.bookmark_list.blockSignals(False)
+        if not self.bookmark_items:
+            self.bookmark_status_label.setText("目前沒有書籤。可新增書籤或載入含書籤的 PDF。")
+        else:
+            self.bookmark_status_label.setText(f"共 {len(self.bookmark_items)} 個書籤。")
+
+    def on_bookmark_selected(self, row: int) -> None:
+        if row < 0 or row >= len(self.bookmark_items):
+            return
+        item = self.bookmark_items[row]
+        self.bookmark_title_input.setText(item.title)
+        self.bookmark_page_input.setText(str(item.page_index + 1))
+        self.bookmark_level_combo.setCurrentIndex(min(item.level, self.bookmark_level_combo.count() - 1))
+
+    def bookmark_inputs(self) -> BookmarkItem | None:
+        title = self.bookmark_title_input.text().strip()
+        if not title:
+            self.set_status("請先輸入書籤標題。")
+            return None
+        page_index = int(self.bookmark_page_input.text() or "1") - 1
+        if self.bookmark_page_count:
+            page_index = max(0, min(page_index, self.bookmark_page_count - 1))
+        level = self.bookmark_level_combo.currentData() or 0
+        return BookmarkItem(title, page_index, int(level))
+
+    def add_bookmark_item(self) -> None:
+        new_item = self.bookmark_inputs()
+        if new_item is None:
+            return
+        row = self.bookmark_list.currentRow()
+        insert_at = row + 1 if 0 <= row < len(self.bookmark_items) else len(self.bookmark_items)
+        self.bookmark_items.insert(insert_at, new_item)
+        self.refresh_bookmark_list()
+        self.bookmark_list.setCurrentRow(insert_at)
+        self.set_status(f"已新增書籤：{new_item.title}")
+
+    def update_selected_bookmark(self) -> None:
+        row = self.bookmark_list.currentRow()
+        if not (0 <= row < len(self.bookmark_items)):
+            self.set_status("請先選取要更新的書籤。")
+            return
+        new_item = self.bookmark_inputs()
+        if new_item is None:
+            return
+        self.bookmark_items[row] = new_item
+        self.refresh_bookmark_list()
+        self.bookmark_list.setCurrentRow(row)
+        self.set_status(f"已更新書籤：{new_item.title}")
+
+    def delete_selected_bookmark(self) -> None:
+        row = self.bookmark_list.currentRow()
+        if not (0 <= row < len(self.bookmark_items)):
+            self.set_status("請先選取要刪除的書籤。")
+            return
+        removed = self.bookmark_items.pop(row)
+        self.refresh_bookmark_list()
+        self.bookmark_list.setCurrentRow(min(row, len(self.bookmark_items) - 1))
+        self.set_status(f"已刪除書籤：{removed.title}")
+
+    def move_bookmark_item(self, direction: int) -> None:
+        row = self.bookmark_list.currentRow()
+        target = row + direction
+        if not (0 <= row < len(self.bookmark_items)) or not (0 <= target < len(self.bookmark_items)):
+            return
+        self.bookmark_items[row], self.bookmark_items[target] = (
+            self.bookmark_items[target],
+            self.bookmark_items[row],
+        )
+        self.refresh_bookmark_list()
+        self.bookmark_list.setCurrentRow(target)
+
+    def indent_bookmark_item(self, delta: int) -> None:
+        row = self.bookmark_list.currentRow()
+        if not (0 <= row < len(self.bookmark_items)):
+            return
+        item = self.bookmark_items[row]
+        new_level = max(0, item.level + delta)
+        self.bookmark_items[row] = BookmarkItem(item.title, item.page_index, new_level)
+        self.refresh_bookmark_list()
+        self.bookmark_list.setCurrentRow(row)
+
+    def clear_bookmarks(self) -> None:
+        if not self.bookmark_items:
+            return
+        self.bookmark_items = []
+        self.refresh_bookmark_list()
+        self.set_status("已清空全部書籤。")
+
+    def save_bookmark_pdf(self) -> None:
+        if self.bookmark_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "另存書籤 PDF", "bookmarked.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        items = list(self.bookmark_items)
+        self.run_pdf_job(
+            lambda: apply_outline(
+                self.bookmark_pdf_path,
+                target_path,
+                items,
+                self.bookmark_password_input.text(),
+            ),
+            f"已套用 {len(items)} 個書籤並另存：{target_path.name}",
+            on_success=lambda: self.open_pdf_as_new_tab(target_path),
+        )
 
     def load_text_edit_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")

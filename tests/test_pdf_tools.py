@@ -9,9 +9,12 @@ from pypdf.generic import DecodedStreamObject, DictionaryObject, NameObject
 
 from app import copy_pages, parse_pages
 from pdf_core import (
+    BookmarkItem,
     PageItem,
     TextBlock,
     add_page_numbers,
+    apply_outline,
+    extract_outline,
     add_text_overlay_annotation,
     add_watermark,
     build_annotation_da,
@@ -406,6 +409,53 @@ class PdfToolsTests(unittest.TestCase):
 
         self.assertEqual(count, 2)
         self.assertEqual(len(list(folder.glob("*.pdf"))), 2)
+
+    def test_apply_and_extract_outline_round_trip(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        for _ in range(5):
+            writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        items = [
+            BookmarkItem("封面", 0, 0),
+            BookmarkItem("第一章", 1, 0),
+            BookmarkItem("第一節", 2, 1),
+            BookmarkItem("第二章", 3, 0),
+        ]
+        apply_outline(source, target, items)
+
+        extracted = extract_outline(target)
+        self.assertEqual(
+            [(item.title, item.page_index, item.level) for item in extracted],
+            [("封面", 0, 0), ("第一章", 1, 0), ("第一節", 2, 1), ("第二章", 3, 0)],
+        )
+
+    def test_apply_outline_clamps_out_of_range_pages(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        apply_outline(source, target, [BookmarkItem("超出範圍", 99, 0)])
+
+        extracted = extract_outline(target)
+        self.assertEqual(len(extracted), 1)
+        self.assertEqual(extracted[0].page_index, 1)
+
+    def test_extract_outline_returns_empty_without_bookmarks(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        self.assertEqual(extract_outline(source), [])
 
     def setUp(self):
         import tempfile

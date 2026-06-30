@@ -1015,3 +1015,67 @@ def clean_metadata(source: Path, target: Path, password: str = "") -> None:
     writer.append_pages_from_reader(reader)
     writer.add_metadata({"/Producer": "Victor PDF Tools Box"})
     write_pdf(writer, target)
+
+
+@dataclass(frozen=True)
+class BookmarkItem:
+    title: str
+    page_index: int
+    level: int = 0
+
+
+def extract_outline(source: Path, password: str = "") -> list[BookmarkItem]:
+    """Return a flattened list of bookmarks with indentation levels."""
+
+    reader = open_reader(source, password)
+    page_count = len(reader.pages)
+    items: list[BookmarkItem] = []
+
+    def walk(entries, level: int) -> None:
+        for entry in entries:
+            if isinstance(entry, list):
+                walk(entry, level + 1)
+                continue
+            title = str(getattr(entry, "title", "") or "").strip()
+            try:
+                page_index = reader.get_destination_page_number(entry)
+            except Exception:
+                page_index = None
+            if page_index is None or page_index < 0:
+                page_index = 0
+            if page_count and page_index >= page_count:
+                page_index = page_count - 1
+            items.append(BookmarkItem(title or "(未命名書籤)", int(page_index), max(0, level)))
+
+    try:
+        outline = reader.outline
+    except Exception:
+        outline = []
+    walk(outline, 0)
+    return items
+
+
+def apply_outline(source: Path, target: Path, items: list[BookmarkItem], password: str = "") -> None:
+    """Rebuild the document outline from a flat list of bookmarks."""
+
+    reader = open_reader(source, password)
+    page_count = len(reader.pages)
+    writer = PdfWriter()
+    writer.append_pages_from_reader(reader)
+
+    parents: dict[int, object] = {}
+    for item in items:
+        title = (item.title or "").strip() or "(未命名書籤)"
+        page_index = item.page_index
+        if page_index < 0:
+            page_index = 0
+        if page_count and page_index >= page_count:
+            page_index = page_count - 1
+        level = max(0, item.level)
+        parent = parents.get(level - 1) if level > 0 else None
+        ref = writer.add_outline_item(title, page_index, parent=parent)
+        parents[level] = ref
+        for deeper in [key for key in parents if key > level]:
+            del parents[deeper]
+
+    write_pdf(writer, target)

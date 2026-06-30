@@ -517,6 +517,69 @@ class QtAppTests(unittest.TestCase):
         self.assertIsNotNone(window.annotation_preview_label.pixmap())
         self.assertFalse(window.annotation_preview_label.pixmap().isNull())
 
+    def test_bookmark_add_edit_and_reorder(self):
+        window = VictorPdfToolsQt()
+        window.set_bookmark_pdf(self.source)
+
+        window.bookmark_title_input.setText("第一章")
+        window.bookmark_page_input.setText("1")
+        window.bookmark_level_combo.setCurrentIndex(0)
+        window.add_bookmark_item()
+
+        window.bookmark_title_input.setText("第二章")
+        window.bookmark_page_input.setText("2")
+        window.add_bookmark_item()
+
+        self.assertEqual(len(window.bookmark_items), 2)
+        self.assertEqual(window.bookmark_items[1].title, "第二章")
+        self.assertEqual(window.bookmark_items[1].page_index, 1)
+
+        window.bookmark_list.setCurrentRow(1)
+        window.move_bookmark_item(-1)
+        self.assertEqual(window.bookmark_items[0].title, "第二章")
+
+        window.bookmark_list.setCurrentRow(0)
+        window.indent_bookmark_item(1)
+        self.assertEqual(window.bookmark_items[0].level, 1)
+
+        window.bookmark_list.setCurrentRow(0)
+        window.delete_selected_bookmark()
+        self.assertEqual(len(window.bookmark_items), 1)
+        self.assertEqual(window.bookmark_items[0].title, "第一章")
+
+    def test_bookmark_save_applies_outline(self):
+        window = VictorPdfToolsQt()
+        window.set_bookmark_pdf(self.source)
+        window.bookmark_title_input.setText("總覽")
+        window.bookmark_page_input.setText("2")
+        window.add_bookmark_item()
+        target = Path(self.temp_dir.name) / "bookmarked.pdf"
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch.object(window, "open_pdf_as_new_tab"):
+                window.save_bookmark_pdf()
+
+        self.assertTrue(target.exists())
+        outline = PdfReader(str(target)).outline
+        self.assertEqual(len(outline), 1)
+        self.assertEqual(str(outline[0].title), "總覽")
+
+    def test_bookmark_load_extracts_existing_outline(self):
+        bookmarked = Path(self.temp_dir.name) / "with-outline.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        writer.add_outline_item("既有書籤", 1)
+        with bookmarked.open("wb") as stream:
+            writer.write(stream)
+
+        window = VictorPdfToolsQt()
+        window.set_bookmark_pdf(bookmarked)
+
+        self.assertEqual(len(window.bookmark_items), 1)
+        self.assertEqual(window.bookmark_items[0].title, "既有書籤")
+        self.assertEqual(window.bookmark_items[0].page_index, 1)
+
     def test_merge_dialog_undo_restores_removed_source(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
