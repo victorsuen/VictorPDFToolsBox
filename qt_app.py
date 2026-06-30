@@ -309,8 +309,16 @@ class PageGrid(QListWidget):
             return stacked
         return preview
 
+    def is_internal_page_drag(self, event) -> bool:
+        # NOTE: do NOT compare event.source() is self here. PySide can hand back
+        # a different Python wrapper for the same underlying widget during real
+        # drag delivery, so identity checks intermittently fail and drops get
+        # rejected. The custom MIME type is unique to this grid, so it alone is
+        # a reliable signal that this is one of our internal page drags.
+        return event.mimeData().hasFormat(self.PAGE_DRAG_MIME)
+
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
-        if event.source() is self and event.mimeData().hasFormat(self.PAGE_DRAG_MIME):
+        if self.is_internal_page_drag(event):
             event.setDropAction(Qt.MoveAction)
             event.accept()
             return
@@ -320,7 +328,7 @@ class PageGrid(QListWidget):
         super().dragEnterEvent(event)
 
     def dragMoveEvent(self, event) -> None:
-        if event.source() is self and event.mimeData().hasFormat(self.PAGE_DRAG_MIME):
+        if self.is_internal_page_drag(event):
             event.setDropAction(Qt.MoveAction)
             event.accept()
             self.set_drop_indicator_row(self.row_from_point(event.position().toPoint()))
@@ -341,7 +349,7 @@ class PageGrid(QListWidget):
             self.filesDropped.emit(paths)
             event.acceptProposedAction()
             return
-        if event.source() is self and event.mimeData().hasFormat(self.PAGE_DRAG_MIME):
+        if self.is_internal_page_drag(event):
             raw_rows = bytes(event.mimeData().data(self.PAGE_DRAG_MIME)).decode("ascii")
             source_rows = sorted(int(row) for row in raw_rows.split(",") if row)
             if not source_rows:

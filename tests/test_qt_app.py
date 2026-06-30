@@ -528,6 +528,28 @@ class QtAppTests(unittest.TestCase):
         self.assertTrue(grid.acceptDrops())
         self.assertEqual(grid.dragDropMode(), QListWidget.DragDrop)
 
+    def test_internal_page_drag_detected_without_source_identity(self):
+        from PySide6.QtCore import QByteArray, QMimeData
+
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        grid = window.page_grid
+
+        class _Evt:
+            def __init__(self, mime):
+                self._mime = mime
+
+            def mimeData(self):
+                return self._mime
+
+        page_mime = QMimeData()
+        page_mime.setData(grid.PAGE_DRAG_MIME, QByteArray(b"0"))
+        self.assertTrue(grid.is_internal_page_drag(_Evt(page_mime)))
+
+        other_mime = QMimeData()
+        other_mime.setText("hello")
+        self.assertFalse(grid.is_internal_page_drag(_Evt(other_mime)))
+
     def test_organize_drag_insertion_indicator(self):
         window = VictorPdfToolsQt()
         window.add_files_from_paths([str(self.source)])
