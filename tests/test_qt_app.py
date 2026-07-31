@@ -12,7 +12,16 @@ from PySide6.QtCore import QPoint
 from PySide6.QtWidgets import QApplication
 
 from pdf_core import TextBlock
-from qt_app import FOLDER_REVEAL_OPERATIONS, MergeFilesDialog, VictorPdfToolsQt, reveal_output
+from document_workspace import DocumentWorkspace
+from qt_app import (
+    FOLDER_REVEAL_OPERATIONS,
+    TOOL_OPERATIONS,
+    WINDOW_MIN_SIZE,
+    MergeFilesDialog,
+    VictorPdfToolsQt,
+    preferred_window_geometry,
+    reveal_output,
+)
 
 
 class QtAppTests(unittest.TestCase):
@@ -36,6 +45,27 @@ class QtAppTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+    def test_preferred_window_geometry_fits_available_screen(self):
+        geometry = preferred_window_geometry()
+        screen = self.app.primaryScreen().availableGeometry()
+        self.assertLessEqual(geometry.width(), screen.width())
+        self.assertLessEqual(geometry.height(), screen.height())
+        self.assertGreaterEqual(geometry.width(), min(WINDOW_MIN_SIZE.width(), screen.width()))
+        self.assertGreaterEqual(geometry.height(), min(WINDOW_MIN_SIZE.height(), screen.height()))
+
+    def test_main_window_is_resizable_and_not_oversized(self):
+        window = VictorPdfToolsQt()
+        screen = self.app.primaryScreen().availableGeometry()
+        self.assertLessEqual(window.width(), screen.width())
+        self.assertLessEqual(window.height(), screen.height())
+        self.assertLessEqual(window.minimumWidth(), screen.width())
+        self.assertLessEqual(window.minimumHeight(), screen.height())
+        # Tall tool options live in a scroll area, so shrinking remains possible.
+        target = window.minimumSize()
+        window.resize(target)
+        self.assertEqual(window.width(), target.width())
+        self.assertEqual(window.height(), target.height())
 
     def test_add_pdf_updates_grid_and_stats(self):
         window = VictorPdfToolsQt()
@@ -492,8 +522,49 @@ class QtAppTests(unittest.TestCase):
     def test_folder_reveal_operations_include_zip_and_text_tools(self):
         self.assertEqual(
             FOLDER_REVEAL_OPERATIONS,
-            {"split", "split_advanced", "extract_text", "ocr_text", "info", "pdf_to_images"},
+            {
+                "split",
+                "split_advanced",
+                "extract_text",
+                "ocr_text",
+                "info",
+                "pdf_to_images",
+                "compare_text",
+                "split_bookmarks",
+            },
         )
+
+    def test_document_workspace_tab_is_first_tab(self):
+        from PySide6.QtWidgets import QTabWidget
+
+        window = VictorPdfToolsQt()
+        tab_widgets = window.centralWidget().findChildren(QTabWidget)
+        self.assertTrue(tab_widgets)
+        main_tabs = tab_widgets[0]
+        self.assertEqual(main_tabs.tabText(0), "文件工作台")
+        self.assertIs(main_tabs.widget(0), window.document_workspace)
+
+    def test_document_workspace_can_be_constructed(self):
+        workspace = DocumentWorkspace()
+        self.assertIsNone(workspace.current_path())
+        workspace.open_path(self.source)
+        self.assertEqual(workspace.current_path(), self.source)
+        self.assertEqual(workspace.page_count, 2)
+
+    def test_tool_operations_include_workspace_tools(self):
+        slugs = {slug for slug, _title in TOOL_OPERATIONS}
+        for key in (
+            "insert_pages",
+            "replace_pages",
+            "compress_advanced",
+            "compare_text",
+            "split_bookmarks",
+            "stamp_image",
+            "flatten_forms",
+            "search_markup",
+            "secure_redact",
+        ):
+            self.assertIn(key, slugs)
 
     def test_reveal_output_skips_missing_path(self):
         with patch("qt_app.subprocess.Popen") as popen, patch("qt_app.os.startfile") as startfile:

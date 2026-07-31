@@ -1814,3 +1814,359 @@ def encrypt_pdf_with_permissions(
         permissions_flag=permissions,
     )
     write_pdf(writer, target)
+
+
+# --- Adobe-Pro-like page / stamp / compare / bookmark tools ------------------
+
+TEXT_MARKUP_KINDS = frozenset({"highlight", "underline", "strikeout"})
+
+
+def _resolve_page_indexes(reader: PdfReader, pages_spec: str) -> list[int]:
+    if (pages_spec or "").strip():
+        return parse_pages(pages_spec, len(reader.pages))
+    return list(range(len(reader.pages)))
+
+
+def _pymupdf_search_rects(page, query: str, case_sensitive: bool = False) -> list:
+    needle = (query or "").strip()
+    if not needle:
+        return []
+    if case_sensitive:
+        return page.search_for(needle)
+    rects: list = []
+    for x0, y0, x1, y1, word, *_rest in page.get_text("words"):
+        if needle.lower() in word.lower():
+            rects.append(fitz.Rect(x0, y0, x1, y1))
+    if rects:
+        return rects
+    return page.search_for(needle)
+
+
+def insert_pdf_pages(
+    source: Path,
+    insert_from: Path,
+    target: Path,
+    at_index: int,
+    pages_spec: str = "",
+    password: str = "",
+    insert_password: str = "",
+) -> int:
+    """Insert pages from ``insert_from`` into ``source`` at ``at_index`` (0-based)."""
+
+    source_reader = open_reader(source, password)
+    insert_reader = open_reader(insert_from, insert_password)
+    source_count = len(source_reader.pages)
+    if at_index < 0 or at_index > source_count:
+        raise ValueError(f"插入位置超出範圍：{at_index + 1}，目前共有 {source_count} 頁。")
+
+    insert_indexes = _resolve_page_indexes(insert_reader, pages_spec)
+    if not insert_indexes:
+        raise ValueError("沒有可插入的頁面。")
+
+    writer = PdfWriter()
+    for index in range(at_index):
+        writer.add_page(source_reader.pages[index])
+    for index in insert_indexes:
+        writer.add_page(insert_reader.pages[index])
+    for index in range(at_index, source_count):
+        writer.add_page(source_reader.pages[index])
+    write_pdf(writer, target)
+    return len(insert_indexes)
+
+
+def replace_pdf_pages(
+    source: Path,
+    replacement: Path,
+    target: Path,
+    start_index: int,
+    pages_spec: str = "",
+    password: str = "",
+    replacement_password: str = "",
+) -> int:
+    """Replace consecutive pages in ``source`` with pages from ``replacement``."""
+
+    source_reader = open_reader(source, password)
+    replacement_reader = open_reader(replacement, replacement_password)
+    source_count = len(source_reader.pages)
+    replacement_indexes = _resolve_page_indexes(replacement_reader, pages_spec)
+    if not replacement_indexes:
+        raise ValueError("沒有可替換的頁面。")
+
+    replace_count = len(replacement_indexes)
+    if start_index < 0 or start_index >= source_count:
+        raise ValueError(f"替換起始位置超出範圍：{start_index + 1}，目前共有 {source_count} 頁。")
+    if start_index + replace_count > source_count:
+        raise ValueError(
+            f"替換範圍超出文件頁數：需 {replace_count} 頁，從第 {start_index + 1} 頁起不足。"
+        )
+
+    writer = PdfWriter()
+    for index in range(start_index):
+        writer.add_page(source_reader.pages[index])
+    for index in replacement_indexes:
+        writer.add_page(replacement_reader.pages[index])
+    for index in range(start_index + replace_count, source_count):
+        writer.add_page(source_reader.pages[index])
+    write_pdf(writer, target)
+    return replace_count
+
+
+def add_image_stamp(
+    source: Path,
+    target: Path,
+    image_path: Path,
+    page_index: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    password: str = "",
+) -> None:
+    """Place an image stamp/signature on a page using PyMuPDF."""
+
+    ensure_pymupdf_available()
+    image_path = Path(image_path)
+    if not image_path.exists():
+        raise ValueError(f"找不到圖片檔案：{image_path.name}")
+
+    document = fitz.open(str(source))
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        if page_index < 0 or page_index >= document.page_count:
+            raise ValueError("頁碼超出範圍。")
+        page = document[page_index]
+        rect = fitz.Rect(x, y, x + width, y + height)
+        page.insert_image(rect, filename=str(image_path))
+        document.save(str(target), garbage=4, deflate=True)
+    finally:
+        document.close()
+
+
+def add_signature_image(
+    source: Path,
+    target: Path,
+    image_path: Path,
+    page_index: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    password: str = "",
+) -> None:
+    """Alias for :func:`add_image_stamp` — place a signature image on a page."""
+
+    add_image_stamp(source, target, image_path, page_index, x, y, width, height, password)
+
+
+def compress_pdf_advanced(
+    source: Path,
+    target: Path,
+    image_dpi: int = 100,
+    jpeg_quality: int = 60,
+    password: str = "",
+) -> tuple[int, int]:
+    """Re-write a PDF with embedded images re-sampled via PyMuPDF."""
+
+    ensure_pymupdf_available()
+    old_size = source.stat().st_size if source.exists() else 0
+    document = fitz.open(str(source))
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        document.rewrite_images(
+            dpi_threshold=image_dpi,
+            dpi_target=image_dpi,
+            quality=jpeg_quality,
+            lossy=True,
+        )
+        document.save(str(target), garbage=4, deflate=True, clean=True)
+    finally:
+        document.close()
+    new_size = target.stat().st_size if target.exists() else 0
+    return old_size, new_size
+
+
+def compare_pdf_text(
+    left: Path,
+    right: Path,
+    target_report: Path,
+    left_password: str = "",
+    right_password: str = "",
+) -> int:
+    """Write a UTF-8 page-by-page text comparison report; return differing page count."""
+
+    left_reader = open_reader(left, left_password)
+    right_reader = open_reader(right, right_password)
+    left_count = len(left_reader.pages)
+    right_count = len(right_reader.pages)
+    max_pages = max(left_count, right_count)
+    diff_count = 0
+    lines = [
+        "Victor PDF Tools Box - Text Compare",
+        f"Left: {left.name}",
+        f"Right: {right.name}",
+        "",
+    ]
+
+    for index in range(max_pages):
+        left_text = (
+            (left_reader.pages[index].extract_text() or "").strip() if index < left_count else ""
+        )
+        right_text = (
+            (right_reader.pages[index].extract_text() or "").strip()
+            if index < right_count
+            else ""
+        )
+        if left_text != right_text:
+            diff_count += 1
+            lines.append(f"--- Page {index + 1} DIFF ---")
+            lines.append("[Left]")
+            lines.append(left_text or "(empty)")
+            lines.append("[Right]")
+            lines.append(right_text or "(empty)")
+            lines.append("")
+
+    if diff_count == 0:
+        lines.append("All pages match.")
+    target_report.write_text("\n".join(lines), encoding="utf-8")
+    return diff_count
+
+
+def split_pdf_by_bookmarks(source: Path, target_zip: Path, password: str = "") -> int:
+    """Split a PDF into one file per top-level bookmark range, packed in a ZIP."""
+
+    reader = open_reader(source, password)
+    page_count = len(reader.pages)
+    items = extract_outline(source, password)
+    top_level = [item for item in items if item.level == 0]
+    if not top_level:
+        raise ValueError("PDF 沒有書籤，無法依書籤拆分。")
+
+    sorted_items = sorted(top_level, key=lambda item: item.page_index)
+    ranges: list[tuple[str, int, int]] = []
+    for index, item in enumerate(sorted_items):
+        start = item.page_index
+        if index + 1 < len(sorted_items):
+            end = sorted_items[index + 1].page_index - 1
+        else:
+            end = page_count - 1
+        if end < start:
+            end = start
+        ranges.append((item.title, start, end))
+
+    stem = safe_output_name(source.stem)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
+        generated: list[Path] = []
+        for part_index, (title, start, end) in enumerate(ranges, start=1):
+            writer = PdfWriter()
+            for page_index in range(start, end + 1):
+                writer.add_page(reader.pages[page_index])
+            part = temp_path / safe_output_name(f"{part_index:03d}-{stem}-{title}.pdf")
+            write_pdf(writer, part)
+            generated.append(part)
+        with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in generated:
+                archive.write(item, item.name)
+    return len(generated)
+
+
+def apply_text_markups_for_query(
+    source: Path,
+    target: Path,
+    query: str,
+    kind: str = "highlight",
+    color_rgb: tuple[float, float, float] = (1.0, 0.92, 0.23),
+    password: str = "",
+    case_sensitive: bool = False,
+) -> int:
+    """Search for ``query`` and add highlight/underline/strikeout annotations."""
+
+    if not (query or "").strip():
+        raise ValueError("請輸入要標註的搜尋文字。")
+    if kind not in TEXT_MARKUP_KINDS:
+        raise ValueError(f"不支援的標註類型：{kind}，請使用 highlight、underline 或 strikeout。")
+    ensure_pymupdf_available()
+
+    annot_adders = {
+        "highlight": lambda page, rect: page.add_highlight_annot(rect),
+        "underline": lambda page, rect: page.add_underline_annot(rect),
+        "strikeout": lambda page, rect: page.add_strikeout_annot(rect),
+    }
+    add_annot = annot_adders[kind]
+
+    document = fitz.open(str(source))
+    match_count = 0
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        for page in document:
+            for rect in _pymupdf_search_rects(page, query, case_sensitive):
+                annotation = add_annot(page, rect)
+                if annotation is not None:
+                    annotation.set_colors(stroke=color_rgb)
+                    annotation.update()
+                    match_count += 1
+        document.save(str(target), garbage=4, deflate=True)
+    finally:
+        document.close()
+    return match_count
+
+
+def flatten_form_fields(source: Path, target: Path, password: str = "") -> int:
+    """Flatten PDF form widgets into page content when present."""
+
+    ensure_pymupdf_available()
+    document = fitz.open(str(source))
+    field_count = 0
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        for page in document:
+            for _widget in page.widgets() or []:
+                field_count += 1
+        if field_count:
+            document.bake(widgets=True, annots=False)
+        document.save(str(target), garbage=4, deflate=True)
+    finally:
+        document.close()
+    return field_count
+
+
+def secure_redact_query(
+    source: Path,
+    target: Path,
+    query: str,
+    password: str = "",
+    case_sensitive: bool = False,
+) -> int:
+    """Search for ``query`` and permanently redact all matches via PyMuPDF."""
+
+    if not (query or "").strip():
+        raise ValueError("請輸入要遮蔽的搜尋文字。")
+    ensure_pymupdf_available()
+
+    document = fitz.open(str(source))
+    match_count = 0
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        for page in document:
+            rects = _pymupdf_search_rects(page, query, case_sensitive)
+            for rect in rects:
+                page.add_redact_annot(rect, fill=(0, 0, 0))
+                match_count += 1
+            if rects:
+                page.apply_redactions()
+        if match_count == 0:
+            raise ValueError(f"找不到要遮蔽的文字：{query.strip()}")
+        document.save(str(target), garbage=4, deflate=True)
+    finally:
+        document.close()
+    return match_count

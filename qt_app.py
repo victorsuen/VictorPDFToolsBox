@@ -37,6 +37,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
+from document_workspace import DocumentWorkspace
 from pdf_core import (
     IMAGE_SUFFIXES,
     MARKUP_COLOR_PRESETS,
@@ -59,9 +60,19 @@ from pdf_core import (
     crop_pdf_pages,
     extract_outline,
     rgb_to_hex,
+    apply_text_markups_for_query,
     clean_metadata,
     compress_pdf,
+    compress_pdf_advanced,
+    compare_pdf_text,
     decrypt_pdf,
+    flatten_form_fields,
+    insert_pdf_pages,
+    add_image_stamp,
+    add_signature_image,
+    replace_pdf_pages,
+    secure_redact_query,
+    split_pdf_by_bookmarks,
     delete_pdf_pages,
     encrypt_pdf,
     encrypt_pdf_with_permissions,
@@ -118,6 +129,15 @@ TOOL_OPERATIONS = [
     ("watermark", "加水印 / 印章"),
     ("remove_blank_pages", "刪除空白頁"),
     ("clean_metadata", "清理 Metadata"),
+    ("insert_pages", "插入頁面"),
+    ("replace_pages", "取代頁面"),
+    ("compress_advanced", "進階壓縮"),
+    ("compare_text", "比對 PDF 文字"),
+    ("split_bookmarks", "依書籤拆分"),
+    ("stamp_image", "影像印章 / 簽名"),
+    ("flatten_forms", "壓平表單"),
+    ("search_markup", "搜尋並螢光"),
+    ("secure_redact", "安全塗銷關鍵字"),
 ]
 
 PDF_OUTPUT_OPERATIONS = frozenset(
@@ -137,11 +157,27 @@ PDF_OUTPUT_OPERATIONS = frozenset(
         "remove_blank_pages",
         "clean_metadata",
         "ocr_searchable_pdf",
+        "insert_pages",
+        "replace_pages",
+        "compress_advanced",
+        "stamp_image",
+        "flatten_forms",
+        "search_markup",
+        "secure_redact",
     }
 )
 
 FOLDER_REVEAL_OPERATIONS = frozenset(
-    {"split", "split_advanced", "extract_text", "ocr_text", "info", "pdf_to_images"}
+    {
+        "split",
+        "split_advanced",
+        "extract_text",
+        "ocr_text",
+        "info",
+        "pdf_to_images",
+        "compare_text",
+        "split_bookmarks",
+    }
 )
 
 SETTINGS_ORG = "VictorSuen"
@@ -168,6 +204,44 @@ ICON_SIZE = QSize(165, 215)
 ANNOT_PREVIEW_MAX_WIDTH = 760
 ANNOT_PREVIEW_MAX_HEIGHT = 760
 ANNOT_PREVIEW_OFFSET = 12
+WINDOW_MIN_SIZE = QSize(880, 560)
+WINDOW_DEFAULT_SIZE = QSize(1180, 760)
+
+
+def preferred_window_geometry(default: QSize = WINDOW_DEFAULT_SIZE) -> QRect:
+    """Return a centered window rect that fits the available screen area."""
+
+    app = QApplication.instance()
+    screen = app.primaryScreen() if app is not None else None
+    if screen is None:
+        return QRect(80, 60, default.width(), default.height())
+    available = screen.availableGeometry()
+    soft_min_w = min(WINDOW_MIN_SIZE.width(), available.width())
+    soft_min_h = min(WINDOW_MIN_SIZE.height(), available.height())
+    width = min(default.width(), max(soft_min_w, int(available.width() * 0.92)))
+    height = min(default.height(), max(soft_min_h, int(available.height() * 0.88)))
+    width = min(max(width, soft_min_w), available.width())
+    height = min(max(height, soft_min_h), available.height())
+    x = available.x() + max((available.width() - width) // 2, 0)
+    y = available.y() + max((available.height() - height) // 2, 0)
+    return QRect(x, y, width, height)
+
+
+def wrap_side_panel(panel: QWidget, max_width: int = 330) -> QScrollArea:
+    """Put a tall side panel in a scroll area so the window can shrink."""
+
+    panel.setMinimumWidth(max(240, max_width - 24))
+    panel.setMaximumWidth(max_width)
+    scroll = QScrollArea()
+    scroll.setWidget(panel)
+    scroll.setWidgetResizable(True)
+    scroll.setFrameShape(QFrame.NoFrame)
+    scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+    scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+    scroll.setMinimumWidth(max_width)
+    scroll.setMaximumWidth(max_width + 8)
+    scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+    return scroll
 
 
 class ToolFileList(QListWidget):
@@ -198,33 +272,46 @@ class ToolFileList(QListWidget):
         super().dropEvent(event)
 
 
-class AnnotationPreviewLabel(QLabel):
-    positionClicked = Signal(QPoint)
+class PreviewImageLabel(QLabel):
+    """Base preview label that does not force the main window to grow."""
 
     def __init__(self) -> None:
         super().__init__()
         self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
         self.setStyleSheet("background: #f6f8fb; border: 1px solid #dce3ec;")
+        self.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+
+    def minimumSizeHint(self) -> QSize:
+        return QSize(120, 120)
+
+    def sizeHint(self) -> QSize:
+        pixmap = self.pixmap()
+        if pixmap is not None and not pixmap.isNull():
+            return pixmap.size()
+        return QSize(320, 400)
+
+    def set_preview_pixmap(self, pixmap: QPixmap) -> None:
+        self.setPixmap(pixmap)
+        self.resize(pixmap.size())
+
+
+class AnnotationPreviewLabel(PreviewImageLabel):
+    positionClicked = Signal(QPoint)
 
     def mousePressEvent(self, event) -> None:
         self.positionClicked.emit(event.position().toPoint())
         super().mousePressEvent(event)
 
 
-class TextEditPreviewLabel(QLabel):
+class TextEditPreviewLabel(PreviewImageLabel):
     positionClicked = Signal(QPoint)
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.setStyleSheet("background: #f6f8fb; border: 1px solid #dce3ec;")
 
     def mousePressEvent(self, event) -> None:
         self.positionClicked.emit(event.position().toPoint())
         super().mousePressEvent(event)
 
 
-class MarkupPreviewLabel(QLabel):
+class MarkupPreviewLabel(PreviewImageLabel):
     """Preview label that supports rubber-band rectangle drawing and clicks."""
 
     rectDrawn = Signal(QPoint, QPoint)
@@ -232,8 +319,6 @@ class MarkupPreviewLabel(QLabel):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self.setStyleSheet("background: #f6f8fb; border: 1px solid #dce3ec;")
         self.band_color = QColor(18, 133, 118)
         self._start: QPoint | None = None
         self._current: QPoint | None = None
@@ -535,7 +620,7 @@ class MergeFilesDialog(QDialog):
         self.main_window = main_window
         self.undo_stack: list[list[tuple[str, list[PageItem]]]] = []
         self.setWindowTitle("合併文件")
-        self.resize(760, 520)
+        self.setGeometry(preferred_window_geometry(QSize(760, 520)))
 
         layout = QVBoxLayout(self)
         self.hint_label = QLabel("選擇要合併的文件，然後拖拉圖示調整文件順序。")
@@ -751,15 +836,18 @@ class PagePreviewDialog(QDialog):
     def __init__(self, parent: "VictorPdfToolsQt", item: PageItem, title: str) -> None:
         super().__init__(parent)
         self.setWindowTitle(title)
-        self.resize(980, 820)
+        self.setGeometry(preferred_window_geometry(QSize(900, 720)))
 
         layout = QVBoxLayout(self)
         scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignCenter)
         label = QLabel()
         label.setAlignment(Qt.AlignCenter)
         image = parent.render_page_preview(item)
-        label.setPixmap(QPixmap.fromImage(ImageQt(image)))
+        pixmap = QPixmap.fromImage(ImageQt(image))
+        label.setPixmap(pixmap)
+        label.resize(pixmap.size())
         scroll.setWidget(label)
         layout.addWidget(scroll, 1)
 
@@ -772,7 +860,6 @@ class VictorPdfToolsQt(QMainWindow):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("Victor PDF Tools Box")
-        self.resize(1280, 820)
         self.setAcceptDrops(True)
 
         self.workspaces: dict[PageGrid, dict] = {}
@@ -782,6 +869,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.page_clipboard: list[PageItem] = []
         self.tool_file_items: list[Path] = []
         self._last_tool_status_message = ""
+        self._tool_aux_path: Path | None = None
         self.annotation_pdf_path: Path | None = None
         self.annotation_page_count = 0
         self.annotation_page_size = (0.0, 0.0)
@@ -819,7 +907,19 @@ class VictorPdfToolsQt(QMainWindow):
         self.install_shortcuts()
         self.setStatusBar(QStatusBar())
         self.create_document_tab("未命名")
+        self.apply_startup_geometry()
         self.set_status("把 PDF 直接拖入縮圖區；每個 PDF 會像 DC 一樣開成獨立文件 Tab。")
+
+    def apply_startup_geometry(self) -> None:
+        """Fit the first open size to the usable desktop, and keep the window resizable."""
+
+        geometry = preferred_window_geometry()
+        # Soft minimum: never larger than the available desktop.
+        self.setMinimumSize(
+            min(WINDOW_MIN_SIZE.width(), geometry.width()),
+            min(WINDOW_MIN_SIZE.height(), geometry.height()),
+        )
+        self.setGeometry(geometry)
 
     def dragEnterEvent(self, event: QDragEnterEvent) -> None:
         if self.has_pdf_urls(event):
@@ -851,12 +951,12 @@ class VictorPdfToolsQt(QMainWindow):
     def build_ui(self) -> None:
         self.setStyleSheet(
             """
-            QMainWindow, QWidget { background: #e9e7e1; color: #111; font-size: 10.5pt; }
-            QLabel#title { font-size: 23pt; font-weight: 700; }
+            QMainWindow, QWidget { background: #e9e7e1; color: #111; font-size: 10pt; }
+            QLabel#title { font-size: 18pt; font-weight: 700; }
             QLabel#muted { color: #52697a; }
             QPushButton {
-                min-height: 30px;
-                padding: 4px 12px;
+                min-height: 28px;
+                padding: 3px 10px;
                 border: 1px solid #9f9d96;
                 border-radius: 6px;
                 background: #f7f6f2;
@@ -865,7 +965,7 @@ class VictorPdfToolsQt(QMainWindow):
             QPushButton#primary { background: #128576; color: #ffffff; border-color: #0d6f63; }
             QPushButton#danger { color: #9d2828; }
             QLineEdit, QComboBox {
-                min-height: 30px;
+                min-height: 28px;
                 padding: 2px 8px;
                 border: 1px solid #aaa69d;
                 border-radius: 6px;
@@ -881,17 +981,22 @@ class VictorPdfToolsQt(QMainWindow):
 
         root = QWidget()
         layout = QVBoxLayout(root)
-        layout.setContentsMargins(18, 16, 18, 16)
-        layout.setSpacing(10)
+        layout.setContentsMargins(12, 10, 12, 10)
+        layout.setSpacing(6)
 
         title = QLabel("Victor PDF Tools Box")
         title.setObjectName("title")
         subtitle = QLabel("第二代 Qt 介面：本機處理 PDF，支援文件 Tab、縮圖重排、旋轉、擷取與合併。")
         subtitle.setObjectName("muted")
+        subtitle.setWordWrap(True)
         layout.addWidget(title)
         layout.addWidget(subtitle)
 
         tabs = QTabWidget()
+        tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.document_workspace = DocumentWorkspace()
+        self.document_workspace.status_changed.connect(self.set_status)
+        tabs.addTab(self.document_workspace, "文件工作台")
         tabs.addTab(self.build_organize_tab(), "組織 / 擷取")
         tabs.addTab(self.build_tools_tab(), "常用 PDF 工具")
         tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
@@ -962,7 +1067,6 @@ class VictorPdfToolsQt(QMainWindow):
 
         side = QFrame()
         side.setObjectName("panel")
-        side.setFixedWidth(270)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
@@ -1000,7 +1104,7 @@ class VictorPdfToolsQt(QMainWindow):
         guide.setWordWrap(True)
         guide.setObjectName("muted")
         side_layout.addWidget(guide)
-        layout.addWidget(side)
+        layout.addWidget(wrap_side_panel(side, 270))
         return tab
 
     def build_tools_tab(self) -> QWidget:
@@ -1029,10 +1133,9 @@ class VictorPdfToolsQt(QMainWindow):
 
         form = QFrame()
         form.setObjectName("panel")
-        form.setFixedWidth(300)
         form_layout = QVBoxLayout(form)
         form_layout.setContentsMargins(14, 14, 14, 14)
-        form_layout.setSpacing(10)
+        form_layout.setSpacing(8)
 
         form_layout.addWidget(QLabel("工具"))
         self.tool_operation = QComboBox()
@@ -1157,7 +1260,7 @@ class VictorPdfToolsQt(QMainWindow):
         hint.setWordWrap(True)
         form_layout.addWidget(hint)
         form_layout.addStretch(1)
-        body.addWidget(form)
+        body.addWidget(wrap_side_panel(form, 310))
         layout.addLayout(body, 1)
         return tab
 
@@ -1184,7 +1287,8 @@ class VictorPdfToolsQt(QMainWindow):
         left.addLayout(top)
 
         scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.annotation_preview_label = AnnotationPreviewLabel()
         self.annotation_preview_label.positionClicked.connect(self.set_annotation_position_from_click)
         scroll.setWidget(self.annotation_preview_label)
@@ -1193,7 +1297,6 @@ class VictorPdfToolsQt(QMainWindow):
 
         side = QFrame()
         side.setObjectName("panel")
-        side.setFixedWidth(320)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
@@ -1269,7 +1372,7 @@ class VictorPdfToolsQt(QMainWindow):
         guide.setWordWrap(True)
         side_layout.addWidget(guide)
         side_layout.addStretch(1)
-        layout.addWidget(side)
+        layout.addWidget(wrap_side_panel(side, 320))
         self.connect_annotation_preview_updates()
         return tab
 
@@ -1434,7 +1537,8 @@ class VictorPdfToolsQt(QMainWindow):
         left.addLayout(top)
 
         scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.markup_preview_label = MarkupPreviewLabel()
         self.markup_preview_label.rectDrawn.connect(self.add_markup_from_rect)
         self.markup_preview_label.pointClicked.connect(self.add_markup_from_point)
@@ -1444,7 +1548,6 @@ class VictorPdfToolsQt(QMainWindow):
 
         side = QFrame()
         side.setObjectName("panel")
-        side.setFixedWidth(330)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
@@ -1475,7 +1578,8 @@ class VictorPdfToolsQt(QMainWindow):
 
         side_layout.addWidget(QLabel("已加入的標註"))
         self.markup_list = QListWidget()
-        self.markup_list.setFixedHeight(180)
+        self.markup_list.setMinimumHeight(120)
+        self.markup_list.setMaximumHeight(180)
         side_layout.addWidget(self.markup_list)
 
         list_buttons = QHBoxLayout()
@@ -1499,7 +1603,7 @@ class VictorPdfToolsQt(QMainWindow):
         guide.setWordWrap(True)
         side_layout.addWidget(guide)
         side_layout.addStretch(1)
-        layout.addWidget(side)
+        layout.addWidget(wrap_side_panel(side, 330))
         return tab
 
     def load_markup_pdf(self) -> None:
@@ -1608,8 +1712,7 @@ class VictorPdfToolsQt(QMainWindow):
 
         merged = Image.alpha_composite(canvas, overlay).convert("RGB")
         pixmap = QPixmap.fromImage(ImageQt(merged))
-        self.markup_preview_label.setPixmap(pixmap)
-        self.markup_preview_label.resize(pixmap.size())
+        self.markup_preview_label.set_preview_pixmap(pixmap)
 
     def _draw_arrow_head(self, draw, x0: float, y0: float, x1: float, y1: float, color) -> None:
         import math
@@ -1791,7 +1894,8 @@ class VictorPdfToolsQt(QMainWindow):
         left.addLayout(top)
 
         scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.crop_preview_label = MarkupPreviewLabel()
         self.crop_preview_label.band_color = QColor(214, 69, 65)
         self.crop_preview_label.rectDrawn.connect(self.set_crop_rect_from_drag)
@@ -1801,7 +1905,6 @@ class VictorPdfToolsQt(QMainWindow):
 
         side = QFrame()
         side.setObjectName("panel")
-        side.setFixedWidth(320)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
@@ -1847,7 +1950,7 @@ class VictorPdfToolsQt(QMainWindow):
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         side_layout.addStretch(1)
-        layout.addWidget(side)
+        layout.addWidget(wrap_side_panel(side, 320))
         return tab
 
     def load_crop_pdf(self) -> None:
@@ -1932,8 +2035,7 @@ class VictorPdfToolsQt(QMainWindow):
             outline.rectangle((ix0, iy0, ix1, iy1), outline=(214, 69, 65, 255), width=2)
         merged = canvas.convert("RGB")
         pixmap = QPixmap.fromImage(ImageQt(merged))
-        self.crop_preview_label.setPixmap(pixmap)
-        self.crop_preview_label.resize(pixmap.size())
+        self.crop_preview_label.set_preview_pixmap(pixmap)
 
     def crop_image_point_to_pdf(self, point: QPoint) -> tuple[float, float]:
         page_width, page_height = self.crop_page_size
@@ -2067,7 +2169,8 @@ class VictorPdfToolsQt(QMainWindow):
         left.addLayout(top)
 
         scroll = QScrollArea()
-        scroll.setWidgetResizable(True)
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.text_edit_preview_label = TextEditPreviewLabel()
         self.text_edit_preview_label.positionClicked.connect(self.select_text_edit_block_at_point)
         scroll.setWidget(self.text_edit_preview_label)
@@ -2076,7 +2179,6 @@ class VictorPdfToolsQt(QMainWindow):
 
         side = QFrame()
         side.setObjectName("panel")
-        side.setFixedWidth(360)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
@@ -2115,8 +2217,10 @@ class VictorPdfToolsQt(QMainWindow):
 
         side_layout.addWidget(QLabel("偵測到的文字片段"))
         self.text_edit_block_list = QListWidget()
+        self.text_edit_block_list.setMinimumHeight(100)
+        self.text_edit_block_list.setMaximumHeight(180)
         self.text_edit_block_list.currentRowChanged.connect(self.on_text_edit_block_selected)
-        side_layout.addWidget(self.text_edit_block_list, 1)
+        side_layout.addWidget(self.text_edit_block_list)
 
         self.text_edit_block_info = QLabel("選取文字片段後可替換。")
         self.text_edit_block_info.setObjectName("muted")
@@ -2173,7 +2277,7 @@ class VictorPdfToolsQt(QMainWindow):
         guide.setObjectName("muted")
         guide.setWordWrap(True)
         side_layout.addWidget(guide)
-        layout.addWidget(side)
+        layout.addWidget(wrap_side_panel(side, 360))
         return tab
 
     def build_bookmark_tab(self) -> QWidget:
@@ -2203,7 +2307,6 @@ class VictorPdfToolsQt(QMainWindow):
 
         side = QFrame()
         side.setObjectName("panel")
-        side.setFixedWidth(320)
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
@@ -2258,7 +2361,7 @@ class VictorPdfToolsQt(QMainWindow):
         guide.setWordWrap(True)
         side_layout.addWidget(guide)
         side_layout.addStretch(1)
-        layout.addWidget(side)
+        layout.addWidget(wrap_side_panel(side, 320))
         return tab
 
     def load_bookmark_pdf(self) -> None:
@@ -2708,8 +2811,7 @@ class VictorPdfToolsQt(QMainWindow):
                 draw.text((left + 2, top + 1), replacement, fill=text_color, font=font)
             draw.rectangle((left, top, right, bottom), outline="#0f766e", width=3)
         pixmap = QPixmap.fromImage(ImageQt(image))
-        self.text_edit_preview_label.setPixmap(pixmap)
-        self.text_edit_preview_label.resize(pixmap.size())
+        self.text_edit_preview_label.set_preview_pixmap(pixmap)
 
     def text_edit_preview_font(
         self,
@@ -3054,8 +3156,7 @@ class VictorPdfToolsQt(QMainWindow):
             painter.drawLine(int(x) - 12, int(y), int(x) + 12, int(y))
             painter.drawLine(int(x), int(y) - 12, int(x), int(y) + 12)
         painter.end()
-        self.annotation_preview_label.setPixmap(pixmap)
-        self.annotation_preview_label.resize(pixmap.size())
+        self.annotation_preview_label.set_preview_pixmap(pixmap)
 
     def set_annotation_position_from_click(self, point: QPoint) -> None:
         page_width, page_height = self.annotation_page_size
@@ -3117,6 +3218,27 @@ class VictorPdfToolsQt(QMainWindow):
         operation = self.tool_operation.currentData()
         password = self.tool_password_input.text()
         source = self.tool_file_items[0]
+        self._tool_aux_path = None
+        if operation in {"insert_pages", "replace_pages", "compare_text"}:
+            prompt = "選擇要比對的 PDF" if operation == "compare_text" else "選擇來源 PDF"
+            second, _ = QFileDialog.getOpenFileName(self, prompt, "", "PDF files (*.pdf)")
+            if not second:
+                return
+            self._tool_aux_path = Path(second)
+        elif operation == "stamp_image":
+            image_path, _ = QFileDialog.getOpenFileName(
+                self,
+                "選擇印章 / 簽名圖片",
+                "",
+                "Images (*.png *.jpg *.jpeg *.webp *.bmp)",
+            )
+            if not image_path:
+                return
+            self._tool_aux_path = Path(image_path)
+        elif operation in {"search_markup", "secure_redact"}:
+            if not self.tool_batch_text_input.text().strip():
+                self.set_status("請在「文字 / 模板」欄位輸入搜尋關鍵字。")
+                return
         if operation == "pdf_to_images":
             if self.tool_images_zip_checkbox.isChecked():
                 target, _ = QFileDialog.getSaveFileName(
@@ -3134,8 +3256,8 @@ class VictorPdfToolsQt(QMainWindow):
                     return
                 target_path = Path(folder)
         else:
-            extension = ".txt" if operation in {"extract_text", "ocr_text", "info"} else ".pdf"
-            if operation in {"split", "split_advanced"}:
+            extension = ".txt" if operation in {"extract_text", "ocr_text", "info", "compare_text"} else ".pdf"
+            if operation in {"split", "split_advanced", "split_bookmarks"}:
                 extension = ".zip"
             target, _ = QFileDialog.getSaveFileName(
                 self,
@@ -3275,6 +3397,93 @@ class VictorPdfToolsQt(QMainWindow):
             return
         elif operation == "clean_metadata":
             clean_metadata(source, target_path, password)
+        elif operation == "insert_pages":
+            if self._tool_aux_path is None:
+                raise ValueError("請選擇要插入的 PDF。")
+            at_index = max(int(self.tool_split_value_input.text() or "1") - 1, 0)
+            inserted = insert_pdf_pages(
+                source,
+                self._tool_aux_path,
+                target_path,
+                at_index=at_index,
+                pages_spec=self.tool_pages_input.text(),
+                password=password,
+            )
+            self._last_tool_status_message = f"已插入 {inserted} 頁。"
+            return
+        elif operation == "replace_pages":
+            if self._tool_aux_path is None:
+                raise ValueError("請選擇取代來源 PDF。")
+            start_index = max(int(self.tool_split_value_input.text() or "1") - 1, 0)
+            replaced = replace_pdf_pages(
+                source,
+                self._tool_aux_path,
+                target_path,
+                start_index=start_index,
+                pages_spec=self.tool_pages_input.text(),
+                password=password,
+            )
+            self._last_tool_status_message = f"已取代 {replaced} 頁。"
+            return
+        elif operation == "compress_advanced":
+            old_size, new_size = compress_pdf_advanced(
+                source,
+                target_path,
+                image_dpi=int(self.tool_image_dpi_combo.currentText()),
+                password=password,
+            )
+            self._last_tool_status_message = f"進階壓縮完成：{old_size} → {new_size} bytes。"
+            return
+        elif operation == "compare_text":
+            if self._tool_aux_path is None:
+                raise ValueError("請選擇要比對的 PDF。")
+            diff_count = compare_pdf_text(source, self._tool_aux_path, target_path, password)
+            self._last_tool_status_message = f"比對完成，{diff_count} 頁文字不同。"
+            return
+        elif operation == "split_bookmarks":
+            section_count = split_pdf_by_bookmarks(source, target_path, password)
+            self._last_tool_status_message = f"已依書籤拆分成 {section_count} 個檔案。"
+            return
+        elif operation == "stamp_image":
+            if self._tool_aux_path is None:
+                raise ValueError("請選擇印章 / 簽名圖片。")
+            page_token = (self.tool_pages_input.text().strip() or "1").split(",")[0].split("-")[0]
+            page_index = max(int(page_token) - 1, 0)
+            add_image_stamp(
+                source,
+                target_path,
+                self._tool_aux_path,
+                page_index,
+                72.0,
+                120.0,
+                180.0,
+                60.0,
+                password,
+            )
+            self._last_tool_status_message = "已加入影像印章 / 簽名。"
+            return
+        elif operation == "flatten_forms":
+            field_count = flatten_form_fields(source, target_path, password)
+            self._last_tool_status_message = f"已壓平 {field_count} 個表單欄位。"
+            return
+        elif operation == "search_markup":
+            match_count = apply_text_markups_for_query(
+                source,
+                target_path,
+                self.tool_batch_text_input.text().strip(),
+                password=password,
+            )
+            self._last_tool_status_message = f"已標註 {match_count} 處符合文字。"
+            return
+        elif operation == "secure_redact":
+            redact_count = secure_redact_query(
+                source,
+                target_path,
+                self.tool_batch_text_input.text().strip(),
+                password,
+            )
+            self._last_tool_status_message = f"已安全塗銷 {redact_count} 處符合文字。"
+            return
         else:
             raise ValueError(f"未知工具：{operation}")
         self._last_tool_status_message = f"已完成：{self.tool_operation.currentText()}"

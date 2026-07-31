@@ -17,13 +17,19 @@ from pdf_core import (
     add_page_numbers,
     apply_markup_annotations,
     apply_outline,
+    apply_text_markups_for_query,
     build_markup_annotation,
+    compare_pdf_text,
     crop_pdf_pages,
     encrypt_pdf_with_permissions,
     extract_outline,
     extract_page_text_blocks,
+    insert_pdf_pages,
     parse_page_groups,
+    replace_pdf_pages,
+    secure_redact_query,
     split_pdf_advanced,
+    split_pdf_by_bookmarks,
     add_text_overlay_annotation,
     add_watermark,
     build_annotation_da,
@@ -700,6 +706,170 @@ class PdfToolsTests(unittest.TestCase):
         self.assertIn("New Label", text)
         self.assertNotIn("Old Label", text)
         self.assertIn("Keep", text)
+
+    def _write_simple_text_pdf(self, path: Path, texts: list[str]) -> None:
+        writer = PdfWriter()
+        for text in texts:
+            page = writer.add_blank_page(width=300, height=400)
+            stream = DecodedStreamObject()
+            stream.set_data(f"BT /F1 12 Tf 72 300 Td ({text}) Tj ET".encode("ascii"))
+            page[NameObject("/Contents")] = stream
+            page[NameObject("/Resources")] = DictionaryObject()
+        with path.open("wb") as output:
+            writer.write(output)
+
+    def _write_blank_pdf(self, path: Path, page_count: int) -> None:
+        writer = PdfWriter()
+        for _ in range(page_count):
+            writer.add_blank_page(width=300, height=400)
+        with path.open("wb") as output:
+            writer.write(output)
+
+    def test_insert_pdf_pages_at_index(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        insert_from = Path(self.temp_dir.name) / "insert.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        self._write_blank_pdf(source, 3)
+        self._write_blank_pdf(insert_from, 2)
+
+        inserted = insert_pdf_pages(source, insert_from, target, at_index=1)
+
+        self.assertEqual(inserted, 2)
+        self.assertEqual(len(PdfReader(str(target)).pages), 5)
+
+    def test_insert_pdf_pages_with_pages_spec(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        insert_from = Path(self.temp_dir.name) / "insert.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        self._write_blank_pdf(source, 2)
+        self._write_blank_pdf(insert_from, 3)
+
+        inserted = insert_pdf_pages(source, insert_from, target, at_index=0, pages_spec="2")
+
+        self.assertEqual(inserted, 1)
+        self.assertEqual(len(PdfReader(str(target)).pages), 3)
+
+    def test_replace_pdf_pages_replaces_consecutive_pages(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        replacement = Path(self.temp_dir.name) / "replacement.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        self._write_blank_pdf(source, 4)
+        self._write_blank_pdf(replacement, 2)
+
+        replaced = replace_pdf_pages(source, replacement, target, start_index=1, pages_spec="1-2")
+
+        self.assertEqual(replaced, 2)
+        self.assertEqual(len(PdfReader(str(target)).pages), 4)
+
+    def test_replace_pdf_pages_rejects_out_of_range(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        replacement = Path(self.temp_dir.name) / "replacement.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        self._write_blank_pdf(source, 2)
+        self._write_blank_pdf(replacement, 2)
+
+        with self.assertRaises(ValueError):
+            replace_pdf_pages(source, replacement, target, start_index=1)
+
+    def test_compare_pdf_text_reports_differences(self):
+        left = Path(self.temp_dir.name) / "left.pdf"
+        right = Path(self.temp_dir.name) / "right.pdf"
+        report = Path(self.temp_dir.name) / "compare.txt"
+        self._write_simple_text_pdf(left, ["Alpha"])
+        self._write_simple_text_pdf(right, ["Beta"])
+
+        diff_count = compare_pdf_text(left, right, report)
+
+        self.assertEqual(diff_count, 1)
+        content = report.read_text(encoding="utf-8")
+        self.assertIn("--- Page 1 DIFF ---", content)
+        self.assertIn("[Left]", content)
+        self.assertIn("[Right]", content)
+
+    def test_compare_pdf_text_reports_no_differences(self):
+        left = Path(self.temp_dir.name) / "left.pdf"
+        right = Path(self.temp_dir.name) / "right.pdf"
+        report = Path(self.temp_dir.name) / "compare.txt"
+        self._write_simple_text_pdf(left, ["Same"])
+        self._write_simple_text_pdf(right, ["Same"])
+
+        diff_count = compare_pdf_text(left, right, report)
+
+        self.assertEqual(diff_count, 0)
+        self.assertIn("All pages match.", report.read_text(encoding="utf-8"))
+
+    def test_split_pdf_by_bookmarks_creates_zip_sections(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        outlined = Path(self.temp_dir.name) / "outlined.pdf"
+        target = Path(self.temp_dir.name) / "bookmarks.zip"
+        self._write_blank_pdf(source, 5)
+        apply_outline(
+            source,
+            outlined,
+            [
+                BookmarkItem("封面", 0, 0),
+                BookmarkItem("正文", 2, 0),
+                BookmarkItem("附錄", 4, 0),
+            ],
+        )
+
+        count = split_pdf_by_bookmarks(outlined, target)
+
+        self.assertEqual(count, 3)
+        self.assertTrue(target.exists())
+
+    def test_split_pdf_by_bookmarks_requires_bookmarks(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "bookmarks.zip"
+        self._write_blank_pdf(source, 2)
+
+        with self.assertRaises(ValueError):
+            split_pdf_by_bookmarks(source, target)
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_apply_text_markups_for_query_highlights_matches(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "markup-source.pdf"
+        target = Path(self.temp_dir.name) / "markup-target.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((72, 100), "Hello World", fontname="helv", fontsize=12)
+        doc.save(str(source))
+        doc.close()
+
+        count = apply_text_markups_for_query(source, target, "Hello", kind="highlight")
+
+        self.assertGreaterEqual(count, 1)
+        result_doc = fitz.open(str(target))
+        try:
+            self.assertIsNotNone(next(result_doc[0].annots(), None))
+        finally:
+            result_doc.close()
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_secure_redact_query_removes_text(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "redact-source.pdf"
+        target = Path(self.temp_dir.name) / "redact-target.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((72, 100), "Secret Data", fontname="helv", fontsize=12)
+        doc.save(str(source))
+        doc.close()
+
+        count = secure_redact_query(source, target, "Secret")
+
+        self.assertGreaterEqual(count, 1)
+        text = fitz.open(str(target))[0].get_text()
+        self.assertNotIn("Secret", text)
 
     def setUp(self):
         import tempfile
