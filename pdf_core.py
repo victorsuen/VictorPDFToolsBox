@@ -1960,6 +1960,56 @@ def add_signature_image(
     add_image_stamp(source, target, image_path, page_index, x, y, width, height, password)
 
 
+def add_text_stamp(
+    source: Path,
+    target: Path,
+    text: str,
+    page_index: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    color_rgb: tuple[float, float, float] = (0.8, 0.0, 0.0),
+    password: str = "",
+) -> None:
+    """Draw a bordered text stamp on a PDF page using PyMuPDF."""
+
+    ensure_pymupdf_available()
+    stamp_text = (text or "").strip()
+    if not stamp_text:
+        raise ValueError("圖章文字不可為空。")
+
+    document = fitz.open(str(source))
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        if page_index < 0 or page_index >= document.page_count:
+            raise ValueError("頁碼超出範圍。")
+        page = document[page_index]
+        rect = fitz.Rect(x, y, x + width, y + height)
+        page.draw_rect(rect, color=color_rgb, width=2)
+        fontsize = max(8.0, min(height * 0.55, width / max(len(stamp_text), 1) * 0.75))
+        rc = page.insert_textbox(
+            rect,
+            stamp_text,
+            fontsize=fontsize,
+            color=color_rgb,
+            align=fitz.TEXT_ALIGN_CENTER,
+        )
+        if rc < 0:
+            page.insert_textbox(
+                rect,
+                stamp_text,
+                fontsize=max(6.0, fontsize * 0.7),
+                color=color_rgb,
+                align=fitz.TEXT_ALIGN_CENTER,
+            )
+        document.save(str(target), garbage=4, deflate=True)
+    finally:
+        document.close()
+
+
 def compress_pdf_advanced(
     source: Path,
     target: Path,

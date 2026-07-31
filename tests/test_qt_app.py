@@ -8,12 +8,13 @@ from pypdf import PdfReader, PdfWriter
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtWidgets import QApplication, QTabWidget
 
-from pdf_core import TextBlock
+from pdf_core import MarkupAnnotation, TextBlock
 from document_workspace import DocumentWorkspace
 from qt_app import (
+    BATCHABLE_OPERATIONS,
     FOLDER_REVEAL_OPERATIONS,
     TOOL_OPERATIONS,
     WINDOW_MIN_SIZE,
@@ -512,6 +513,11 @@ class QtAppTests(unittest.TestCase):
         )
 
     def test_output_preferences_default_enabled(self):
+        from PySide6.QtCore import QSettings
+        from qt_app import SETTINGS_APP, SETTINGS_ORG
+
+        settings = QSettings(SETTINGS_ORG, SETTINGS_APP)
+        settings.clear()
         window = VictorPdfToolsQt()
 
         self.assertTrue(window.open_pdf_after_save_checkbox.isChecked())
@@ -535,14 +541,61 @@ class QtAppTests(unittest.TestCase):
         )
 
     def test_document_workspace_tab_is_first_tab(self):
-        from PySide6.QtWidgets import QTabWidget
-
         window = VictorPdfToolsQt()
-        tab_widgets = window.centralWidget().findChildren(QTabWidget)
-        self.assertTrue(tab_widgets)
-        main_tabs = tab_widgets[0]
+        main_tabs = window.main_tabs
         self.assertEqual(main_tabs.tabText(0), "文件工作台")
         self.assertIs(main_tabs.widget(0), window.document_workspace)
+
+    def test_advanced_tabs_nested_under_one_main_tab(self):
+        window = VictorPdfToolsQt()
+        main_tabs = window.main_tabs
+        main_texts = [main_tabs.tabText(index) for index in range(main_tabs.count())]
+        self.assertEqual(main_texts[:3], ["文件工作台", "組織 / 擷取", "常用 PDF 工具"])
+        self.assertIn("進階分頁", main_texts)
+        advanced_index = main_texts.index("進階分頁")
+        advanced_tabs = main_tabs.widget(advanced_index)
+        self.assertIsInstance(advanced_tabs, QTabWidget)
+        nested_texts = [advanced_tabs.tabText(index) for index in range(advanced_tabs.count())]
+        for expected in (
+            "文字標註 / 覆蓋",
+            "螢光 / 圖形註解",
+            "裁切頁面",
+            "文字編輯 Beta",
+            "書籤 / 目錄",
+        ):
+            self.assertIn(expected, nested_texts)
+
+    def test_document_workspace_lazy_thumbnails_create_page_items(self):
+        workspace = DocumentWorkspace()
+        workspace.open_path(self.source)
+        self.assertEqual(workspace.thumb_list.count(), 2)
+        self.assertEqual(workspace.thumb_list.item(0).text(), "第 1 頁")
+        self.assertEqual(workspace.thumb_list.item(1).text(), "第 2 頁")
+
+    def test_document_workspace_shortcuts_include_undo_and_page_nav(self):
+        workspace = DocumentWorkspace()
+        shortcuts = {
+            action.shortcut().toString(): action
+            for action in workspace.actions()
+            if not action.shortcut().isEmpty()
+        }
+        self.assertIn("Ctrl+Z", shortcuts)
+        self.assertIn("Left", shortcuts)
+        self.assertIn("Right", shortcuts)
+        page_keys = [key for key in shortcuts if "pg" in key.lower()]
+        self.assertGreaterEqual(len(page_keys), 2)
+        self.assertEqual(shortcuts["Ctrl+Z"].shortcutContext(), Qt.WidgetWithChildrenShortcut)
+
+    def test_audit_log_append_writes_line(self):
+        from audit_log import append_audit_event
+
+        log_path = Path(self.temp_dir.name) / "audit.log"
+        with patch("audit_log.audit_log_path", return_value=log_path):
+            append_audit_event("test_op", "source.pdf", "target.pdf", "ok")
+        content = log_path.read_text(encoding="utf-8")
+        self.assertIn("test_op", content)
+        self.assertIn("source.pdf", content)
+        self.assertIn("target.pdf", content)
 
     def test_document_workspace_can_be_constructed(self):
         workspace = DocumentWorkspace()
@@ -550,6 +603,63 @@ class QtAppTests(unittest.TestCase):
         workspace.open_path(self.source)
         self.assertEqual(workspace.current_path(), self.source)
         self.assertEqual(workspace.page_count, 2)
+
+    def test_document_workspace_has_zoom_controls_and_undo(self):
+        workspace = DocumentWorkspace()
+        self.assertEqual(workspace.preview_zoom, 1.0)
+        self.assertTrue(hasattr(workspace, "zoom_label"))
+        self.assertTrue(callable(workspace.undo))
+        workspace.open_path(self.source)
+        workspace._change_zoom(0.25)
+        self.assertAlmostEqual(workspace.preview_zoom, 1.25)
+        workspace._fit_preview_zoom()
+        self.assertEqual(workspace.preview_zoom, 1.0)
+        workspace._push_undo_snapshot()
+        workspace.markup_items.append((0, MarkupAnnotation("rect", 1, 2, 3, 4)))
+        workspace.undo()
+        self.assertEqual(workspace.markup_items, [])
+
+    def test_document_workspace_modes_include_crop(self):
+        workspace = DocumentWorkspace()
+        mode_ids = []
+        for button in workspace.mode_group.buttons():
+            mode_ids.append(button.property("mode_id"))
+        self.assertIn("crop", mode_ids)
+        crop_index = mode_ids.index("crop")
+        workspace.mode_group.button(crop_index).click()
+        self.assertEqual(workspace.interaction, "crop")
+        self.assertEqual(workspace.right_stack.currentIndex(), crop_index)
+
+    def test_document_workspace_signature_stores_rect(self):
+        workspace = DocumentWorkspace()
+        workspace.open_path(self.source)
+        workspace.preview_image = _white_image(300, 400)
+        workspace.page_size = (300.0, 400.0)
+        workspace.signature_image_path = self.source
+        workspace.interaction = "signature"
+        workspace._set_signature_rect_from_drag(QPoint(60, 100), QPoint(240, 300))
+        self.assertIsNotNone(workspace.signature_rect)
+        x, y, width, height = workspace.signature_rect
+        self.assertAlmostEqual(x, 60.0, places=1)
+        self.assertAlmostEqual(width, 180.0, places=1)
+        self.assertGreater(height, 0)
+
+    def test_document_workspace_bookmark_save_applies_outline(self):
+        workspace = DocumentWorkspace()
+        workspace.open_path(self.source)
+        workspace.bookmark_title_input.setText("總覽")
+        workspace.bookmark_page_input.setText("2")
+        workspace._add_bookmark_item()
+        target = Path(self.temp_dir.name) / "workspace-bookmarked.pdf"
+
+        with patch("document_workspace.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch.object(workspace, "_offer_reload_output"):
+                workspace._save_bookmark_outline()
+
+        self.assertTrue(target.exists())
+        outline = PdfReader(str(target)).outline
+        self.assertEqual(len(outline), 1)
+        self.assertEqual(str(outline[0].title), "總覽")
 
     def test_tool_operations_include_workspace_tools(self):
         slugs = {slug for slug, _title in TOOL_OPERATIONS}
@@ -560,11 +670,39 @@ class QtAppTests(unittest.TestCase):
             "compare_text",
             "split_bookmarks",
             "stamp_image",
+            "text_stamp",
             "flatten_forms",
             "search_markup",
             "secure_redact",
         ):
             self.assertIn(key, slugs)
+
+    def test_batchable_operations_cover_common_tools(self):
+        for expected in ("rotate", "compress", "watermark", "add_page_numbers", "clean_metadata"):
+            self.assertIn(expected, BATCHABLE_OPERATIONS)
+        self.assertNotIn("merge", BATCHABLE_OPERATIONS)
+
+    def test_tool_batch_rotate_writes_each_pdf(self):
+        window = VictorPdfToolsQt()
+        window.tool_file_items = [self.source, self.second_source]
+        window.refresh_tool_file_list()
+        window.tool_operation.setCurrentIndex(window.tool_operation.findData("rotate"))
+        window.tool_batch_checkbox.setChecked(True)
+        for checkbox in (
+            window.tool_open_pdf_tab_checkbox,
+            window.tool_open_output_folder_checkbox,
+        ):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+        out_dir = Path(self.temp_dir.name) / "batch_out"
+        out_dir.mkdir()
+        with patch("qt_app.QFileDialog.getExistingDirectory", return_value=str(out_dir)):
+            with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
+                window.run_tool_operation()
+        self.assertTrue((out_dir / "source_rotate.pdf").exists())
+        self.assertTrue((out_dir / "second_rotate.pdf").exists())
+        self.assertIn("批次完成", window._last_tool_status_message)
 
     def test_reveal_output_skips_missing_path(self):
         with patch("qt_app.subprocess.Popen") as popen, patch("qt_app.os.startfile") as startfile:

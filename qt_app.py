@@ -38,6 +38,7 @@ from PySide6.QtWidgets import (
 )
 
 from document_workspace import DocumentWorkspace
+from audit_log import append_audit_event, audit_log_path
 from pdf_core import (
     IMAGE_SUFFIXES,
     MARKUP_COLOR_PRESETS,
@@ -70,6 +71,7 @@ from pdf_core import (
     insert_pdf_pages,
     add_image_stamp,
     add_signature_image,
+    add_text_stamp,
     replace_pdf_pages,
     secure_redact_query,
     split_pdf_by_bookmarks,
@@ -135,6 +137,7 @@ TOOL_OPERATIONS = [
     ("compare_text", "比對 PDF 文字"),
     ("split_bookmarks", "依書籤拆分"),
     ("stamp_image", "影像印章 / 簽名"),
+    ("text_stamp", "文字圖章"),
     ("flatten_forms", "壓平表單"),
     ("search_markup", "搜尋並螢光"),
     ("secure_redact", "安全塗銷關鍵字"),
@@ -161,6 +164,7 @@ PDF_OUTPUT_OPERATIONS = frozenset(
         "replace_pages",
         "compress_advanced",
         "stamp_image",
+        "text_stamp",
         "flatten_forms",
         "search_markup",
         "secure_redact",
@@ -177,6 +181,32 @@ FOLDER_REVEAL_OPERATIONS = frozenset(
         "pdf_to_images",
         "compare_text",
         "split_bookmarks",
+    }
+)
+
+# Tools that can run once per PDF when batch mode is enabled (output to a folder).
+BATCHABLE_OPERATIONS = frozenset(
+    {
+        "rotate",
+        "encrypt",
+        "encrypt_permissions",
+        "decrypt",
+        "compress",
+        "compress_advanced",
+        "add_page_numbers",
+        "watermark",
+        "remove_blank_pages",
+        "clean_metadata",
+        "bates",
+        "flatten_forms",
+        "search_markup",
+        "secure_redact",
+        "extract_text",
+        "info",
+        "delete",
+        "extract",
+        "ocr_text",
+        "ocr_searchable_pdf",
     }
 )
 
@@ -994,16 +1024,19 @@ class VictorPdfToolsQt(QMainWindow):
 
         tabs = QTabWidget()
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.main_tabs = tabs
         self.document_workspace = DocumentWorkspace()
         self.document_workspace.status_changed.connect(self.set_status)
         tabs.addTab(self.document_workspace, "文件工作台")
         tabs.addTab(self.build_organize_tab(), "組織 / 擷取")
         tabs.addTab(self.build_tools_tab(), "常用 PDF 工具")
-        tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
-        tabs.addTab(self.build_markup_tab(), "螢光 / 圖形註解")
-        tabs.addTab(self.build_crop_tab(), "裁切頁面")
-        tabs.addTab(self.build_text_edit_tab(), "文字編輯 Beta")
-        tabs.addTab(self.build_bookmark_tab(), "書籤 / 目錄")
+        advanced_tabs = QTabWidget()
+        advanced_tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
+        advanced_tabs.addTab(self.build_markup_tab(), "螢光 / 圖形註解")
+        advanced_tabs.addTab(self.build_crop_tab(), "裁切頁面")
+        advanced_tabs.addTab(self.build_text_edit_tab(), "文字編輯 Beta")
+        advanced_tabs.addTab(self.build_bookmark_tab(), "書籤 / 目錄")
+        tabs.addTab(advanced_tabs, "進階分頁")
         layout.addWidget(tabs, 1)
         self.setCentralWidget(root)
 
@@ -1255,7 +1288,16 @@ class VictorPdfToolsQt(QMainWindow):
         self.tool_open_output_folder_checkbox.toggled.connect(self.save_output_preferences)
         form_layout.addWidget(self.tool_open_output_folder_checkbox)
 
-        hint = QLabel("提示：可把 PDF / 圖片直接拖入左側清單；合併 / 圖片轉 PDF 可加入多個檔案，其餘工具使用清單第一個 PDF。")
+        self.tool_batch_checkbox = QCheckBox("批次處理清單中每個 PDF（輸出到資料夾）")
+        self.tool_batch_checkbox.setChecked(False)
+        form_layout.addWidget(self.tool_batch_checkbox)
+
+        self.add_button(form_layout, "開啟處理紀錄", self.open_audit_log)
+
+        hint = QLabel(
+            "提示：可把 PDF / 圖片直接拖入左側清單。合併 / 圖片轉 PDF 本身支援多檔；"
+            "其餘工具預設用第一個 PDF。勾選「批次處理」後，旋轉／壓縮／浮水印／頁碼／加密等會對清單每個 PDF 各輸出一份到資料夾。"
+        )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         form_layout.addWidget(hint)
@@ -3211,6 +3253,22 @@ class VictorPdfToolsQt(QMainWindow):
             on_success=lambda: self.open_pdf_as_new_tab(target_path),
         )
 
+    def _batch_sources(self) -> list[Path]:
+        return [path for path in self.tool_file_items if path.suffix.lower() == ".pdf"]
+
+    def _should_batch_tool(self, operation: str) -> bool:
+        if operation in {"merge", "images_to_pdf"}:
+            return False
+        if not getattr(self, "tool_batch_checkbox", None) or not self.tool_batch_checkbox.isChecked():
+            return False
+        if operation not in BATCHABLE_OPERATIONS:
+            return False
+        return len(self._batch_sources()) > 1
+
+    def _batch_output_path(self, source: Path, folder: Path, operation: str) -> Path:
+        extension = ".txt" if operation in {"extract_text", "ocr_text", "info"} else ".pdf"
+        return folder / safe_output_name(f"{source.stem}_{operation}{extension}")
+
     def run_tool_operation(self) -> None:
         if not self.tool_file_items:
             self.set_status("請先加入檔案。")
@@ -3219,6 +3277,10 @@ class VictorPdfToolsQt(QMainWindow):
         password = self.tool_password_input.text()
         source = self.tool_file_items[0]
         self._tool_aux_path = None
+        batch_mode = self._should_batch_tool(operation)
+        if batch_mode and operation not in BATCHABLE_OPERATIONS:
+            self.set_status("這個工具不支援批次處理，請取消勾選或改用單檔。")
+            return
         if operation in {"insert_pages", "replace_pages", "compare_text"}:
             prompt = "選擇要比對的 PDF" if operation == "compare_text" else "選擇來源 PDF"
             second, _ = QFileDialog.getOpenFileName(self, prompt, "", "PDF files (*.pdf)")
@@ -3239,6 +3301,28 @@ class VictorPdfToolsQt(QMainWindow):
             if not self.tool_batch_text_input.text().strip():
                 self.set_status("請在「文字 / 模板」欄位輸入搜尋關鍵字。")
                 return
+
+        if batch_mode:
+            folder = QFileDialog.getExistingDirectory(self, "選擇批次輸出資料夾")
+            if not folder:
+                return
+            target_path = Path(folder)
+
+            def on_batch_success() -> None:
+                self.set_status(self._last_tool_status_message)
+                if self.tool_open_output_folder_checkbox.isChecked():
+                    reveal_output(target_path)
+
+            self.run_pdf_job(
+                lambda: self._execute_batch_tool_operation(operation, target_path, password),
+                "",
+                on_success=on_batch_success,
+                audit_operation=f"batch_{operation}",
+                audit_target=target_path,
+                audit_detail=f"{len(self._batch_sources())} files",
+            )
+            return
+
         if operation == "pdf_to_images":
             if self.tool_images_zip_checkbox.isChecked():
                 target, _ = QFileDialog.getSaveFileName(
@@ -3280,7 +3364,32 @@ class VictorPdfToolsQt(QMainWindow):
             lambda: self._execute_tool_operation(operation, source, target_path, password),
             "",
             on_success=on_success,
+            audit_operation=operation,
+            audit_source=source,
+            audit_target=target_path,
         )
+
+    def _execute_batch_tool_operation(self, operation: str, folder: Path, password: str) -> None:
+        sources = self._batch_sources()
+        if not sources:
+            raise ValueError("批次處理需要至少一個 PDF。")
+        folder.mkdir(parents=True, exist_ok=True)
+        done = 0
+        errors: list[str] = []
+        for source in sources:
+            target = self._batch_output_path(source, folder, operation)
+            try:
+                self._execute_tool_operation(operation, source, target, password)
+                done += 1
+            except Exception as exc:
+                errors.append(f"{source.name}: {exc}")
+        if done == 0:
+            detail = "；".join(errors[:3]) if errors else "未知錯誤"
+            raise ValueError(f"批次處理失敗。{detail}")
+        message = f"批次完成：成功 {done} / {len(sources)} 個檔案 → {folder}"
+        if errors:
+            message += f"（失敗 {len(errors)}：{errors[0]}）"
+        self._last_tool_status_message = message
 
     def _execute_tool_operation(self, operation: str, source: Path, target_path: Path, password: str) -> None:
         if operation == "merge":
@@ -3461,6 +3570,23 @@ class VictorPdfToolsQt(QMainWindow):
                 password,
             )
             self._last_tool_status_message = "已加入影像印章 / 簽名。"
+            return
+        elif operation == "text_stamp":
+            stamp_text = self.tool_batch_text_input.text().strip() or "DRAFT"
+            page_token = (self.tool_pages_input.text().strip() or "1").split(",")[0].split("-")[0]
+            page_index = max(int(page_token) - 1, 0)
+            add_text_stamp(
+                source,
+                target_path,
+                stamp_text,
+                page_index,
+                72.0,
+                120.0,
+                180.0,
+                60.0,
+                password=password,
+            )
+            self._last_tool_status_message = f"已加入文字圖章：{stamp_text}。"
             return
         elif operation == "flatten_forms":
             field_count = flatten_form_fields(source, target_path, password)
@@ -3896,13 +4022,37 @@ class VictorPdfToolsQt(QMainWindow):
             on_success=on_success,
         )
 
-    def run_pdf_job(self, job, success_message: str, on_success=None) -> None:
+    def open_audit_log(self) -> None:
+        path = audit_log_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists():
+            path.write_text("", encoding="utf-8")
+        if os.name == "nt":
+            os.startfile(str(path))
+        else:
+            subprocess.run(["xdg-open", str(path)], check=False)
+
+    def run_pdf_job(
+        self,
+        job,
+        success_message: str,
+        on_success=None,
+        *,
+        audit_operation: str = "",
+        audit_source: Path | str = "",
+        audit_target: Path | str = "",
+        audit_detail: str = "",
+    ) -> None:
         QApplication.setOverrideCursor(Qt.WaitCursor)
         try:
             job()
         except Exception as exc:
             self.show_error(exc)
         else:
+            if audit_operation:
+                source_name = Path(audit_source).name if audit_source else ""
+                target_name = Path(audit_target).name if audit_target else ""
+                append_audit_event(audit_operation, source_name, target_name, audit_detail)
             if on_success is not None:
                 on_success()
             if success_message:

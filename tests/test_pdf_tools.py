@@ -31,6 +31,7 @@ from pdf_core import (
     split_pdf_advanced,
     split_pdf_by_bookmarks,
     add_text_overlay_annotation,
+    add_text_stamp,
     add_watermark,
     build_annotation_da,
     clean_metadata,
@@ -870,6 +871,25 @@ class PdfToolsTests(unittest.TestCase):
         self.assertGreaterEqual(count, 1)
         text = fitz.open(str(target))[0].get_text()
         self.assertNotIn("Secret", text)
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_add_text_stamp_writes_stamp_text(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "stamp-source.pdf"
+        target = Path(self.temp_dir.name) / "stamp-target.pdf"
+        doc = fitz.open()
+        doc.new_page(width=300, height=400)
+        doc.save(str(source))
+        doc.close()
+
+        add_text_stamp(source, target, "APPROVED", 0, 72.0, 300.0, 140.0, 40.0)
+
+        text = fitz.open(str(target))[0].get_text()
+        self.assertIn("APPROVED", text)
 
     def setUp(self):
         import tempfile
