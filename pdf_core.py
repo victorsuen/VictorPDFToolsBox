@@ -89,6 +89,27 @@ class TextBlock:
     font_file: str = ""
 
 
+@dataclass
+class FormField:
+    name: str
+    page_index: int
+    field_type: str
+    value: str
+    choices: tuple[str, ...] = ()
+
+
+FORM_WIDGET_TYPE_NAMES = {
+    0: "unknown",
+    1: "button",
+    2: "checkbox",
+    3: "combobox",
+    4: "listbox",
+    5: "radio",
+    6: "signature",
+    7: "text",
+}
+
+
 def block_right(block: TextBlock) -> float:
     return block.x + block.width
 
@@ -2186,6 +2207,175 @@ def flatten_form_fields(source: Path, target: Path, password: str = "") -> int:
     finally:
         document.close()
     return field_count
+
+
+def _form_widget_type_name(field_type: int) -> str:
+    if fitz is not None:
+        mapping = {
+            int(getattr(fitz, "PDF_WIDGET_TYPE_BUTTON", 1)): "button",
+            int(getattr(fitz, "PDF_WIDGET_TYPE_CHECKBOX", 2)): "checkbox",
+            int(getattr(fitz, "PDF_WIDGET_TYPE_RADIOBUTTON", 5)): "radio",
+            int(getattr(fitz, "PDF_WIDGET_TYPE_TEXT", 7)): "text",
+            int(getattr(fitz, "PDF_WIDGET_TYPE_LISTBOX", 4)): "listbox",
+            int(getattr(fitz, "PDF_WIDGET_TYPE_COMBOBOX", 3)): "combobox",
+            int(getattr(fitz, "PDF_WIDGET_TYPE_SIGNATURE", 6)): "signature",
+        }
+        return mapping.get(int(field_type or 0), "unknown")
+    return FORM_WIDGET_TYPE_NAMES.get(int(field_type or 0), "unknown")
+
+
+def _open_pymupdf_document(source: Path, password: str = ""):
+    ensure_pymupdf_available()
+    document = fitz.open(str(source))
+    if document.is_encrypted:
+        if not password or document.authenticate(password) == 0:
+            document.close()
+            raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+    return document
+
+
+def list_form_fields(source: Path, password: str = "") -> list[FormField]:
+    """Return AcroForm widgets in page order."""
+
+    document = _open_pymupdf_document(source, password)
+    fields: list[FormField] = []
+    try:
+        for page_index, page in enumerate(document):
+            for widget in page.widgets() or []:
+                choices = tuple(str(item) for item in (getattr(widget, "choice_values", None) or []))
+                fields.append(
+                    FormField(
+                        name=str(widget.field_name or ""),
+                        page_index=page_index,
+                        field_type=_form_widget_type_name(widget.field_type),
+                        value="" if widget.field_value is None else str(widget.field_value),
+                        choices=choices,
+                    )
+                )
+    finally:
+        document.close()
+    return fields
+
+
+def fill_form_fields(
+    source: Path,
+    target: Path,
+    values: dict[str, str],
+    password: str = "",
+) -> int:
+    """Write ``values`` keyed by field name into widgets, then save."""
+
+    if not values:
+        raise ValueError("請輸入要填寫的欄位值。")
+    document = _open_pymupdf_document(source, password)
+    updated = 0
+    try:
+        for page in document:
+            for widget in page.widgets() or []:
+                name = str(widget.field_name or "")
+                if not name or name not in values:
+                    continue
+                if _form_widget_type_name(widget.field_type) == "signature":
+                    continue
+                widget.field_value = values[name]
+                widget.update()
+                updated += 1
+        if updated == 0:
+            raise ValueError("沒有符合的表單欄位可填寫。")
+        document.save(str(target), garbage=4, deflate=True)
+    finally:
+        document.close()
+    return updated
+
+
+def _pad_rgb_image(image: Image.Image, size: tuple[int, int], fill=(255, 255, 255)) -> Image.Image:
+    rgb = image.convert("RGB")
+    if rgb.size == size:
+        return rgb
+    canvas = Image.new("RGB", size, fill)
+    canvas.paste(rgb, (0, 0))
+    return canvas
+
+
+def compare_pdf_visual(
+    left: Path,
+    right: Path,
+    target: Path,
+    left_password: str = "",
+    right_password: str = "",
+    dpi: int = 72,
+    threshold: float = 8.0,
+) -> int:
+    """Render both PDFs, pixel-diff each page, and write a side-by-side PDF.
+
+    Returns the number of pages that differ (including missing pages).
+    """
+
+    from PIL import ImageChops, ImageDraw, ImageStat
+
+    if not PDF_RENDER_AVAILABLE or pdfium is None:
+        raise ValueError("視覺比對需要 pypdfium2 預覽元件。")
+    if dpi < 36 or dpi > 200:
+        raise ValueError("視覺比對解析度請介於 36 至 200 DPI。")
+
+    left_pages = render_pdf_page_images(left, left_password, dpi=dpi)
+    right_pages = render_pdf_page_images(right, right_password, dpi=dpi)
+    max_pages = max(len(left_pages), len(right_pages))
+    if max_pages == 0:
+        raise ValueError("沒有可比對的頁面。")
+
+    composed: list[Image.Image] = []
+    diff_count = 0
+    for index in range(max_pages):
+        left_img = left_pages[index][1] if index < len(left_pages) else None
+        right_img = right_pages[index][1] if index < len(right_pages) else None
+        if left_img is None or right_img is None:
+            diff_count += 1
+            is_diff = True
+            ref = left_img or right_img
+            width, height = ref.size
+            left_pad = (
+                left_img.convert("RGB")
+                if left_img is not None
+                else Image.new("RGB", (width, height), (230, 230, 230))
+            )
+            right_pad = (
+                right_img.convert("RGB")
+                if right_img is not None
+                else Image.new("RGB", (width, height), (230, 230, 230))
+            )
+            highlighted = right_pad
+        else:
+            width = max(left_img.width, right_img.width)
+            height = max(left_img.height, right_img.height)
+            left_pad = _pad_rgb_image(left_img, (width, height))
+            right_pad = _pad_rgb_image(right_img, (width, height))
+            diff = ImageChops.difference(left_pad, right_pad)
+            stats = ImageStat.Stat(diff)
+            mean_val = sum(stats.mean) / max(len(stats.mean), 1)
+            is_diff = mean_val > threshold
+            if is_diff:
+                diff_count += 1
+                mask = diff.convert("L").point(lambda pixel: 170 if pixel > max(int(threshold), 4) else 0)
+                red = Image.new("RGB", (width, height), (220, 40, 40))
+                highlighted = Image.composite(red, right_pad, mask)
+            else:
+                highlighted = right_pad
+
+        gap = 16
+        header = 36
+        canvas = Image.new("RGB", (width * 2 + gap + 24, height + header + 16), (36, 40, 44))
+        canvas.paste(left_pad, (8, header))
+        canvas.paste(highlighted, (16 + width, header))
+        draw = ImageDraw.Draw(canvas)
+        status = "DIFF" if is_diff else "MATCH"
+        color = (255, 180, 80) if is_diff else (140, 220, 160)
+        draw.text((8, 8), f"Page {index + 1}  {status}    Left | Right", fill=color)
+        composed.append(canvas)
+
+    rgb_pages = [image.convert("RGB") for image in composed]
+    rgb_pages[0].save(target, save_all=True, append_images=rgb_pages[1:], resolution=float(dpi))
+    return diff_count
 
 
 def secure_redact_query(

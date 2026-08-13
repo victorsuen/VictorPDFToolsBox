@@ -20,11 +20,16 @@ from pdf_core import (
     apply_text_markups_for_query,
     build_markup_annotation,
     compare_pdf_text,
+    compare_pdf_visual,
     crop_pdf_pages,
     encrypt_pdf_with_permissions,
     extract_outline,
     extract_page_text_blocks,
+    fill_form_fields,
+    flatten_form_fields,
+    images_to_pdf,
     insert_pdf_pages,
+    list_form_fields,
     parse_page_groups,
     replace_pdf_pages,
     secure_redact_query,
@@ -890,6 +895,70 @@ class PdfToolsTests(unittest.TestCase):
 
         text = fitz.open(str(target))[0].get_text()
         self.assertIn("APPROVED", text)
+
+    def test_compare_pdf_visual_reports_differences(self):
+        left = Path(self.temp_dir.name) / "left.pdf"
+        right = Path(self.temp_dir.name) / "right.pdf"
+        report = Path(self.temp_dir.name) / "compare-visual.pdf"
+        left_image = Path(self.temp_dir.name) / "left.png"
+        right_image = Path(self.temp_dir.name) / "right.png"
+        Image.new("RGB", (200, 240), "white").save(left_image)
+        Image.new("RGB", (200, 240), "black").save(right_image)
+        images_to_pdf([left_image], left)
+        images_to_pdf([right_image], right)
+
+        diff_count = compare_pdf_visual(left, right, report)
+
+        self.assertEqual(diff_count, 1)
+        self.assertTrue(report.exists())
+        self.assertGreater(report.stat().st_size, 0)
+
+    def test_compare_pdf_visual_reports_no_differences(self):
+        left = Path(self.temp_dir.name) / "left.pdf"
+        right = Path(self.temp_dir.name) / "right.pdf"
+        report = Path(self.temp_dir.name) / "compare-visual.pdf"
+        self._write_blank_pdf(left, 1)
+        self._write_blank_pdf(right, 1)
+
+        diff_count = compare_pdf_visual(left, right, report)
+
+        self.assertEqual(diff_count, 0)
+        self.assertTrue(report.exists())
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_list_and_fill_form_fields(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "form-source.pdf"
+        target = Path(self.temp_dir.name) / "form-filled.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=400)
+        widget = fitz.Widget()
+        widget.rect = fitz.Rect(50, 50, 250, 90)
+        widget.field_name = "Name"
+        widget.field_type = fitz.PDF_WIDGET_TYPE_TEXT
+        widget.field_value = "Alice"
+        widget.text_font = "Helv"
+        widget.text_fontsize = 12
+        page.add_widget(widget)
+        doc.save(str(source))
+        doc.close()
+
+        fields = list_form_fields(source)
+        self.assertEqual(len(fields), 1)
+        self.assertEqual(fields[0].name, "Name")
+        self.assertEqual(fields[0].field_type, "text")
+        self.assertEqual(fields[0].value, "Alice")
+
+        updated = fill_form_fields(source, target, {"Name": "Bob"})
+        self.assertEqual(updated, 1)
+        filled = list_form_fields(target)
+        self.assertEqual(filled[0].value, "Bob")
+        flattened = Path(self.temp_dir.name) / "form-flat.pdf"
+        self.assertGreaterEqual(flatten_form_fields(target, flattened), 1)
 
     def setUp(self):
         import tempfile

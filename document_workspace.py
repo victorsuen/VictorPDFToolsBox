@@ -1,13 +1,26 @@
 from __future__ import annotations
 
 import math
+import shutil
+import tempfile
 from copy import deepcopy
 from pathlib import Path
 
 from PIL import Image, ImageDraw
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QPoint, QRect, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QIcon, QIntValidator, QKeySequence, QPainter, QPen, QPixmap
+from PySide6.QtGui import (
+    QAction,
+    QColor,
+    QDragEnterEvent,
+    QDropEvent,
+    QIcon,
+    QIntValidator,
+    QKeySequence,
+    QPainter,
+    QPen,
+    QPixmap,
+)
 from PySide6.QtWidgets import (
     QApplication,
     QButtonGroup,
@@ -34,12 +47,14 @@ from PySide6.QtWidgets import (
 )
 
 from audit_log import append_audit_event
+from stamp_library import add_library_stamp, delete_library_stamp, list_library_stamps
 from pdf_core import (
     MARKUP_COLOR_PRESETS,
     PDF_RENDER_AVAILABLE,
     PDF_SUFFIXES,
     PYMUPDF_AVAILABLE,
     BookmarkItem,
+    FormField,
     MarkupAnnotation,
     TextBlock,
     add_signature_image,
@@ -49,12 +64,15 @@ from pdf_core import (
     apply_text_markups_for_query,
     compress_pdf_advanced,
     compare_pdf_text,
+    compare_pdf_visual,
     crop_pdf_pages,
     delete_pdf_pages,
     extract_outline,
     extract_page_text_blocks,
+    fill_form_fields,
     flatten_form_fields,
     insert_pdf_pages,
+    list_form_fields,
     open_reader,
     pdfium,
     replace_pdf_pages,
@@ -67,8 +85,12 @@ from pdf_core import (
 
 PREVIEW_MAX_WIDTH = 760
 PREVIEW_MAX_HEIGHT = 760
-THUMB_MAX_SIZE = (120, 160)
+THUMB_MAX_SIZE = (160, 210)
+THUMB_ICON_SIZE = QSize(160, 210)
+THUMB_PANEL_MIN_WIDTH = 300
+THUMB_PANEL_MAX_WIDTH = 360
 THUMB_BATCH_SIZE = 6
+THUMB_BATCH_DELAY_MS = 40
 ZOOM_MIN = 0.5
 ZOOM_MAX = 3.0
 ZOOM_STEP = 0.1
@@ -125,8 +147,9 @@ class WorkspacePreviewLabel(PreviewImageLabel):
     rectDrawn = Signal(QPoint, QPoint)
     pointClicked = Signal(QPoint)
 
-    def __init__(self) -> None:
+    def __init__(self, page_index: int = 0) -> None:
         super().__init__()
+        self.page_index = page_index
         self.band_color = QColor(18, 133, 118)
         self._start: QPoint | None = None
         self._current: QPoint | None = None
@@ -173,11 +196,14 @@ def _render_page_image(
     max_size: tuple[int, int],
     scale_cap: float = 1.25,
     zoom: float = 1.0,
+    document=None,
 ) -> tuple[Image.Image | None, tuple[float, float]]:
     if not PDF_RENDER_AVAILABLE or pdfium is None:
         return None, (0.0, 0.0)
+    owns_document = document is None
     try:
-        document = pdfium.PdfDocument(str(pdf_path), password=password or None)
+        if document is None:
+            document = pdfium.PdfDocument(str(pdf_path), password=password or None)
         page = document.get_page(page_index)
         try:
             page_width, page_height = page.get_size()
@@ -187,7 +213,8 @@ def _render_page_image(
             return image, (float(page_width), float(page_height))
         finally:
             page.close()
-            document.close()
+            if owns_document:
+                document.close()
     except Exception:
         return None, (0.0, 0.0)
 
@@ -228,9 +255,11 @@ class DocumentWorkspace(QWidget):
     """Acrobat-like document workspace with reading, annotation, edit, organize, and tools modes."""
 
     status_changed = Signal(str)
+    files_dropped = Signal(list)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
+        self.setAcceptDrops(True)
         self.pdf_path: Path | None = None
         self.password = ""
         self.page_count = 0
@@ -242,6 +271,7 @@ class DocumentWorkspace(QWidget):
         self.markup_items: list[tuple[int, MarkupAnnotation]] = []
         self.markup_color_rgb = MARKUP_COLOR_PRESETS["yellow"]
         self.text_blocks: list[TextBlock] = []
+        self.form_fields: list[FormField] = []
         self.undo_stack: list[dict] = []
         self.crop_rect: tuple[float, float, float, float] | None = None
         self.signature_rect: tuple[float, float, float, float] | None = None
@@ -249,11 +279,17 @@ class DocumentWorkspace(QWidget):
         self.stamp_rect: tuple[float, float, float, float] | None = None
         self.stamp_text: str = ""
         self.bookmark_items: list[BookmarkItem] = []
+        self.page_images: dict[int, Image.Image] = {}
+        self.page_sizes: list[tuple[float, float]] = []
+        self._preview_render_zoom = 1.0
         self._thumb_generation = 0
         self._thumb_pending: list[int] = []
+        self._thumb_pending_rest: list[int] = []
         self._thumb_timer = QTimer(self)
         self._thumb_timer.setSingleShot(True)
         self._thumb_timer.timeout.connect(self._render_next_thumb_batch)
+        self._pdfium_doc = None
+        self._pdfium_doc_path: Path | None = None
         self._build_ui()
         self._install_shortcuts()
 
@@ -263,7 +299,13 @@ class DocumentWorkspace(QWidget):
         root.setSpacing(8)
 
         top = QHBoxLayout()
+        brand = QLabel("Victor PDF Tools")
+        brand.setStyleSheet("font-weight: 600;")
+        top.addWidget(brand)
+        top.addSpacing(10)
         self.add_button(top, "開啟 PDF...", self.choose_pdf)
+        self.add_button(top, "儲存", self.save_pdf, "primary")
+        self.add_button(top, "另存副本...", self.save_pdf_copy)
         self.add_button(top, "復原", self.undo)
         top.addSpacing(8)
         self.mode_group = QButtonGroup(self)
@@ -296,12 +338,24 @@ class DocumentWorkspace(QWidget):
         body.setSpacing(10)
 
         left_tabs = QTabWidget()
-        left_tabs.setMinimumWidth(200)
-        left_tabs.setMaximumWidth(220)
+        left_tabs.setMinimumWidth(THUMB_PANEL_MIN_WIDTH)
+        left_tabs.setMaximumWidth(THUMB_PANEL_MAX_WIDTH)
+        left_tabs.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        self.left_tabs = left_tabs
 
         self.thumb_list = QListWidget()
-        self.thumb_list.setIconSize(QSize(96, 128))
+        self.thumb_list.setViewMode(QListWidget.IconMode)
+        self.thumb_list.setIconSize(THUMB_ICON_SIZE)
+        self.thumb_list.setGridSize(QSize(THUMB_ICON_SIZE.width() + 24, THUMB_ICON_SIZE.height() + 36))
+        self.thumb_list.setResizeMode(QListWidget.Adjust)
+        self.thumb_list.setMovement(QListWidget.Static)
+        self.thumb_list.setSpacing(10)
+        self.thumb_list.setWordWrap(True)
+        self.thumb_list.setUniformItemSizes(True)
+        self.thumb_list.setAcceptDrops(False)
+        self.thumb_list.viewport().setAcceptDrops(False)
         self.thumb_list.currentRowChanged.connect(self._on_thumb_selected)
+        self.thumb_list.verticalScrollBar().valueChanged.connect(self._on_thumb_scrolled)
         left_tabs.addTab(self.thumb_list, "縮圖")
 
         self.bookmark_tree = QTreeWidget()
@@ -367,19 +421,22 @@ class DocumentWorkspace(QWidget):
         self.add_button(nav, "+", lambda: self._change_zoom(ZOOM_STEP))
         self.add_button(nav, "適合頁面", self._fit_preview_zoom)
         nav.addSpacing(12)
-        self.add_button(nav, "更新預覽", self.render_preview)
+        self.add_button(nav, "重新整理", self.render_preview)
         nav.addStretch(1)
         center.addLayout(nav)
 
-        preview_scroll = QScrollArea()
-        preview_scroll.setWidgetResizable(False)
-        preview_scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
-        self.preview_scroll = preview_scroll
-        self.preview_label = WorkspacePreviewLabel()
-        self.preview_label.rectDrawn.connect(self._on_preview_rect_drawn)
-        self.preview_label.pointClicked.connect(self._on_preview_point_clicked)
-        preview_scroll.setWidget(self.preview_label)
-        center.addWidget(preview_scroll, 1)
+        self.preview_scroll = QScrollArea()
+        self.preview_scroll.setWidgetResizable(True)
+        self.preview_scroll.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        self.preview_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.preview_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.preview_scroll.setAcceptDrops(False)
+        self.preview_scroll.viewport().setAcceptDrops(False)
+        self.preview_widget = WorkspacePreviewLabel(0)
+        self.preview_widget.rectDrawn.connect(self._on_preview_rect_drawn)
+        self.preview_widget.pointClicked.connect(self._on_preview_point_clicked)
+        self.preview_scroll.setWidget(self.preview_widget)
+        center.addWidget(self.preview_scroll, 1)
         body.addLayout(center, 1)
 
         self.right_stack = QStackedWidget()
@@ -392,6 +449,99 @@ class DocumentWorkspace(QWidget):
         body.addWidget(_wrap_side_panel(self.right_stack, 300))
         root.addLayout(body, 1)
         self.interaction = MODE_DEFAULT_INTERACTION["read"]
+        self._refresh_stamp_library_list()
+
+    def _set_current_page(
+        self,
+        page_index: int,
+        *,
+        load_blocks: bool = True,
+        sync_thumb: bool = True,
+    ) -> None:
+        if not (0 <= page_index < self.page_count):
+            return
+        self.current_page = page_index
+        self.preview_widget.page_index = page_index
+        self.page_input.setText(str(page_index + 1))
+        if sync_thumb:
+            self.thumb_list.blockSignals(True)
+            self.thumb_list.setCurrentRow(page_index)
+            self.thumb_list.blockSignals(False)
+        cached = (
+            page_index in self.page_images
+            and self._preview_render_zoom == self.preview_zoom
+        )
+        if cached:
+            self.preview_image = self.page_images[page_index]
+            self.page_size = self.page_sizes[page_index]
+            self._update_preview_display()
+        else:
+            self.render_preview()
+        if load_blocks:
+            self._load_text_blocks()
+
+    def save_pdf(self) -> None:
+        if self.pdf_path is None:
+            self._emit_status("請先載入 PDF。")
+            return
+        self._write_current_document(self.pdf_path, reload_after=True, audit_operation="save")
+
+    def save_pdf_copy(self) -> None:
+        if self.pdf_path is None:
+            self._emit_status("請先載入 PDF。")
+            return
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "另存 PDF 副本",
+            safe_output_name(self.pdf_path.name),
+            "PDF files (*.pdf)",
+        )
+        if not target:
+            return
+        self._write_current_document(Path(target), reload_after=False, audit_operation="save_copy")
+
+    def _write_current_document(
+        self,
+        target: Path,
+        *,
+        reload_after: bool,
+        audit_operation: str,
+    ) -> None:
+        if self.pdf_path is None:
+            return
+        source = self.pdf_path
+        password = self._active_password()
+        markups = list(self.markup_items)
+        same_path = source.resolve() == Path(target).resolve()
+        if same_path and not markups:
+            append_audit_event(audit_operation, source.name, Path(target).name, "ok")
+            self._emit_status("已儲存。")
+            return
+        self._close_pdfium_doc()
+
+        def job() -> bool:
+            with tempfile.TemporaryDirectory() as temp_dir:
+                temp_path = Path(temp_dir) / "out.pdf"
+                if markups:
+                    apply_markup_annotations(source, temp_path, markups, password)
+                else:
+                    shutil.copy2(source, temp_path)
+                shutil.copy2(temp_path, target)
+            return True
+
+        result = self._run_job(
+            job,
+            "已儲存。" if same_path else f"已另存副本：{Path(target).name}",
+            audit_operation=audit_operation,
+            audit_target=Path(target),
+        )
+        if result is None:
+            return
+        if markups and (reload_after or same_path):
+            self.markup_items = []
+            self._refresh_markup_list()
+        if reload_after or same_path:
+            self.open_path(target)
 
     def _build_read_panel(self) -> QWidget:
         panel = QFrame()
@@ -470,6 +620,19 @@ class DocumentWorkspace(QWidget):
         self.text_replacement_input.setFixedHeight(72)
         layout.addWidget(self.text_replacement_input)
         self.add_button(layout, "替換選取區塊", self.replace_selected_text_block)
+        layout.addWidget(QLabel("表單欄位"))
+        self.form_field_list = QListWidget()
+        self.form_field_list.setMaximumHeight(140)
+        self.form_field_list.currentRowChanged.connect(self._on_form_field_selected)
+        layout.addWidget(self.form_field_list)
+        self.form_value_input = QLineEdit()
+        self.form_value_input.setPlaceholderText("欄位值")
+        layout.addWidget(self.form_value_input)
+        form_row = QHBoxLayout()
+        self.add_button(form_row, "重新載入欄位", self._load_form_fields)
+        self.add_button(form_row, "更新選取值", self._update_selected_form_value)
+        layout.addLayout(form_row)
+        self.add_button(layout, "套用填表並另存", self.fill_forms, "primary")
         self.add_button(layout, "壓平表單欄位", self.flatten_forms)
         layout.addWidget(QLabel("PDF 密碼（如適用）"))
         self.edit_password_input = QLineEdit()
@@ -565,12 +728,23 @@ class DocumentWorkspace(QWidget):
         self.add_button(layout, "在預覽框選後蓋章", self.start_text_stamp_placement)
         self.add_button(layout, "套用文字圖章", self.apply_text_stamp_to_pdf, "primary")
         self.add_button(layout, "取消待套用圖章", self.cancel_pending_text_stamp)
+        layout.addSpacing(8)
+        layout.addWidget(QLabel("影像圖章庫"))
+        self.stamp_library_list = QListWidget()
+        self.stamp_library_list.setMaximumHeight(110)
+        layout.addWidget(self.stamp_library_list)
+        stamp_row = QHBoxLayout()
+        self.add_button(stamp_row, "加入圖片...", self._add_library_stamp)
+        self.add_button(stamp_row, "刪除", self._delete_library_stamp, "danger")
+        layout.addLayout(stamp_row)
+        self.add_button(layout, "使用選取圖章並框選位置", self.start_library_stamp_placement)
         note = QLabel("Bates 編號請使用「常用 PDF 工具」分頁。")
         note.setObjectName("muted")
         note.setWordWrap(True)
         layout.addWidget(note)
         self.add_button(layout, "進階壓縮", self.compress_advanced)
         self.add_button(layout, "比對 PDF 文字...", self.compare_pdf)
+        self.add_button(layout, "視覺比對 PDF...", self.compare_pdf_pages)
         self.add_button(layout, "依書籤拆分", self.split_by_bookmarks)
         self.add_button(layout, "壓平表單欄位", self.flatten_forms)
         layout.addWidget(QLabel("PDF 密碼（如適用）"))
@@ -589,6 +763,12 @@ class DocumentWorkspace(QWidget):
         undo_action.setShortcutContext(context)
         undo_action.triggered.connect(self.undo)
         self.addAction(undo_action)
+
+        save_action = QAction("儲存", self)
+        save_action.setShortcut(QKeySequence("Ctrl+S"))
+        save_action.setShortcutContext(context)
+        save_action.triggered.connect(self.save_pdf)
+        self.addAction(save_action)
 
         for key, delta in (
             (QKeySequence(Qt.Key_Left), -1),
@@ -616,6 +796,10 @@ class DocumentWorkspace(QWidget):
         return super().eventFilter(obj, event)
 
     def _open_audit_log(self) -> None:
+        parent = self.window()
+        if hasattr(parent, "show_audit_log_dialog"):
+            parent.show_audit_log_dialog()
+            return
         import os
 
         from audit_log import audit_log_path
@@ -645,6 +829,38 @@ class DocumentWorkspace(QWidget):
     def current_path(self) -> Path | None:
         return self.pdf_path
 
+    def dragEnterEvent(self, event: QDragEnterEvent) -> None:
+        if self._has_pdf_urls(event):
+            event.acceptProposedAction()
+            return
+        super().dragEnterEvent(event)
+
+    def dragMoveEvent(self, event) -> None:
+        if self._has_pdf_urls(event):
+            event.acceptProposedAction()
+            return
+        super().dragMoveEvent(event)
+
+    def dropEvent(self, event: QDropEvent) -> None:
+        if self._has_pdf_urls(event):
+            paths = [
+                url.toLocalFile()
+                for url in event.mimeData().urls()
+                if url.toLocalFile() and Path(url.toLocalFile()).suffix.lower() == ".pdf"
+            ]
+            if paths:
+                self.open_path(Path(paths[0]))
+                self.files_dropped.emit(paths)
+                self._emit_status(f"已載入 {Path(paths[0]).name}" + (f"；另加入 {len(paths) - 1} 個檔案。" if len(paths) > 1 else "。"))
+            event.acceptProposedAction()
+            return
+        super().dropEvent(event)
+
+    def _has_pdf_urls(self, event) -> bool:
+        if not event.mimeData().hasUrls():
+            return False
+        return any(Path(url.toLocalFile()).suffix.lower() == ".pdf" for url in event.mimeData().urls())
+
     def open_path(self, path: Path) -> None:
         path = Path(path)
         if path.suffix.lower() not in PDF_SUFFIXES:
@@ -667,16 +883,25 @@ class DocumentWorkspace(QWidget):
         self.signature_image_path = None
         self.stamp_rect = None
         self.stamp_text = ""
+        self._close_pdfium_doc()
         self._refresh_markup_list()
         self.path_label.setText(path.name)
         self.page_validator.setRange(1, max(page_count, 1))
         self.bookmark_page_validator.setRange(1, max(page_count, 1))
         self.page_input.setText("1")
         self.page_total_label.setText(f"/ {page_count}")
+        self.page_images.clear()
+        self.page_sizes = [(0.0, 0.0)] * self.page_count
+        self.preview_widget.page_index = 0
+        self.render_preview()
         self._populate_thumbnails()
         self._populate_bookmarks()
-        self._load_text_blocks()
-        self.render_preview()
+        # Defer expensive text-block extraction until Edit mode needs it.
+        self.text_blocks = []
+        self.text_block_list.clear()
+        self.form_fields = []
+        if hasattr(self, "form_field_list"):
+            self.form_field_list.clear()
         self._emit_status(f"已載入 {path.name}，共 {page_count} 頁。")
 
     def choose_pdf(self) -> None:
@@ -701,11 +926,16 @@ class DocumentWorkspace(QWidget):
         mode_id = MODE_IDS[index] if 0 <= index < len(MODE_IDS) else "read"
         self.interaction = MODE_DEFAULT_INTERACTION.get(mode_id)
         if mode_id == "crop":
-            self.preview_label.band_color = QColor(214, 69, 65)
-        elif mode_id == "signature" or self.interaction == "signature":
-            self.preview_label.band_color = QColor(18, 133, 118)
+            band_color = QColor(214, 69, 65)
         else:
-            self.preview_label.band_color = QColor(18, 133, 118)
+            band_color = QColor(18, 133, 118)
+        self.preview_widget.band_color = band_color
+        if mode_id == "edit" and self.pdf_path is not None:
+            if not self.text_blocks:
+                self._load_text_blocks()
+            self._load_form_fields()
+        if mode_id == "tools":
+            self._refresh_stamp_library_list()
         self._update_preview_display()
 
     def change_page(self, delta: int) -> None:
@@ -713,68 +943,121 @@ class DocumentWorkspace(QWidget):
             return
         target = min(max(self.current_page + delta, 0), self.page_count - 1)
         if target != self.current_page:
-            self.current_page = target
-            self.page_input.setText(str(target + 1))
-            self.thumb_list.setCurrentRow(target)
-            self._load_text_blocks()
-            self.render_preview()
+            self._set_current_page(target)
 
     def _sync_page_from_input(self) -> None:
         if self.page_count <= 0:
             return
         page = min(max(int(self.page_input.text() or "1"), 1), self.page_count)
-        self.current_page = page - 1
-        self.page_input.setText(str(page))
-        self.thumb_list.blockSignals(True)
-        self.thumb_list.setCurrentRow(self.current_page)
-        self.thumb_list.blockSignals(False)
-        self._load_text_blocks()
-        self.render_preview()
+        self._set_current_page(page - 1)
 
     def _on_thumb_selected(self, row: int) -> None:
         if row < 0 or row >= self.page_count:
             return
-        self.current_page = row
-        self.page_input.setText(str(row + 1))
-        self._load_text_blocks()
-        self.render_preview()
+        self._set_current_page(row)
+
+    def _close_pdfium_doc(self) -> None:
+        if self._pdfium_doc is not None:
+            try:
+                self._pdfium_doc.close()
+            except Exception:
+                pass
+        self._pdfium_doc = None
+        self._pdfium_doc_path = None
+
+    def _get_pdfium_doc(self):
+        if self.pdf_path is None or not PDF_RENDER_AVAILABLE or pdfium is None:
+            return None
+        if self._pdfium_doc is not None and self._pdfium_doc_path == self.pdf_path:
+            return self._pdfium_doc
+        self._close_pdfium_doc()
+        try:
+            self._pdfium_doc = pdfium.PdfDocument(
+                str(self.pdf_path),
+                password=self._active_password() or None,
+            )
+            self._pdfium_doc_path = self.pdf_path
+            return self._pdfium_doc
+        except Exception:
+            self._close_pdfium_doc()
+            return None
 
     def _populate_thumbnails(self) -> None:
         self._thumb_timer.stop()
         self._thumb_generation += 1
         self._thumb_pending = []
+        self._thumb_pending_rest = []
         self.thumb_list.clear()
         if self.pdf_path is None:
             return
         for index in range(self.page_count):
             self.thumb_list.addItem(QListWidgetItem(f"第 {index + 1} 頁"))
-        self._thumb_pending = self._thumb_render_order()
         if self.page_count:
             self.thumb_list.setCurrentRow(self.current_page)
+        QApplication.processEvents()
+        order = self._thumb_render_order()
+        self._thumb_pending = order[:12]
+        self._thumb_pending_rest = order[12:]
         self._schedule_thumb_batch()
+
+    def _visible_thumb_indexes(self) -> list[int]:
+        viewport = self.thumb_list.viewport().rect()
+        expanded = viewport.adjusted(0, -max(viewport.height() // 4, 40), 0, max(viewport.height() // 4, 40))
+        visible: list[int] = []
+        for index in range(self.thumb_list.count()):
+            item = self.thumb_list.item(index)
+            if item is None:
+                continue
+            if self.thumb_list.visualItemRect(item).intersects(expanded):
+                visible.append(index)
+        return visible
 
     def _thumb_render_order(self) -> list[int]:
         if self.page_count <= 0:
             return []
+        visible = self._visible_thumb_indexes()
         current = self.current_page
-        order = [current]
+        order: list[int] = []
+        seen: set[int] = set()
+
+        def append(index: int) -> None:
+            if 0 <= index < self.page_count and index not in seen:
+                seen.add(index)
+                order.append(index)
+
+        append(current)
+        for index in visible:
+            append(index)
         for delta in range(1, self.page_count):
-            for candidate in (current - delta, current + delta):
-                if 0 <= candidate < self.page_count and candidate not in order:
-                    order.append(candidate)
+            append(current - delta)
+            append(current + delta)
         return order
 
+    def _on_thumb_scrolled(self, *_args) -> None:
+        pending = set(self._thumb_pending + self._thumb_pending_rest)
+        if not pending:
+            return
+        remaining = [index for index in self._thumb_render_order() if index in pending]
+        self._thumb_pending = remaining[:12]
+        self._thumb_pending_rest = remaining[12:]
+
     def _schedule_thumb_batch(self) -> None:
-        if self._thumb_pending:
+        if self._thumb_pending or self._thumb_pending_rest:
             self._thumb_timer.start(0)
 
     def _render_next_thumb_batch(self) -> None:
         generation = self._thumb_generation
         if self.pdf_path is None or generation != self._thumb_generation:
             return
+        if not self._thumb_pending and self._thumb_pending_rest:
+            self._thumb_pending = self._thumb_pending_rest[:12]
+            self._thumb_pending_rest = self._thumb_pending_rest[12:]
+        if not self._thumb_pending:
+            return
         password = self._active_password()
+        document = self._get_pdfium_doc()
         batch: list[int] = []
-        while self._thumb_pending and len(batch) < THUMB_BATCH_SIZE:
+        while self._thumb_pending and len(batch) < 4:
             batch.append(self._thumb_pending.pop(0))
         for index in batch:
             if generation != self._thumb_generation:
@@ -787,15 +1070,17 @@ class DocumentWorkspace(QWidget):
                 index,
                 password,
                 THUMB_MAX_SIZE,
-                scale_cap=0.5,
+                scale_cap=0.35,
+                document=document,
             )
             if image is None:
                 image = _placeholder_image(THUMB_MAX_SIZE[0], THUMB_MAX_SIZE[1], f"P{index + 1}")
             else:
-                image.thumbnail(THUMB_MAX_SIZE, Image.Resampling.LANCZOS)
+                image.thumbnail(THUMB_MAX_SIZE, Image.Resampling.BILINEAR)
             item.setIcon(QIcon(QPixmap.fromImage(ImageQt(image))))
-        if self._thumb_pending and generation == self._thumb_generation:
-            self._thumb_timer.start(1)
+        QApplication.processEvents()
+        if (self._thumb_pending or self._thumb_pending_rest) and generation == self._thumb_generation:
+            self._thumb_timer.start(THUMB_BATCH_DELAY_MS)
 
     def _populate_bookmarks(self) -> None:
         if self.pdf_path is None:
@@ -917,38 +1202,47 @@ class DocumentWorkspace(QWidget):
         page_index = item.data(0, Qt.UserRole)
         if page_index is None:
             return
-        self.current_page = int(page_index)
-        self.page_input.setText(str(self.current_page + 1))
-        self.thumb_list.setCurrentRow(self.current_page)
-        self._load_text_blocks()
-        self.render_preview()
+        self._set_current_page(int(page_index))
 
     def render_preview(self) -> None:
         if self.pdf_path is None:
-            self.preview_label.clear()
+            self.preview_widget.clear()
+            self.preview_image = None
             return
+        password = self._active_password()
         image, page_size = _render_page_image(
             self.pdf_path,
             self.current_page,
-            self._active_password(),
+            password,
             (PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT),
             zoom=self.preview_zoom,
+            document=self._get_pdfium_doc(),
         )
         if image is None:
-            image = _placeholder_image(PREVIEW_MAX_WIDTH, PREVIEW_MAX_HEIGHT)
+            image = _placeholder_image(
+                PREVIEW_MAX_WIDTH,
+                PREVIEW_MAX_HEIGHT,
+                f"第 {self.current_page + 1} 頁",
+            )
             page_size = (float(PREVIEW_MAX_WIDTH), float(PREVIEW_MAX_HEIGHT))
-        self.page_size = page_size
         self.preview_image = image
+        self.page_size = page_size
+        if self.current_page < len(self.page_sizes):
+            self.page_sizes[self.current_page] = page_size
+        self.page_images[self.current_page] = image
+        self._preview_render_zoom = self.preview_zoom
         self._update_preview_display()
 
     def _change_zoom(self, delta: float) -> None:
         self.preview_zoom = max(ZOOM_MIN, min(self.preview_zoom + delta, ZOOM_MAX))
         self._update_zoom_label()
+        self.page_images.clear()
         self.render_preview()
 
     def _fit_preview_zoom(self) -> None:
         self.preview_zoom = 1.0
         self._update_zoom_label()
+        self.page_images.clear()
         self.render_preview()
         self._emit_status("已重設為適合頁面。")
 
@@ -1007,7 +1301,8 @@ class DocumentWorkspace(QWidget):
             self.page_validator.setRange(1, max(self.page_count, 1))
             self.bookmark_page_validator.setRange(1, max(self.page_count, 1))
             self.page_total_label.setText(f"/ {self.page_count}")
-            self._populate_thumbnails()
+            self.page_images.clear()
+            self.page_sizes = [(0.0, 0.0)] * self.page_count
             self._populate_bookmarks()
         self.markup_items = deepcopy(snapshot.get("markup_items", []))
         self.current_page = snapshot.get("current_page", 0)
@@ -1024,7 +1319,11 @@ class DocumentWorkspace(QWidget):
         if self.crop_rect is not None:
             self._set_crop_rect(self.crop_rect, update_inputs=True)
         self._load_text_blocks()
+        if self.current_page in self.page_images:
+            self.preview_image = self.page_images[self.current_page]
+            self.page_size = self.page_sizes[self.current_page]
         self.render_preview()
+        self._update_preview_display()
 
     def _on_preview_rect_drawn(self, start: QPoint, end: QPoint) -> None:
         interaction = self.interaction
@@ -1050,15 +1349,26 @@ class DocumentWorkspace(QWidget):
 
     def _update_preview_display(self) -> None:
         if self.preview_image is None:
-            self.preview_label.clear()
+            self.preview_widget.clear()
             return
-        page_width, page_height = self.page_size
-        canvas = self.preview_image.convert("RGBA")
+        merged = self._compose_page_overlay(self.current_page, self.preview_image)
+        self.preview_widget.set_preview_pixmap(QPixmap.fromImage(ImageQt(merged)))
+
+    def _compose_page_overlay(self, page_index: int, base_image: Image.Image) -> Image.Image:
+        page_size = self.page_sizes[page_index] if page_index < len(self.page_sizes) else self.page_size
+        page_width, page_height = page_size
+        canvas = base_image.convert("RGBA")
         image_width, image_height = canvas.size
         scale_x = image_width / page_width if page_width else 1.0
         scale_y = image_height / page_height if page_height else 1.0
 
-        if self.interaction == "crop" and self.crop_rect is not None and page_width > 0 and page_height > 0:
+        if (
+            page_index == self.current_page
+            and self.interaction == "crop"
+            and self.crop_rect is not None
+            and page_width > 0
+            and page_height > 0
+        ):
             left, bottom, right, top = self.crop_rect
             ix0 = left * scale_x
             ix1 = right * scale_x
@@ -1077,8 +1387,8 @@ class DocumentWorkspace(QWidget):
         def to_image(x: float, y: float) -> tuple[float, float]:
             return (x * scale_x, image_height - y * scale_y)
 
-        for page_index, markup in self.markup_items:
-            if page_index != self.current_page:
+        for markup_page_index, markup in self.markup_items:
+            if markup_page_index != page_index:
                 continue
             red, green, blue = (int(max(0.0, min(c, 1.0)) * 255) for c in markup.color_rgb)
             ix0, iy0 = to_image(markup.x0, markup.y0)
@@ -1102,7 +1412,12 @@ class DocumentWorkspace(QWidget):
             elif markup.kind == "note":
                 draw.rectangle((ix0, iy0 - 16, ix0 + 16, iy0), fill=(red, green, blue, 230))
 
-        if self.signature_rect is not None and page_width > 0 and page_height > 0:
+        if (
+            page_index == self.current_page
+            and self.signature_rect is not None
+            and page_width > 0
+            and page_height > 0
+        ):
             sx, sy, sw, sh = self.signature_rect
             sig_ix0 = sx * scale_x
             sig_ix1 = (sx + sw) * scale_x
@@ -1114,7 +1429,7 @@ class DocumentWorkspace(QWidget):
                 width=2,
             )
 
-        if self.stamp_rect is not None and page_width > 0 and page_height > 0:
+        if page_index == self.current_page and self.stamp_rect is not None and page_width > 0 and page_height > 0:
             tx, ty, tw, th = self.stamp_rect
             stamp_ix0 = tx * scale_x
             stamp_ix1 = (tx + tw) * scale_x
@@ -1132,8 +1447,7 @@ class DocumentWorkspace(QWidget):
                     fill=(204, 0, 0, 220),
                 )
 
-        merged = Image.alpha_composite(canvas, overlay).convert("RGB")
-        self.preview_label.set_preview_pixmap(QPixmap.fromImage(ImageQt(merged)))
+        return Image.alpha_composite(canvas, overlay).convert("RGB")
 
     def _draw_arrow_head(self, draw, x0: float, y0: float, x1: float, y1: float, color) -> None:
         angle = math.atan2(y1 - y0, x1 - x0)
@@ -1143,9 +1457,11 @@ class DocumentWorkspace(QWidget):
             hy = y1 + length * math.sin(angle + offset)
             draw.line((x1, y1, hx, hy), fill=color, width=2)
 
-    def _image_point_to_pdf(self, point: QPoint) -> tuple[float, float]:
-        page_width, page_height = self.page_size
-        image = self.preview_image
+    def _image_point_to_pdf(self, point: QPoint, page_index: int | None = None) -> tuple[float, float]:
+        page_index = self.current_page if page_index is None else page_index
+        page_size = self.page_sizes[page_index] if page_index < len(self.page_sizes) else self.page_size
+        page_width, page_height = page_size
+        image = self.page_images.get(page_index, self.preview_image)
         if image is None or page_width <= 0 or page_height <= 0:
             return (0.0, 0.0)
         image_width, image_height = image.size
@@ -1293,20 +1609,96 @@ class DocumentWorkspace(QWidget):
             preview = block.text.replace("\n", " ")[:48]
             self.text_block_list.addItem(preview or "(空白)")
 
+    def _load_form_fields(self) -> None:
+        if not hasattr(self, "form_field_list"):
+            return
+        self.form_field_list.clear()
+        self.form_fields = []
+        if self.pdf_path is None or not PYMUPDF_AVAILABLE:
+            return
+        try:
+            self.form_fields = list_form_fields(self.pdf_path, self.edit_password_input.text() or self.password)
+        except Exception as exc:
+            self._emit_status(str(exc))
+            self.form_fields = []
+        for field in self.form_fields:
+            page_label = f"第 {field.page_index + 1} 頁"
+            name = field.name or "(未命名)"
+            preview = field.value.replace("\n", " ")[:24] if field.value else "空白"
+            self.form_field_list.addItem(f"{page_label} · {name} [{field.field_type}]：{preview}")
+        if self.form_fields:
+            self.form_field_list.setCurrentRow(0)
+
+    def _on_form_field_selected(self, row: int) -> None:
+        if 0 <= row < len(self.form_fields):
+            self.form_value_input.setText(self.form_fields[row].value)
+
+    def _update_selected_form_value(self) -> None:
+        row = self.form_field_list.currentRow()
+        if row < 0 or row >= len(self.form_fields):
+            self._emit_status("請選取要更新的表單欄位。")
+            return
+        self.form_fields[row].value = self.form_value_input.text()
+        self._load_form_fields_labels()
+        self.form_field_list.setCurrentRow(row)
+        self._emit_status(f"已更新欄位「{self.form_fields[row].name or '(未命名)'}」的待套用值。")
+
+    def _load_form_fields_labels(self) -> None:
+        self.form_field_list.clear()
+        for field in self.form_fields:
+            page_label = f"第 {field.page_index + 1} 頁"
+            name = field.name or "(未命名)"
+            preview = field.value.replace("\n", " ")[:24] if field.value else "空白"
+            self.form_field_list.addItem(f"{page_label} · {name} [{field.field_type}]：{preview}")
+
+    def fill_forms(self) -> None:
+        if self.pdf_path is None:
+            self._emit_status("請先載入 PDF。")
+            return
+        if not self.form_fields:
+            self._load_form_fields()
+        if not self.form_fields:
+            self._emit_status("這個 PDF 沒有可填寫的表單欄位。")
+            return
+        row = self.form_field_list.currentRow()
+        if 0 <= row < len(self.form_fields):
+            self.form_fields[row].value = self.form_value_input.text()
+        values = {field.name: field.value for field in self.form_fields if field.name}
+        if not values:
+            self._emit_status("沒有可填寫的欄位名稱。")
+            return
+        self._push_undo_snapshot()
+        target, _ = QFileDialog.getSaveFileName(
+            self, "另存填表 PDF", safe_output_name("filled-form.pdf"), "PDF files (*.pdf)"
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        password = self.edit_password_input.text() or self.password
+
+        def job() -> int:
+            return fill_form_fields(self.pdf_path, target_path, values, password)
+
+        count = self._run_job(job, "已套用表單欄位。", audit_operation="fill_forms", audit_target=target_path)
+        if count is not None:
+            self._emit_status(f"已更新 {count} 個表單欄位。")
+            self._offer_reload_output(target_path)
+
     def _on_text_block_selected(self, row: int) -> None:
         if 0 <= row < len(self.text_blocks):
             self.text_replacement_input.setPlainText(self.text_blocks[row].text)
 
     def _text_block_to_image_rect(self, block: TextBlock) -> tuple[float, float, float, float]:
-        if self.preview_image is None:
+        image = self.page_images.get(self.current_page, self.preview_image)
+        if image is None:
             return (0.0, 0.0, 0.0, 0.0)
         page_width, page_height = self.page_size
         if page_width <= 0 or page_height <= 0:
             return (0.0, 0.0, 0.0, 0.0)
-        scale_x = self.preview_image.width / page_width
-        scale_y = self.preview_image.height / page_height
+        scale_x = image.width / page_width
+        scale_y = image.height / page_height
         left = block.x * scale_x
-        bottom = self.preview_image.height - block.y * scale_y
+        bottom = image.height - block.y * scale_y
         top = bottom - block.height * scale_y
         right = left + block.width * scale_x
         return (left, top, right, bottom)
@@ -1499,6 +1891,67 @@ class DocumentWorkspace(QWidget):
         if self._run_job(job, "已加入簽名影像。", audit_operation="signature_image", audit_target=target_path) is not None:
             self._offer_reload_output(target_path)
 
+    def _refresh_stamp_library_list(self) -> None:
+        if not hasattr(self, "stamp_library_list"):
+            return
+        self.stamp_library_list.clear()
+        for path in list_library_stamps():
+            item = QListWidgetItem(path.name)
+            item.setData(Qt.UserRole, str(path))
+            self.stamp_library_list.addItem(item)
+
+    def _add_library_stamp(self) -> None:
+        image_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "加入圖章圖片",
+            "",
+            "Images (*.png *.jpg *.jpeg *.webp *.bmp *.tif *.tiff)",
+        )
+        if not image_path:
+            return
+        try:
+            dest = add_library_stamp(Path(image_path))
+        except Exception as exc:
+            QMessageBox.critical(self, "文件工作台", str(exc))
+            return
+        self._refresh_stamp_library_list()
+        self._emit_status(f"已加入圖章：{dest.name}")
+
+    def _delete_library_stamp(self) -> None:
+        row = self.stamp_library_list.currentRow()
+        item = self.stamp_library_list.currentItem()
+        if item is None or row < 0:
+            self._emit_status("請先選取要刪除的圖章。")
+            return
+        path = Path(str(item.data(Qt.UserRole)))
+        answer = QMessageBox.question(
+            self,
+            "文件工作台",
+            f"要從圖章庫刪除 {path.name} 嗎？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if answer != QMessageBox.Yes:
+            return
+        try:
+            delete_library_stamp(path)
+        except Exception as exc:
+            QMessageBox.critical(self, "文件工作台", str(exc))
+            return
+        self._refresh_stamp_library_list()
+        self._emit_status(f"已刪除圖章：{path.name}")
+
+    def start_library_stamp_placement(self) -> None:
+        item = self.stamp_library_list.currentItem()
+        if item is None:
+            self._emit_status("請先選取圖章庫中的圖片。")
+            return
+        self.signature_image_path = Path(str(item.data(Qt.UserRole)))
+        self.signature_rect = None
+        self.interaction = "signature"
+        self._update_preview_display()
+        self._emit_status("請在預覽上拖曳框選圖章位置。")
+
     def _stamp_text_value(self) -> str:
         if self.stamp_preset_combo.currentData() == "custom":
             return self.stamp_custom_input.text().strip()
@@ -1512,7 +1965,7 @@ class DocumentWorkspace(QWidget):
         self.stamp_text = text
         self.stamp_rect = None
         self.interaction = "text_stamp"
-        self.preview_label.band_color = QColor(204, 0, 0)
+        self.preview_widget.band_color = QColor(204, 0, 0)
         self._update_preview_display()
         self._emit_status("請在預覽上拖曳框選圖章位置。")
 
@@ -1843,6 +2296,28 @@ class DocumentWorkspace(QWidget):
         diff_count = self._run_job(job, "文字比對完成。", audit_operation="compare_text", audit_target=target_path)
         if diff_count is not None:
             self._emit_status(f"共有 {diff_count} 頁文字不同；報告已儲存。")
+
+    def compare_pdf_pages(self) -> None:
+        if self.pdf_path is None:
+            return
+        other, _ = QFileDialog.getOpenFileName(self, "選擇要比對的 PDF", "", "PDF files (*.pdf)")
+        if not other:
+            return
+        target, _ = QFileDialog.getSaveFileName(
+            self, "另存視覺比對 PDF", safe_output_name("compare-visual.pdf"), "PDF files (*.pdf)"
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        password = self.tools_password_input.text() or self.password
+
+        def job() -> int:
+            return compare_pdf_visual(self.pdf_path, Path(other), target_path, password)
+
+        diff_count = self._run_job(job, "視覺比對完成。", audit_operation="compare_visual", audit_target=target_path)
+        if diff_count is not None:
+            self._emit_status(f"共有 {diff_count} 頁畫面不同；比對 PDF 已儲存。")
+            self._offer_reload_output(target_path)
 
     def split_by_bookmarks(self) -> None:
         if self.pdf_path is None:

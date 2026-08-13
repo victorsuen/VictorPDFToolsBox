@@ -14,12 +14,14 @@ from PySide6.QtWidgets import QApplication, QTabWidget
 from pdf_core import MarkupAnnotation, TextBlock
 from document_workspace import DocumentWorkspace
 from qt_app import (
+    AuditLogDialog,
     BATCHABLE_OPERATIONS,
     FOLDER_REVEAL_OPERATIONS,
     TOOL_OPERATIONS,
     WINDOW_MIN_SIZE,
     MergeFilesDialog,
     VictorPdfToolsQt,
+    document_tab_title,
     preferred_window_geometry,
     reveal_output,
 )
@@ -31,7 +33,7 @@ class QtAppTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
-        self.temp_dir = tempfile.TemporaryDirectory()
+        self.temp_dir = tempfile.TemporaryDirectory(ignore_cleanup_errors=True)
         self.source = Path(self.temp_dir.name) / "source.pdf"
         self.second_source = Path(self.temp_dir.name) / "second.pdf"
         writer = PdfWriter()
@@ -45,6 +47,25 @@ class QtAppTests(unittest.TestCase):
             second_writer.write(stream)
 
     def tearDown(self):
+        import gc
+
+        app = QApplication.instance()
+        if app is not None:
+            for widget in list(app.topLevelWidgets()):
+                if isinstance(widget, VictorPdfToolsQt):
+                    for workspace in widget.workspaces.values():
+                        workspace["generation"] = workspace.get("generation", 0) + 1
+                        workspace["pending"] = []
+                        workspace["pending_rest"] = []
+                    widget.release_all_pdfium_documents()
+                    widget.close()
+            for widget in list(app.allWidgets()):
+                if isinstance(widget, DocumentWorkspace):
+                    widget._thumb_generation += 1
+                    widget._thumb_timer.stop()
+                    widget._close_pdfium_doc()
+            app.processEvents()
+        gc.collect()
         self.temp_dir.cleanup()
 
     def test_preferred_window_geometry_fits_available_screen(self):
@@ -101,7 +122,7 @@ class QtAppTests(unittest.TestCase):
 
         self.assertIn("Page 1", window.page_grid.item(0).text())
         self.assertIn("原頁 1", window.page_grid.item(0).text())
-        self.assertIn("source.pdf", window.page_grid.item(0).text())
+        self.assertNotIn("source.pdf", window.page_grid.item(0).text())
 
     def test_cut_and_paste_pages_across_tabs(self):
         window = VictorPdfToolsQt()
@@ -176,6 +197,23 @@ class QtAppTests(unittest.TestCase):
 
         self.assertEqual(len(window.page_items), 2)
         self.assertEqual(window.stats_label.text(), "總頁數：2　已選取：0")
+
+    def test_multiple_pdfs_create_visible_short_tabs(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.add_files_from_paths([str(self.second_source)])
+        self.assertEqual(window.main_tabs.currentIndex(), 0)
+        self.assertEqual(window.document_tabs.count(), 2)
+        self.assertFalse(window.document_tabs.tabBar().isHidden())
+        self.assertEqual(window.document_tabs.tabText(0), "source.pdf")
+        self.assertEqual(window.document_tabs.tabText(1), "second.pdf")
+
+    def test_document_tab_title_shortens_long_names(self):
+        long_name = "深圳投資2025年合併審計報告-信會師報字[2026]第ZI21041號.pdf"
+        title = document_tab_title(long_name)
+        self.assertLessEqual(len(title), 18)
+        self.assertTrue(title.endswith(".pdf"))
+        self.assertIn("…", title)
 
     def test_all_tab_page_items_merges_tabs_in_tab_order(self):
         window = VictorPdfToolsQt()
@@ -540,22 +578,21 @@ class QtAppTests(unittest.TestCase):
             },
         )
 
-    def test_document_workspace_tab_is_first_tab(self):
+    def test_organize_tab_is_first_tab(self):
         window = VictorPdfToolsQt()
         main_tabs = window.main_tabs
-        self.assertEqual(main_tabs.tabText(0), "文件工作台")
-        self.assertIs(main_tabs.widget(0), window.document_workspace)
+        self.assertEqual(main_tabs.tabText(0), "組織")
+        self.assertEqual(main_tabs.currentIndex(), 0)
+        self.assertIsNotNone(window.page_grid)
 
-    def test_advanced_tabs_nested_under_one_main_tab(self):
+    def test_main_tabs_flat_structure(self):
         window = VictorPdfToolsQt()
         main_tabs = window.main_tabs
         main_texts = [main_tabs.tabText(index) for index in range(main_tabs.count())]
-        self.assertEqual(main_texts[:3], ["文件工作台", "組織 / 擷取", "常用 PDF 工具"])
-        self.assertIn("進階分頁", main_texts)
-        advanced_index = main_texts.index("進階分頁")
-        advanced_tabs = main_tabs.widget(advanced_index)
+        self.assertEqual(main_texts, ["組織", "文件工作台", "常用工具", "進階"])
+        advanced_tabs = window.advanced_tabs
         self.assertIsInstance(advanced_tabs, QTabWidget)
-        nested_texts = [advanced_tabs.tabText(index) for index in range(advanced_tabs.count())]
+        advanced_texts = [advanced_tabs.tabText(index) for index in range(advanced_tabs.count())]
         for expected in (
             "文字標註 / 覆蓋",
             "螢光 / 圖形註解",
@@ -563,7 +600,31 @@ class QtAppTests(unittest.TestCase):
             "文字編輯 Beta",
             "書籤 / 目錄",
         ):
-            self.assertIn(expected, nested_texts)
+            self.assertIn(expected, advanced_texts)
+        workspace_tab = main_tabs.widget(1)
+        self.assertIs(workspace_tab.findChild(DocumentWorkspace), window.document_workspace)
+
+    def test_document_workspace_single_page_preview(self):
+        workspace = DocumentWorkspace()
+        self.assertTrue(hasattr(workspace, "preview_widget"))
+        self.assertTrue(hasattr(workspace, "preview_scroll"))
+        workspace.open_path(self.source)
+        self.assertEqual(workspace.page_count, 2)
+        self.assertIs(workspace.preview_scroll.widget(), workspace.preview_widget)
+
+    def test_document_workspace_open_does_not_create_all_page_widgets(self):
+        big_pdf = Path(self.temp_dir.name) / "big.pdf"
+        writer = PdfWriter()
+        for _ in range(100):
+            writer.add_blank_page(width=300, height=400)
+        with big_pdf.open("wb") as stream:
+            writer.write(stream)
+
+        workspace = DocumentWorkspace()
+        workspace.open_path(big_pdf)
+        self.assertEqual(workspace.page_count, 100)
+        self.assertEqual(workspace.thumb_list.count(), 100)
+        self.assertIs(workspace.preview_scroll.widget(), workspace.preview_widget)
 
     def test_document_workspace_lazy_thumbnails_create_page_items(self):
         workspace = DocumentWorkspace()
@@ -571,6 +632,73 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(workspace.thumb_list.count(), 2)
         self.assertEqual(workspace.thumb_list.item(0).text(), "第 1 頁")
         self.assertEqual(workspace.thumb_list.item(1).text(), "第 2 頁")
+
+    def test_document_workspace_thumb_panel_is_wide_enough(self):
+        from document_workspace import THUMB_PANEL_MIN_WIDTH, THUMB_PANEL_MAX_WIDTH
+
+        workspace = DocumentWorkspace()
+        self.assertGreaterEqual(workspace.left_tabs.minimumWidth(), THUMB_PANEL_MIN_WIDTH)
+        self.assertGreaterEqual(workspace.left_tabs.maximumWidth(), THUMB_PANEL_MAX_WIDTH - 1)
+        self.assertGreaterEqual(workspace.thumb_list.iconSize().width(), 140)
+
+    def test_document_workspace_accepts_pdf_drop(self):
+        from PySide6.QtCore import QMimeData, QPoint, QUrl
+        from PySide6.QtGui import QDropEvent
+
+        workspace = DocumentWorkspace()
+        received: list[list[str]] = []
+        workspace.files_dropped.connect(lambda paths: received.append(list(paths)))
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(self.source))])
+        event = QDropEvent(
+            QPoint(10, 10),
+            Qt.CopyAction,
+            mime,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+        workspace.dropEvent(event)
+        self.assertEqual(workspace.current_path(), self.source)
+        self.assertEqual(len(received), 1)
+        self.assertEqual([Path(path) for path in received[0]], [self.source])
+
+    def test_main_window_drop_adds_to_organize_by_default(self):
+        from PySide6.QtCore import QMimeData, QPoint, QUrl
+        from PySide6.QtGui import QDropEvent
+
+        window = VictorPdfToolsQt()
+        self.assertEqual(window.main_tabs.currentIndex(), 0)
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(self.source))])
+        event = QDropEvent(
+            QPoint(20, 20),
+            Qt.CopyAction,
+            mime,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+        window.dropEvent(event)
+        self.assertTrue(any(item.pdf_path == self.source for item in window.page_items))
+        self.assertIsNone(window.document_workspace.current_path())
+
+    def test_main_window_drop_on_workspace_also_opens_workspace(self):
+        from PySide6.QtCore import QMimeData, QPoint, QUrl
+        from PySide6.QtGui import QDropEvent
+
+        window = VictorPdfToolsQt()
+        window.main_tabs.setCurrentIndex(1)
+        mime = QMimeData()
+        mime.setUrls([QUrl.fromLocalFile(str(self.source))])
+        event = QDropEvent(
+            QPoint(20, 20),
+            Qt.CopyAction,
+            mime,
+            Qt.LeftButton,
+            Qt.NoModifier,
+        )
+        window.dropEvent(event)
+        self.assertEqual(window.document_workspace.current_path(), self.source)
+        self.assertTrue(any(item.pdf_path == self.source for item in window.page_items))
 
     def test_document_workspace_shortcuts_include_undo_and_page_nav(self):
         workspace = DocumentWorkspace()
@@ -580,6 +708,7 @@ class QtAppTests(unittest.TestCase):
             if not action.shortcut().isEmpty()
         }
         self.assertIn("Ctrl+Z", shortcuts)
+        self.assertIn("Ctrl+S", shortcuts)
         self.assertIn("Left", shortcuts)
         self.assertIn("Right", shortcuts)
         page_keys = [key for key in shortcuts if "pg" in key.lower()]
@@ -596,6 +725,76 @@ class QtAppTests(unittest.TestCase):
         self.assertIn("test_op", content)
         self.assertIn("source.pdf", content)
         self.assertIn("target.pdf", content)
+
+    def test_prioritize_visible_thumbnails_moves_visible_first(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        grid = window.page_grid
+        workspace = window.workspaces[grid]
+        workspace["pending"] = []
+        workspace["pending_rest"] = [0, 1]
+        with patch.object(window, "_visible_item_indexes", return_value=[1]):
+            window._prioritize_visible_thumbnails(grid)
+        self.assertEqual(workspace["pending"], [1])
+        self.assertEqual(workspace["pending_rest"], [0])
+
+    def test_open_current_pdf_in_workspace_switches_tab(self):
+        window = VictorPdfToolsQt()
+        window.add_files_from_paths([str(self.source)])
+        window.open_current_pdf_in_workspace()
+        self.assertEqual(window.main_tabs.currentIndex(), 1)
+        self.assertEqual(window.document_workspace.current_path(), self.source)
+
+    def test_workspace_save_applies_pending_markups_in_place(self):
+        workspace = DocumentWorkspace()
+        workspace.open_path(self.source)
+        workspace.markup_items.append((0, MarkupAnnotation("rect", 10, 20, 80, 90)))
+        workspace.save_pdf()
+        self.assertEqual(workspace.markup_items, [])
+        annots = PdfReader(str(self.source)).pages[0].get("/Annots")
+        self.assertIsNotNone(annots)
+        self.assertGreaterEqual(len(annots), 1)
+
+    def test_workspace_save_copy_writes_new_file(self):
+        workspace = DocumentWorkspace()
+        workspace.open_path(self.source)
+        target = Path(self.temp_dir.name) / "copy.pdf"
+        with patch("document_workspace.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            workspace.save_pdf_copy()
+        self.assertTrue(target.exists())
+        self.assertEqual(len(PdfReader(str(target)).pages), 2)
+
+    def test_audit_log_read_newest_first_and_dialog_rows(self):
+        from audit_log import append_audit_event, read_audit_events
+
+        log_path = Path(self.temp_dir.name) / "audit.log"
+        with patch("audit_log.audit_log_path", return_value=log_path):
+            append_audit_event("first", "a.pdf", "b.pdf", "ok")
+            append_audit_event("second", "c.pdf", "d.pdf", "ok")
+            events = read_audit_events(10)
+        self.assertEqual(events[0].operation, "second")
+        self.assertEqual(events[1].operation, "first")
+        with patch("qt_app.read_audit_events", return_value=events):
+            dialog = AuditLogDialog()
+            self.assertEqual(dialog.table.rowCount(), 2)
+            self.assertEqual(dialog.table.item(0, 1).text(), "second")
+        dialog.close()
+
+    def test_stamp_library_add_and_delete(self):
+        from PIL import Image
+
+        from stamp_library import add_library_stamp, delete_library_stamp, list_library_stamps
+
+        library = Path(self.temp_dir.name) / "stamps"
+        library.mkdir()
+        image_path = Path(self.temp_dir.name) / "approved.png"
+        Image.new("RGB", (40, 20), "red").save(image_path)
+        with patch("stamp_library.stamp_library_dir", return_value=library):
+            dest = add_library_stamp(image_path)
+            self.assertTrue(dest.exists())
+            self.assertEqual(list_library_stamps(), [dest])
+            delete_library_stamp(dest)
+            self.assertEqual(list_library_stamps(), [])
 
     def test_document_workspace_can_be_constructed(self):
         workspace = DocumentWorkspace()
@@ -635,6 +834,8 @@ class QtAppTests(unittest.TestCase):
         workspace.open_path(self.source)
         workspace.preview_image = _white_image(300, 400)
         workspace.page_size = (300.0, 400.0)
+        workspace.page_images[0] = workspace.preview_image
+        workspace.page_sizes[0] = workspace.page_size
         workspace.signature_image_path = self.source
         workspace.interaction = "signature"
         workspace._set_signature_rect_from_drag(QPoint(60, 100), QPoint(240, 300))
@@ -668,6 +869,7 @@ class QtAppTests(unittest.TestCase):
             "replace_pages",
             "compress_advanced",
             "compare_text",
+            "compare_visual",
             "split_bookmarks",
             "stamp_image",
             "text_stamp",
