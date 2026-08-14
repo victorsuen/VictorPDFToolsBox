@@ -63,7 +63,9 @@ from pdf_core import (
     merge_text_blocks,
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
+    pdf_to_docx,
     pdf_to_images,
+    pdf_to_xlsx,
     redact_matching_text_blocks_overlay,
     redact_text_block_secure,
     redact_text_block_overlay,
@@ -1594,6 +1596,58 @@ class PdfToolsTests(unittest.TestCase):
         self.assertEqual(filled[0].value, "Bob")
         flattened = Path(self.temp_dir.name) / "form-flat.pdf"
         self.assertGreaterEqual(flatten_form_fields(target, flattened), 1)
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_docx_from_text_layer(self):
+        import fitz
+        from docx import Document
+
+        source = Path(self.temp_dir.name) / "report.pdf"
+        target = Path(self.temp_dir.name) / "report.docx"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=500)
+        page.insert_text((72, 72), "Quarterly contracted sales")
+        doc.save(str(source))
+        doc.close()
+
+        with patch("pdf_core._pdf_to_docx_via_word", return_value=(False, "skip")):
+            with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
+                with patch("pdf_core._pdf2docx_available", return_value=False):
+                    pages, method = pdf_to_docx(source, target)
+
+        self.assertEqual(pages, 1)
+        self.assertEqual(method, "text")
+        self.assertTrue(target.exists())
+        texts = [paragraph.text for paragraph in Document(str(target)).paragraphs]
+        self.assertTrue(any("Quarterly contracted sales" in text for text in texts))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_xlsx_writes_text_sheet(self):
+        import fitz
+        from openpyxl import load_workbook
+
+        source = Path(self.temp_dir.name) / "figures.pdf"
+        target = Path(self.temp_dir.name) / "figures.xlsx"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=500)
+        page.insert_text((72, 72), "Alpha 100")
+        page.insert_text((72, 96), "Beta 200")
+        doc.save(str(source))
+        doc.close()
+
+        pages, method = pdf_to_xlsx(source, target)
+
+        self.assertEqual(pages, 1)
+        self.assertIn(method, {"tables", "text"})
+        self.assertTrue(target.exists())
+        values = [cell.value for row in load_workbook(target).active.iter_rows() for cell in row]
+        self.assertTrue(any(value and "Alpha" in str(value) for value in values))
 
     def setUp(self):
         import tempfile

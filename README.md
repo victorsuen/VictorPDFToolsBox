@@ -88,8 +88,10 @@
 
 ## 建議後續功能
 
-- OCR、PDF 轉 Word、電子簽名等高階功能（需先評估授權）
+- 電子簽名等高階功能（需先評估授權）
 - 自動清理暫存 workspace 排程
+
+`feature/pdf-to-office` 分枝已加入本機 **PDF 轉 Word**、**PDF 轉 Excel**（常用工具；不取代 v0.8.1 桌面 EXE）。有 Microsoft Word 時優先用 Word 開 PDF 另存；否則抽取文字層／表格。掃描件需本機 Tesseract OCR。轉換結果是可再編輯草稿，版面不會與 Adobe 完全一致。
 
 公司內部本機 PDF 工具箱，目標是提供接近常見 PDF 軟件的日常功能，同時避免把上市公司財務資料、審計文件或個人資料上傳到外部服務。
 
@@ -106,6 +108,7 @@
 - 抽取 PDF 文字
 - 圖片轉 PDF
 - Word / Excel / PowerPoint 轉 PDF（需本機 Microsoft Office 或 LibreOffice）
+- PDF 轉 Word / Excel（`feature/pdf-to-office` 分枝：本機轉換，掃描件需 OCR）
 - PDF 轉圖片（PNG / JPG / WEBP，可指定頁碼與 DPI）
 - OCR 抽文字（掃描 PDF → TXT）
 - 掃描 PDF 轉可搜尋 PDF（加入 OCR 文字層）

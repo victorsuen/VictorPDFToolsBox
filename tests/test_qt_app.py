@@ -761,6 +761,8 @@ class QtAppTests(unittest.TestCase):
                 "pdf_to_images",
                 "compare_text",
                 "split_bookmarks",
+                "pdf_to_word",
+                "pdf_to_excel",
             },
         )
 
@@ -1095,6 +1097,8 @@ class QtAppTests(unittest.TestCase):
             "flatten_forms",
             "search_markup",
             "secure_redact",
+            "pdf_to_word",
+            "pdf_to_excel",
         ):
             self.assertIn(key, slugs)
         self.assertNotIn("office_to_pdf", slugs)
@@ -1164,7 +1168,7 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.office_progress.value(), 100)
 
     def test_batchable_operations_cover_common_tools(self):
-        for expected in ("rotate", "compress", "watermark", "add_page_numbers", "clean_metadata"):
+        for expected in ("rotate", "compress", "watermark", "add_page_numbers", "clean_metadata", "pdf_to_word", "pdf_to_excel"):
             self.assertIn(expected, BATCHABLE_OPERATIONS)
         self.assertNotIn("merge", BATCHABLE_OPERATIONS)
 
@@ -2264,6 +2268,35 @@ class QtAppTests(unittest.TestCase):
                     window.save_text_edit_pdf()
 
         self.assertEqual(window.text_edit_pdf_path, target)
+
+    def test_pdf_to_word_and_excel_tools_write_office_files(self):
+        import fitz
+
+        window = VictorPdfToolsQt()
+        source = Path(self.temp_dir.name) / "office-source.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=500)
+        page.insert_text((72, 72), "Contracted sales 2026")
+        doc.save(str(source))
+        doc.close()
+        window.tool_file_items = [source]
+        word_target = Path(self.temp_dir.name) / "out.docx"
+        excel_target = Path(self.temp_dir.name) / "out.xlsx"
+
+        window.tool_operation.setCurrentIndex(window.tool_operation.findData("pdf_to_word"))
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(word_target), "Word files (*.docx)")):
+            with patch("pdf_core._pdf_to_docx_via_word", return_value=(False, "skip")):
+                with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
+                    with patch("pdf_core._pdf2docx_available", return_value=False):
+                        window.run_tool_operation()
+        self.assertTrue(word_target.exists())
+        self.assertIn("Word", window.statusBar().currentMessage())
+
+        window.tool_operation.setCurrentIndex(window.tool_operation.findData("pdf_to_excel"))
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(excel_target), "Excel files (*.xlsx)")):
+            window.run_tool_operation()
+        self.assertTrue(excel_target.exists())
+        self.assertIn("Excel", window.statusBar().currentMessage())
 
 
 def _white_image(width: int, height: int):

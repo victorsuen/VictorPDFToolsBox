@@ -117,7 +117,9 @@ from pdf_core import (
     merge_pdf_files,
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
+    pdf_to_docx,
     pdf_to_images,
+    pdf_to_xlsx,
     open_reader,
     paint_callout_markup,
     page_item_label,
@@ -158,6 +160,8 @@ TOOL_OPERATIONS = [
     ("extract_text", "抽取文字"),
     ("ocr_text", "OCR 抽文字"),
     ("ocr_searchable_pdf", "掃描 PDF 轉可搜尋 PDF"),
+    ("pdf_to_word", "PDF 轉 Word"),
+    ("pdf_to_excel", "PDF 轉 Excel"),
     ("images_to_pdf", "圖片轉 PDF"),
     ("pdf_to_images", "PDF 轉圖片"),
     ("info", "PDF 資訊"),
@@ -215,6 +219,8 @@ FOLDER_REVEAL_OPERATIONS = frozenset(
         "ocr_text",
         "info",
         "pdf_to_images",
+        "pdf_to_word",
+        "pdf_to_excel",
         "compare_text",
         "split_bookmarks",
     }
@@ -243,12 +249,26 @@ BATCHABLE_OPERATIONS = frozenset(
         "extract",
         "ocr_text",
         "ocr_searchable_pdf",
+        "pdf_to_word",
+        "pdf_to_excel",
     }
 )
 
 SETTINGS_ORG = "VictorSuen"
 SETTINGS_APP = "VictorPDFToolsBox"
 DOCUMENT_TAB_TITLE_MAX = 18
+
+
+def tool_output_extension(operation: str) -> str:
+    if operation == "pdf_to_word":
+        return ".docx"
+    if operation == "pdf_to_excel":
+        return ".xlsx"
+    if operation in {"extract_text", "ocr_text", "info", "compare_text"}:
+        return ".txt"
+    if operation in {"split", "split_advanced", "split_bookmarks"}:
+        return ".zip"
+    return ".pdf"
 
 
 def document_tab_title(name: str, max_chars: int = DOCUMENT_TAB_TITLE_MAX) -> str:
@@ -2301,6 +2321,7 @@ class VictorPdfToolsQt(QMainWindow):
         hint = QLabel(
             "提示：可把 PDF / 圖片直接拖入左側清單。合併 / 圖片轉 PDF 本身支援多檔；"
             "其餘工具預設用第一個 PDF。勾選「批次處理」後，旋轉／壓縮／浮水印／頁碼／加密等會對清單每個 PDF 各輸出一份到資料夾。"
+            "「PDF 轉 Word / Excel」會在本機轉換（有 Microsoft Word 時優先用 Word；否則抽取文字與表格）。掃描件需本機 OCR。"
             "Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁。"
         )
         hint.setObjectName("muted")
@@ -7093,7 +7114,7 @@ class VictorPdfToolsQt(QMainWindow):
         return len(self._batch_sources()) > 1
 
     def _batch_output_path(self, source: Path, folder: Path, operation: str) -> Path:
-        extension = ".txt" if operation in {"extract_text", "ocr_text", "info"} else ".pdf"
+        extension = tool_output_extension(operation)
         return folder / safe_output_name(f"{source.stem}_{operation}{extension}")
 
     def watermark_options(self) -> dict:
@@ -7190,14 +7211,18 @@ class VictorPdfToolsQt(QMainWindow):
                     return
                 target_path = Path(folder)
         else:
-            extension = ".txt" if operation in {"extract_text", "ocr_text", "info", "compare_text"} else ".pdf"
-            if operation in {"split", "split_advanced", "split_bookmarks"}:
-                extension = ".zip"
+            extension = tool_output_extension(operation)
+            dialog_filter = {
+                ".docx": "Word files (*.docx)",
+                ".xlsx": "Excel files (*.xlsx)",
+                ".txt": "Text files (*.txt)",
+                ".zip": "ZIP files (*.zip)",
+            }.get(extension, f"Output files (*{extension})")
             target, _ = QFileDialog.getSaveFileName(
                 self,
                 "另存輸出檔案",
                 safe_output_name(f"{operation}{extension}"),
-                f"Output files (*{extension})",
+                dialog_filter,
             )
             if not target:
                 return
@@ -7337,6 +7362,36 @@ class VictorPdfToolsQt(QMainWindow):
                 dpi=int(self.tool_image_dpi_combo.currentText()),
             )
             self._last_tool_status_message = f"已產生 {page_count} 頁可搜尋 PDF。"
+            return
+        elif operation == "pdf_to_word":
+            page_count, method = pdf_to_docx(
+                source,
+                target_path,
+                password,
+                pages_spec=self.tool_pages_input.text(),
+                language=self.tool_ocr_language_combo.currentData() or "eng+chi_tra",
+                dpi=int(self.tool_image_dpi_combo.currentText() or "200"),
+            )
+            method_label = {
+                "word": "Microsoft Word",
+                "libreoffice": "LibreOffice",
+                "pdf2docx": "版面重建",
+                "text": "文字層",
+                "ocr": "OCR",
+            }.get(method, method)
+            self._last_tool_status_message = f"已把 {page_count} 頁轉成 Word（{method_label}）。"
+            return
+        elif operation == "pdf_to_excel":
+            page_count, method = pdf_to_xlsx(
+                source,
+                target_path,
+                password,
+                pages_spec=self.tool_pages_input.text(),
+                language=self.tool_ocr_language_combo.currentData() or "eng+chi_tra",
+                dpi=int(self.tool_image_dpi_combo.currentText() or "200"),
+            )
+            method_label = {"tables": "偵測表格", "text": "文字層", "ocr": "OCR"}.get(method, method)
+            self._last_tool_status_message = f"已把 {page_count} 頁轉成 Excel（{method_label}）。"
             return
         elif operation == "info":
             write_pdf_info(source, target_path, password)

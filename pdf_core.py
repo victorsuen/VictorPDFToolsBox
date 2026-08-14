@@ -6,6 +6,7 @@ import math
 import re
 import shutil
 import subprocess
+import sys
 import tempfile
 import threading
 import zipfile
@@ -510,6 +511,378 @@ def extract_pdf_text(source: Path, target: Path, password: str = "") -> None:
         text = page.extract_text() or ""
         pieces.append(f"--- Page {index} ---\n{text.strip()}\n")
     target.write_text("\n".join(pieces), encoding="utf-8")
+
+
+def _page_indexes_or_all(source: Path, password: str = "", pages_spec: str = "") -> list[int]:
+    reader = open_reader(source, password)
+    if (pages_spec or "").strip():
+        return parse_pages(pages_spec, len(reader.pages))
+    return list(range(len(reader.pages)))
+
+
+def _pdf_extractable_char_count(source: Path, password: str = "", pages_spec: str = "") -> int:
+    reader = open_reader(source, password)
+    indexes = _page_indexes_or_all(source, password, pages_spec)
+    total = 0
+    for index in indexes:
+        total += len((reader.pages[index].extract_text() or "").strip())
+    return total
+
+
+def _write_unlocked_pdf_copy(source: Path, password: str = "") -> Path:
+    reader = open_reader(source, password)
+    if not getattr(reader, "is_encrypted", False) and not password:
+        return source
+    handle = tempfile.NamedTemporaryFile(suffix=".pdf", delete=False)
+    handle.close()
+    target = Path(handle.name)
+    writer = PdfWriter()
+    for page in reader.pages:
+        writer.add_page(page)
+    write_pdf(writer, target)
+    return target
+
+
+def _docx_available() -> bool:
+    try:
+        import docx  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _xlsx_available() -> bool:
+    try:
+        import openpyxl  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _pdf2docx_available() -> bool:
+    try:
+        from pdf2docx import Converter  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _pdf_to_docx_via_word(source: Path, target: Path) -> tuple[bool, str]:
+    if sys.platform != "win32":
+        return False, "not-windows"
+    try:
+        import pythoncom
+        import win32com.client
+    except ImportError:
+        return False, "no-com"
+    initialized = False
+    word = None
+    document = None
+    try:
+        pythoncom.CoInitialize()
+        initialized = True
+        word = _dispatch_com_app(win32com.client, ("Word.Application", "Word.Application.16"))
+        try:
+            word.Visible = False
+        except Exception:
+            pass
+        try:
+            word.DisplayAlerts = 0
+        except Exception:
+            pass
+        document = _try_com_call(
+            lambda: word.Documents.Open(str(source.resolve()), False, True, False),
+            lambda: word.Documents.Open(str(source.resolve())),
+        )
+        target.parent.mkdir(parents=True, exist_ok=True)
+        _try_com_call(
+            lambda: document.SaveAs2(str(target.resolve()), 16),
+            lambda: document.SaveAs(str(target.resolve()), 16),
+        )
+        if target.is_file() and target.stat().st_size > 0:
+            return True, "word"
+        return False, "empty-output"
+    except Exception as exc:
+        return False, str(exc) or type(exc).__name__
+    finally:
+        if document is not None:
+            try:
+                document.Close(False)
+            except Exception:
+                pass
+        if word is not None:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+        if initialized:
+            try:
+                pythoncom.CoUninitialize()
+            except Exception:
+                pass
+
+
+def _pdf_to_office_via_libreoffice(source: Path, target: Path, convert_to: str) -> tuple[bool, str]:
+    executable = find_libreoffice_executable()
+    if executable is None:
+        return False, "no-libreoffice"
+    with tempfile.TemporaryDirectory() as temp_dir:
+        out_dir = Path(temp_dir)
+        command = [
+            str(executable),
+            "--headless",
+            "--norestore",
+            "--nolockcheck",
+            "--convert-to",
+            convert_to,
+            "--outdir",
+            str(out_dir),
+            str(source.resolve()),
+        ]
+        try:
+            subprocess.run(command, capture_output=True, timeout=180, check=False)
+        except Exception as exc:
+            return False, str(exc)
+        produced = out_dir / f"{source.stem}.{convert_to}"
+        if not produced.exists():
+            matches = list(out_dir.glob(f"*.{convert_to}"))
+            produced = matches[0] if matches else produced
+        if not produced.exists() or produced.stat().st_size <= 0:
+            return False, "empty-output"
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(produced, target)
+        return True, "libreoffice"
+
+
+def _write_docx_from_text_blocks(
+    source: Path,
+    target: Path,
+    password: str = "",
+    pages_spec: str = "",
+) -> None:
+    from docx import Document
+    from docx.shared import Pt
+
+    indexes = _page_indexes_or_all(source, password, pages_spec)
+    document = Document()
+    for offset, page_index in enumerate(indexes):
+        if offset:
+            document.add_page_break()
+        blocks = extract_page_text_blocks(source, page_index, password)
+        if not blocks:
+            reader = open_reader(source, password)
+            text = (reader.pages[page_index].extract_text() or "").strip()
+            if text:
+                for line in text.splitlines():
+                    if line.strip():
+                        document.add_paragraph(line.strip())
+            else:
+                document.add_paragraph("（此頁沒有可抽取的文字）")
+            continue
+        for block in blocks:
+            paragraph = document.add_paragraph((block.text or "").strip())
+            if paragraph.runs:
+                size = max(8.0, min(float(block.font_size or 12.0), 36.0))
+                paragraph.runs[0].font.size = Pt(size)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    document.save(str(target))
+
+
+def _write_docx_from_ocr(
+    source: Path,
+    target: Path,
+    password: str = "",
+    pages_spec: str = "",
+    language: str = "eng+chi_tra",
+    dpi: int = 200,
+) -> int:
+    from docx import Document
+
+    handle = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
+    handle.close()
+    text_path = Path(handle.name)
+    try:
+        page_count = ocr_pdf_to_text(source, text_path, password, language, pages_spec, dpi)
+        document = Document()
+        for paragraph in text_path.read_text(encoding="utf-8").splitlines():
+            if paragraph.strip():
+                document.add_paragraph(paragraph.strip())
+        target.parent.mkdir(parents=True, exist_ok=True)
+        document.save(str(target))
+        return page_count
+    finally:
+        text_path.unlink(missing_ok=True)
+
+
+def pdf_to_docx(
+    source: Path,
+    target: Path,
+    password: str = "",
+    pages_spec: str = "",
+    language: str = "eng+chi_tra",
+    dpi: int = 200,
+) -> tuple[int, str]:
+    if not _docx_available():
+        raise ValueError("PDF 轉 Word 需要安裝 python-docx。")
+    indexes = _page_indexes_or_all(source, password, pages_spec)
+    if not indexes:
+        raise ValueError("沒有可轉換的頁面。")
+    unlocked = _write_unlocked_pdf_copy(source, password)
+    try:
+        char_count = _pdf_extractable_char_count(unlocked, "", pages_spec)
+        if char_count >= 20 and not (pages_spec or "").strip():
+            ok, _reason = _pdf_to_docx_via_word(unlocked, target)
+            if ok:
+                return len(indexes), "word"
+            ok, _reason = _pdf_to_office_via_libreoffice(unlocked, target, "docx")
+            if ok:
+                return len(indexes), "libreoffice"
+            if _pdf2docx_available():
+                from pdf2docx import Converter
+
+                converter = Converter(str(unlocked))
+                try:
+                    converter.convert(str(target))
+                finally:
+                    converter.close()
+                if target.is_file() and target.stat().st_size > 0:
+                    return len(indexes), "pdf2docx"
+        if char_count >= 8:
+            _write_docx_from_text_blocks(source, target, password, pages_spec)
+            return len(indexes), "text"
+        page_count = _write_docx_from_ocr(source, target, password, pages_spec, language, dpi)
+        return page_count, "ocr"
+    finally:
+        if unlocked != source:
+            unlocked.unlink(missing_ok=True)
+
+
+def _extract_pdf_tables(
+    source: Path,
+    password: str = "",
+    pages_spec: str = "",
+) -> list[tuple[int, list[list[str]]]]:
+    if not PYMUPDF_AVAILABLE or fitz is None:
+        return []
+    indexes = _page_indexes_or_all(source, password, pages_spec)
+    document = fitz.open(str(source))
+    tables: list[tuple[int, list[list[str]]]] = []
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        for page_index in indexes:
+            page = document[page_index]
+            try:
+                finder = page.find_tables()
+            except Exception:
+                continue
+            found = getattr(finder, "tables", None) or []
+            for table in found:
+                try:
+                    raw_rows = table.extract()
+                except Exception:
+                    continue
+                rows = [[("" if cell is None else str(cell).replace("\n", " ").strip()) for cell in row] for row in raw_rows]
+                if any(any(cell for cell in row) for row in rows):
+                    tables.append((page_index, rows))
+    finally:
+        document.close()
+    return tables
+
+
+def _write_xlsx_tables(tables: list[tuple[int, list[list[str]]]], target: Path) -> None:
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    first = True
+    used_names: set[str] = set()
+    for offset, (page_index, rows) in enumerate(tables, start=1):
+        base = f"P{page_index + 1}_T{offset}"
+        name = base[:31]
+        suffix = 2
+        while name in used_names:
+            name = f"{base[:28]}_{suffix}"[:31]
+            suffix += 1
+        used_names.add(name)
+        sheet = workbook.active if first else workbook.create_sheet(title=name)
+        if first:
+            sheet.title = name
+            first = False
+        for row_index, row in enumerate(rows, start=1):
+            for column_index, value in enumerate(row, start=1):
+                sheet.cell(row_index, column_index, value)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(str(target))
+
+
+def _write_xlsx_from_text(
+    source: Path,
+    target: Path,
+    password: str = "",
+    pages_spec: str = "",
+    lines: list[str] | None = None,
+) -> None:
+    from openpyxl import Workbook
+
+    workbook = Workbook()
+    sheet = workbook.active
+    sheet.title = "Text"
+    row_index = 1
+    if lines is None:
+        indexes = _page_indexes_or_all(source, password, pages_spec)
+        reader = open_reader(source, password)
+        for page_index in indexes:
+            sheet.cell(row_index, 1, f"--- Page {page_index + 1} ---")
+            row_index += 1
+            text = reader.pages[page_index].extract_text() or ""
+            for line in text.splitlines():
+                if line.strip():
+                    sheet.cell(row_index, 1, line.strip())
+                    row_index += 1
+            row_index += 1
+    else:
+        for line in lines:
+            if line.strip():
+                sheet.cell(row_index, 1, line.strip())
+                row_index += 1
+    target.parent.mkdir(parents=True, exist_ok=True)
+    workbook.save(str(target))
+
+
+def pdf_to_xlsx(
+    source: Path,
+    target: Path,
+    password: str = "",
+    pages_spec: str = "",
+    language: str = "eng+chi_tra",
+    dpi: int = 200,
+) -> tuple[int, str]:
+    if not _xlsx_available():
+        raise ValueError("PDF 轉 Excel 需要安裝 openpyxl。")
+    indexes = _page_indexes_or_all(source, password, pages_spec)
+    if not indexes:
+        raise ValueError("沒有可轉換的頁面。")
+    tables = _extract_pdf_tables(source, password, pages_spec)
+    if tables:
+        _write_xlsx_tables(tables, target)
+        return len(indexes), "tables"
+    if _pdf_extractable_char_count(source, password, pages_spec) >= 8:
+        _write_xlsx_from_text(source, target, password, pages_spec)
+        return len(indexes), "text"
+    handle = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
+    handle.close()
+    text_path = Path(handle.name)
+    try:
+        page_count = ocr_pdf_to_text(source, text_path, password, language, pages_spec, dpi)
+        lines = text_path.read_text(encoding="utf-8").splitlines()
+        _write_xlsx_from_text(source, target, password, pages_spec, lines=lines)
+        return page_count, "ocr"
+    finally:
+        text_path.unlink(missing_ok=True)
 
 
 def write_pdf_info(source: Path, target: Path, password: str = "") -> None:
