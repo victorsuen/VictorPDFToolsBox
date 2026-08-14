@@ -31,6 +31,7 @@ from PySide6.QtWidgets import (
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMessageBox,
@@ -47,6 +48,7 @@ from PySide6.QtWidgets import (
 )
 
 from audit_log import append_audit_event
+from flow_layout import FlowLayout, prevent_button_clip
 from stamp_library import add_library_stamp, delete_library_stamp, list_library_stamps
 from pdf_core import (
     MARKUP_COLOR_PRESETS,
@@ -62,6 +64,8 @@ from pdf_core import (
     apply_markup_annotations,
     apply_outline,
     apply_text_markups_for_query,
+    CALLOUT_KINDS,
+    paint_callout_markup,
     compress_pdf_advanced,
     compare_pdf_text,
     compare_pdf_visual,
@@ -85,10 +89,10 @@ from pdf_core import (
 
 PREVIEW_MAX_WIDTH = 760
 PREVIEW_MAX_HEIGHT = 760
-THUMB_MAX_SIZE = (160, 210)
-THUMB_ICON_SIZE = QSize(160, 210)
-THUMB_PANEL_MIN_WIDTH = 300
-THUMB_PANEL_MAX_WIDTH = 360
+THUMB_MAX_SIZE = (148, 190)
+THUMB_ICON_SIZE = QSize(148, 190)
+THUMB_PANEL_MIN_WIDTH = 240
+THUMB_PANEL_MAX_WIDTH = 300
 THUMB_BATCH_SIZE = 6
 THUMB_BATCH_DELAY_MS = 40
 ZOOM_MIN = 0.5
@@ -235,6 +239,9 @@ MARKUP_TOOL_OPTIONS = [
     ("ellipse", "橢圓框"),
     ("line", "直線"),
     ("arrow", "箭頭"),
+    ("callout", "標註框（帶指引線）"),
+    ("speech", "對話框"),
+    ("cloud", "雲朵標註"),
     ("note", "便利貼"),
 ]
 
@@ -290,24 +297,40 @@ class DocumentWorkspace(QWidget):
         self._thumb_timer.timeout.connect(self._render_next_thumb_batch)
         self._pdfium_doc = None
         self._pdfium_doc_path: Path | None = None
+        self._thumb_placeholder_icon = QIcon(
+            QPixmap.fromImage(ImageQt(_placeholder_image(THUMB_MAX_SIZE[0], THUMB_MAX_SIZE[1], "PDF")))
+        )
         self._build_ui()
         self._install_shortcuts()
+
+    def showEvent(self, event) -> None:
+        super().showEvent(event)
+        self._relayout_thumbnails()
+
+    def _relayout_thumbnails(self) -> None:
+        if self.thumb_list.count() <= 0:
+            return
+        self.thumb_list.doItemsLayout()
+        current = self.thumb_list.item(self.current_page)
+        if current is not None:
+            self.thumb_list.scrollToItem(current)
+        self._on_thumb_scrolled()
+        self._schedule_thumb_batch()
 
     def _build_ui(self) -> None:
         root = QVBoxLayout(self)
         root.setContentsMargins(0, 8, 0, 0)
         root.setSpacing(8)
 
-        top = QHBoxLayout()
+        toolbar = QWidget()
+        top = FlowLayout(toolbar, margin=0, hspacing=6, vspacing=6)
         brand = QLabel("Victor PDF Tools")
         brand.setStyleSheet("font-weight: 600;")
         top.addWidget(brand)
-        top.addSpacing(10)
         self.add_button(top, "開啟 PDF...", self.choose_pdf)
         self.add_button(top, "儲存", self.save_pdf, "primary")
         self.add_button(top, "另存副本...", self.save_pdf_copy)
         self.add_button(top, "復原", self.undo)
-        top.addSpacing(8)
         self.mode_group = QButtonGroup(self)
         self.mode_group.setExclusive(True)
         for index, (mode_id, label) in enumerate(
@@ -323,16 +346,16 @@ class DocumentWorkspace(QWidget):
             button = QPushButton(label)
             button.setCheckable(True)
             button.setProperty("mode_id", mode_id)
+            prevent_button_clip(button)
             if index == 0:
                 button.setChecked(True)
             self.mode_group.addButton(button, index)
             top.addWidget(button)
         self.mode_group.idClicked.connect(self._on_mode_changed)
-        top.addStretch(1)
         self.path_label = QLabel("尚未載入 PDF")
         self.path_label.setObjectName("muted")
         top.addWidget(self.path_label)
-        root.addLayout(top)
+        root.addWidget(toolbar)
 
         body = QHBoxLayout()
         body.setSpacing(10)
@@ -344,16 +367,38 @@ class DocumentWorkspace(QWidget):
         self.left_tabs = left_tabs
 
         self.thumb_list = QListWidget()
-        self.thumb_list.setViewMode(QListWidget.IconMode)
-        self.thumb_list.setIconSize(THUMB_ICON_SIZE)
-        self.thumb_list.setGridSize(QSize(THUMB_ICON_SIZE.width() + 24, THUMB_ICON_SIZE.height() + 36))
-        self.thumb_list.setResizeMode(QListWidget.Adjust)
+        self.thumb_list.setViewMode(QListWidget.ListMode)
+        self.thumb_list.setFlow(QListView.TopToBottom)
+        self.thumb_list.setWrapping(False)
         self.thumb_list.setMovement(QListWidget.Static)
-        self.thumb_list.setSpacing(10)
-        self.thumb_list.setWordWrap(True)
+        self.thumb_list.setIconSize(THUMB_ICON_SIZE)
+        self.thumb_list.setSpacing(8)
         self.thumb_list.setUniformItemSizes(True)
+        self.thumb_list.setWordWrap(True)
+        self.thumb_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         self.thumb_list.setAcceptDrops(False)
         self.thumb_list.viewport().setAcceptDrops(False)
+        self.thumb_list.setStyleSheet(
+            """
+            QListWidget {
+                background: #f7f6f2;
+                border: none;
+                padding: 8px;
+            }
+            QListWidget::item {
+                background: #ffffff;
+                border: 1px solid #d2d2d2;
+                border-radius: 8px;
+                padding: 6px;
+                margin: 4px 2px;
+                color: #222;
+            }
+            QListWidget::item:selected {
+                background: #d9f0ea;
+                border: 2px solid #128576;
+            }
+            """
+        )
         self.thumb_list.currentRowChanged.connect(self._on_thumb_selected)
         self.thumb_list.verticalScrollBar().valueChanged.connect(self._on_thumb_scrolled)
         left_tabs.addTab(self.thumb_list, "縮圖")
@@ -559,7 +604,10 @@ class DocumentWorkspace(QWidget):
         self.read_password_input = QLineEdit()
         self.read_password_input.setEchoMode(QLineEdit.Password)
         layout.addWidget(self.read_password_input)
-        hint = QLabel("搜尋會另存新檔；安全塗銷會永久移除符合文字。")
+        hint = QLabel(
+            "文件工作台用來打開「一份」PDF 閱讀和編輯：左側縮圖換頁，"
+            "上方可切換註解、改字、裁切、簽名。多檔合併、抽頁請用「組織」。"
+        )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -589,9 +637,14 @@ class DocumentWorkspace(QWidget):
         self.markup_color_button.clicked.connect(self._choose_markup_color)
         color_row.addWidget(self.markup_color_button)
         layout.addLayout(color_row)
-        layout.addWidget(QLabel("便利貼 / 註解文字"))
+        layout.addWidget(QLabel("註解文字（標註框 / 對話框 / 便利貼）"))
         self.markup_note_input = QLineEdit()
+        self.markup_note_input.setPlaceholderText("例如：請核對此數字")
         layout.addWidget(self.markup_note_input)
+        hint = QLabel("標註框／對話框／雲朵：從要指出的位置拖到文字框；便利貼則單擊放置。")
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
         layout.addWidget(QLabel("待定標註"))
         self.markup_pending_list = QListWidget()
         self.markup_pending_list.setMaximumHeight(140)
@@ -819,11 +872,10 @@ class DocumentWorkspace(QWidget):
         button = QPushButton(text)
         if kind:
             button.setObjectName(kind)
+        if not isinstance(layout, QVBoxLayout):
+            prevent_button_clip(button)
         button.clicked.connect(callback)
-        if isinstance(layout, QVBoxLayout):
-            layout.addWidget(button)
-        else:
-            layout.addWidget(button)
+        layout.addWidget(button)
         return button
 
     def current_path(self) -> Path | None:
@@ -991,7 +1043,9 @@ class DocumentWorkspace(QWidget):
         if self.pdf_path is None:
             return
         for index in range(self.page_count):
-            self.thumb_list.addItem(QListWidgetItem(f"第 {index + 1} 頁"))
+            item = QListWidgetItem(self._thumb_placeholder_icon, f"第 {index + 1} 頁")
+            item.setSizeHint(QSize(THUMB_PANEL_MIN_WIDTH - 40, THUMB_ICON_SIZE.height() + 18))
+            self.thumb_list.addItem(item)
         if self.page_count:
             self.thumb_list.setCurrentRow(self.current_page)
         QApplication.processEvents()
@@ -1411,6 +1465,8 @@ class DocumentWorkspace(QWidget):
                     self._draw_arrow_head(draw, ix0, iy0, ix1, iy1, (red, green, blue, 255))
             elif markup.kind == "note":
                 draw.rectangle((ix0, iy0 - 16, ix0 + 16, iy0), fill=(red, green, blue, 230))
+            elif markup.kind in CALLOUT_KINDS:
+                paint_callout_markup(draw, markup, to_image)
 
         if (
             page_index == self.current_page
@@ -1505,6 +1561,9 @@ class DocumentWorkspace(QWidget):
         self._push_undo_snapshot()
         x0, y0 = self._image_point_to_pdf(start)
         x1, y1 = self._image_point_to_pdf(end)
+        contents = self.markup_note_input.text().strip()
+        if kind in CALLOUT_KINDS:
+            contents = contents or "註解"
         markup = MarkupAnnotation(
             kind=kind,
             x0=x0,
@@ -1512,7 +1571,7 @@ class DocumentWorkspace(QWidget):
             x1=x1,
             y1=y1,
             color_rgb=self._markup_color(),
-            contents=self.markup_note_input.text().strip(),
+            contents=contents,
         )
         self.markup_items.append((self.current_page, markup))
         self._refresh_markup_list()
@@ -1522,19 +1581,31 @@ class DocumentWorkspace(QWidget):
         if self.preview_image is None:
             return
         kind = self.markup_tool_combo.currentData() or "highlight"
-        if kind != "note":
+        if kind not in {"note"} | CALLOUT_KINDS:
+            self._emit_status("此工具需要拖曳：從要指出的位置拉到文字框。")
             return
         self._push_undo_snapshot()
         x0, y0 = self._image_point_to_pdf(point)
-        markup = MarkupAnnotation(
-            kind="note",
-            x0=x0,
-            y0=y0,
-            x1=x0,
-            y1=y0,
-            color_rgb=self._markup_color(),
-            contents=self.markup_note_input.text().strip() or "備註",
-        )
+        if kind in CALLOUT_KINDS:
+            markup = MarkupAnnotation(
+                kind=kind,
+                x0=x0,
+                y0=y0,
+                x1=x0 + 140.0,
+                y1=y0 + 50.0,
+                color_rgb=self._markup_color(),
+                contents=self.markup_note_input.text().strip() or "註解",
+            )
+        else:
+            markup = MarkupAnnotation(
+                kind="note",
+                x0=x0,
+                y0=y0,
+                x1=x0,
+                y1=y0,
+                color_rgb=self._markup_color(),
+                contents=self.markup_note_input.text().strip() or "備註",
+            )
         self.markup_items.append((self.current_page, markup))
         self._refresh_markup_list()
         self._update_preview_display()
@@ -1546,7 +1617,7 @@ class DocumentWorkspace(QWidget):
         self.markup_pending_list.clear()
         for page_index, markup in self.markup_items:
             label = f"第 {page_index + 1} 頁 · {self._markup_label(markup)}"
-            if markup.contents and markup.kind == "note":
+            if markup.contents and markup.kind in {"note"} | CALLOUT_KINDS:
                 label += f"：{markup.contents[:12]}"
             self.markup_pending_list.addItem(label)
 

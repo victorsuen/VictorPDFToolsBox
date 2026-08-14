@@ -8,7 +8,7 @@ from pathlib import Path
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
 from PySide6.QtCore import QByteArray, QMimeData, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QDrag, QDragEnterEvent, QDropEvent, QIcon, QIntValidator, QPainter, QPen, QPixmap
+from PySide6.QtGui import QAction, QColor, QDrag, QDragEnterEvent, QDropEvent, QIcon, QIntValidator, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -29,6 +29,8 @@ from PySide6.QtWidgets import (
     QMainWindow,
     QMenu,
     QMessageBox,
+    QProgressBar,
+    QProgressDialog,
     QPushButton,
     QScrollArea,
     QSizePolicy,
@@ -43,10 +45,13 @@ from PySide6.QtWidgets import (
 
 from document_workspace import DocumentWorkspace
 from audit_log import append_audit_event, audit_log_path, read_audit_events
+from flow_layout import FlowLayout, prevent_button_clip
 from pdf_core import (
     IMAGE_SUFFIXES,
     MARKUP_COLOR_PRESETS,
     OCR_LANGUAGE_OPTIONS,
+    OFFICE_DIALOG_FILTER,
+    OFFICE_SUFFIXES,
     PDF_RENDER_AVAILABLE,
     PDF_SUFFIXES,
     PYMUPDF_AVAILABLE,
@@ -62,6 +67,8 @@ from pdf_core import (
     apply_markup_annotations,
     apply_outline,
     BATES_POSITIONS,
+    CALLOUT_KINDS,
+    callout_box_from_pointer,
     crop_pdf_pages,
     extract_outline,
     rgb_to_hex,
@@ -88,11 +95,13 @@ from pdf_core import (
     extract_pdf_text,
     font_key_for_pdf_font,
     images_to_pdf,
+    office_files_to_pdf,
     merge_pdf_files,
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
     pdf_to_images,
     open_reader,
+    paint_callout_markup,
     page_item_label,
     parse_pages,
     pdfium,
@@ -106,6 +115,8 @@ from pdf_core import (
     replace_text_block_overlay,
     rotate_pdf_pages,
     safe_output_name,
+    suggested_pdf_name_for_source,
+    suggested_pdf_path_for_source,
     split_pdf_advanced,
     split_pdf_to_zip,
     text_matches_query,
@@ -249,6 +260,19 @@ def reveal_output(path: Path) -> None:
         return
     subprocess.Popen(["xdg-open", str(target if target.is_dir() else target.parent)])
 
+
+def open_output_file(path: Path) -> None:
+    target = path.resolve()
+    if not target.exists() or target.is_dir():
+        return
+    if sys.platform == "win32":
+        os.startfile(str(target))
+        return
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", str(target)])
+        return
+    subprocess.Popen(["xdg-open", str(target)])
+
 THUMB_SIZE = QSize(195, 292)
 ICON_SIZE = QSize(165, 215)
 THUMB_RENDER_BATCH = 8
@@ -351,10 +375,46 @@ class PreviewImageLabel(QLabel):
 
 class AnnotationPreviewLabel(PreviewImageLabel):
     positionClicked = Signal(QPoint)
+    rectDrawn = Signal(QPoint, QPoint)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.band_color = QColor(43, 106, 158)
+        self._start: QPoint | None = None
+        self._current: QPoint | None = None
 
     def mousePressEvent(self, event) -> None:
-        self.positionClicked.emit(event.position().toPoint())
+        self._start = event.position().toPoint()
+        self._current = self._start
+        self.update()
         super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._start is not None:
+            self._current = event.position().toPoint()
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._start is not None:
+            start = self._start
+            end = event.position().toPoint()
+            self._start = None
+            self._current = None
+            self.update()
+            if (start - end).manhattanLength() <= 4:
+                self.positionClicked.emit(end)
+            else:
+                self.rectDrawn.emit(start, end)
+        super().mouseReleaseEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if self._start is not None and self._current is not None:
+            painter = QPainter(self)
+            painter.setPen(QPen(self.band_color, 2, Qt.DashLine))
+            painter.drawLine(self._start, self._current)
+            painter.end()
 
 
 class TextEditPreviewLabel(PreviewImageLabel):
@@ -977,6 +1037,7 @@ class VictorPdfToolsQt(QMainWindow):
         self._pdfium_docs: dict[str, object] = {}
         self.page_clipboard: list[PageItem] = []
         self.tool_file_items: list[Path] = []
+        self.office_file_items: list[Path] = []
         self._last_tool_status_message = ""
         self._tool_aux_path: Path | None = None
         self.annotation_pdf_path: Path | None = None
@@ -984,6 +1045,8 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_page_size = (0.0, 0.0)
         self.annotation_preview_image: Image.Image | None = None
         self.annotation_color_rgb = (0.0, 0.0, 0.0)
+        self.annotation_box_pdf: tuple[float, float] | None = None
+        self.annotation_box_locked = False
         self.text_edit_pdf_path: Path | None = None
         self.text_edit_page_count = 0
         self.text_edit_blocks: list[TextBlock] = []
@@ -1085,7 +1148,7 @@ class VictorPdfToolsQt(QMainWindow):
             QLabel#muted { color: #52697a; }
             QPushButton {
                 min-height: 28px;
-                padding: 3px 10px;
+                padding: 4px 12px;
                 border: 1px solid #9f9d96;
                 border-radius: 6px;
                 background: #f7f6f2;
@@ -1144,7 +1207,7 @@ class VictorPdfToolsQt(QMainWindow):
         title = QLabel("Victor PDF Tools Box")
         title.setObjectName("title")
         title.setStyleSheet("font-size: 13pt; font-weight: 700;")
-        subtitle = QLabel("本機 PDF 工作站：預設「組織」拖入 PDF 管理頁面縮圖；「文件工作台」提供單頁閱讀與編輯。")
+        subtitle = QLabel("「組織」管理多份 PDF 的頁面；「文件工作台」打開一份 PDF 閱讀、註解和編輯。")
         subtitle.setObjectName("muted")
         subtitle.setWordWrap(True)
         layout.addWidget(title)
@@ -1166,7 +1229,11 @@ class VictorPdfToolsQt(QMainWindow):
         self._workspace_tab = workspace_tab
         tabs.addTab(workspace_tab, "文件工作台")
 
-        tabs.addTab(self.build_tools_tab(), "常用工具")
+        self._tools_tab = self.build_tools_tab()
+        tabs.addTab(self._tools_tab, "常用工具")
+
+        self._office_tab = self.build_office_convert_tab()
+        tabs.addTab(self._office_tab, "Office 轉 PDF")
 
         advanced_tabs = QTabWidget()
         advanced_tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
@@ -1198,10 +1265,13 @@ class VictorPdfToolsQt(QMainWindow):
         show_workspace.triggered.connect(lambda: self.main_tabs.setCurrentIndex(1))
         window_menu.addAction(show_workspace)
         show_tools = QAction("常用工具", self)
-        show_tools.triggered.connect(lambda: self.main_tabs.setCurrentIndex(2))
+        show_tools.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self._tools_tab))
         window_menu.addAction(show_tools)
+        show_office = QAction("Office 轉 PDF", self)
+        show_office.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self._office_tab))
+        window_menu.addAction(show_office)
         show_advanced = QAction("進階工具", self)
-        show_advanced.triggered.connect(lambda: self.main_tabs.setCurrentIndex(3))
+        show_advanced.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self.advanced_tabs))
         window_menu.addAction(show_advanced)
 
     def install_shortcuts(self) -> None:
@@ -1229,7 +1299,9 @@ class VictorPdfToolsQt(QMainWindow):
         left_layout.setContentsMargins(0, 0, 0, 0)
         left_layout.setSpacing(10)
 
-        controls = QHBoxLayout()
+        toolbar = QWidget()
+        self.organize_toolbar = toolbar
+        controls = FlowLayout(toolbar, margin=0, hspacing=6, vspacing=6)
         self.add_button(controls, "加入 PDF", self.choose_pdf_files)
         self.add_button(controls, "在工作台開啟", self.open_current_pdf_in_workspace)
         self.add_button(controls, "複製頁", self.copy_selected_pages)
@@ -1238,12 +1310,10 @@ class VictorPdfToolsQt(QMainWindow):
         self.add_button(controls, "復原", self.undo_last_action)
         self.add_button(controls, "刪除頁", self.remove_selected_pages, "danger")
         self.add_button(controls, "清空目前 Tab", self.clear_pages)
-        controls.addSpacing(10)
         self.add_button(controls, "選取左轉", lambda: self.rotate_selected_pages(270))
         self.add_button(controls, "選取右轉", lambda: self.rotate_selected_pages(90))
-        controls.addStretch(1)
         controls.addWidget(self.stats_label)
-        left_layout.addLayout(controls)
+        left_layout.addWidget(toolbar)
 
         drag_hint = QLabel("提示：每個 PDF 會開成上方獨立 Tab；雙擊縮圖可大圖預覽，右鍵或上方按鈕可在工作台開啟此檔。")
         drag_hint.setObjectName("muted")
@@ -1312,15 +1382,15 @@ class VictorPdfToolsQt(QMainWindow):
         layout.setContentsMargins(0, 10, 0, 0)
         layout.setSpacing(10)
 
-        controls = QHBoxLayout()
+        toolbar = QWidget()
+        controls = FlowLayout(toolbar, margin=0, hspacing=6, vspacing=6)
         self.add_button(controls, "加入 PDF", self.add_tool_pdf_files)
         self.add_button(controls, "加入圖片", self.add_tool_image_files)
         self.add_button(controls, "移除選取", self.remove_tool_files, "danger")
         self.add_button(controls, "上移", lambda: self.move_tool_file(-1))
         self.add_button(controls, "下移", lambda: self.move_tool_file(1))
         self.add_button(controls, "清空", self.clear_tool_files, "danger")
-        controls.addStretch(1)
-        layout.addLayout(controls)
+        layout.addWidget(toolbar)
 
         body = QHBoxLayout()
         body.setSpacing(14)
@@ -1463,6 +1533,85 @@ class VictorPdfToolsQt(QMainWindow):
         hint = QLabel(
             "提示：可把 PDF / 圖片直接拖入左側清單。合併 / 圖片轉 PDF 本身支援多檔；"
             "其餘工具預設用第一個 PDF。勾選「批次處理」後，旋轉／壓縮／浮水印／頁碼／加密等會對清單每個 PDF 各輸出一份到資料夾。"
+            "Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁。"
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        form_layout.addWidget(hint)
+        form_layout.addStretch(1)
+        body.addWidget(wrap_side_panel(form, 310))
+        layout.addLayout(body, 1)
+        return tab
+
+    def build_office_convert_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_office_files)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(10)
+
+        toolbar = QWidget()
+        controls = FlowLayout(toolbar, margin=0, hspacing=6, vspacing=6)
+        self.add_button(controls, "加入 Word / Excel / PPT", self.add_office_files)
+        self.add_button(controls, "移除選取", self.remove_office_files, "danger")
+        self.add_button(controls, "上移", lambda: self.move_office_file(-1))
+        self.add_button(controls, "下移", lambda: self.move_office_file(1))
+        self.add_button(controls, "清空", self.clear_office_files, "danger")
+        layout.addWidget(toolbar)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        self.office_file_list = ToolFileList()
+        self.office_file_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.office_file_list.filesDropped.connect(self.drop_office_files)
+        body.addWidget(self.office_file_list, 1)
+
+        form = QFrame()
+        form.setObjectName("panel")
+        form_layout = QVBoxLayout(form)
+        form_layout.setContentsMargins(14, 14, 14, 14)
+        form_layout.setSpacing(8)
+
+        form_layout.addWidget(QLabel("輸出方式"))
+        self.office_output_mode = QComboBox()
+        self.office_output_mode.addItem("合併成一份 PDF", "merge")
+        self.office_output_mode.addItem("每個檔各存一份", "separate")
+        form_layout.addWidget(self.office_output_mode)
+
+        convert_button = self.add_button(form_layout, "轉換並另存 PDF", self.run_office_convert, "primary")
+        convert_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.office_progress_label = QLabel("尚未開始轉換")
+        self.office_progress_label.setObjectName("muted")
+        self.office_progress_label.setWordWrap(True)
+        form_layout.addWidget(self.office_progress_label)
+        self.office_progress = QProgressBar()
+        self.office_progress.setRange(0, 100)
+        self.office_progress.setValue(0)
+        self.office_progress.setTextVisible(True)
+        form_layout.addWidget(self.office_progress)
+
+        self.office_open_pdf_checkbox = QCheckBox("完成後開啟 PDF")
+        self.office_open_pdf_checkbox.setChecked(True)
+        self.office_open_pdf_checkbox.toggled.connect(self.save_output_preferences)
+        form_layout.addWidget(self.office_open_pdf_checkbox)
+        self.office_open_pdf_tab_checkbox = QCheckBox("PDF 輸出後開成新 Tab")
+        self.office_open_pdf_tab_checkbox.setChecked(True)
+        self.office_open_pdf_tab_checkbox.toggled.connect(self.save_output_preferences)
+        form_layout.addWidget(self.office_open_pdf_tab_checkbox)
+        self.office_open_output_folder_checkbox = QCheckBox("各存一份時開啟輸出資料夾")
+        self.office_open_output_folder_checkbox.setChecked(True)
+        self.office_open_output_folder_checkbox.toggled.connect(self.save_output_preferences)
+        form_layout.addWidget(self.office_open_output_folder_checkbox)
+
+        self.add_button(form_layout, "開啟處理紀錄", self.open_audit_log)
+
+        hint = QLabel(
+            "提示：把 Word（.doc / .docx）、Excel（.xls / .xlsx）或 PowerPoint（.ppt / .pptx）"
+            "拖入左側清單。另存檔名會沿用原檔名。PowerPoint 在背景轉換，並依投影片畫面以 300 DPI 匯出，"
+            "以免「另存 PDF」把立體字變成黑塊；PDF 內文字無法選取。"
+            "轉換需已安裝 Microsoft Office 或 LibreOffice。"
         )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
@@ -1499,6 +1648,7 @@ class VictorPdfToolsQt(QMainWindow):
         scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.annotation_preview_label = AnnotationPreviewLabel()
         self.annotation_preview_label.positionClicked.connect(self.set_annotation_position_from_click)
+        self.annotation_preview_label.rectDrawn.connect(self.set_annotation_from_drag)
         scroll.setWidget(self.annotation_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -1508,6 +1658,29 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout = QVBoxLayout(side)
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
+
+        side_layout.addWidget(QLabel("文字外框"))
+        self.annotation_shape_list = QListWidget()
+        self.annotation_shape_list.setViewMode(QListWidget.IconMode)
+        self.annotation_shape_list.setMovement(QListWidget.Static)
+        self.annotation_shape_list.setResizeMode(QListWidget.Adjust)
+        self.annotation_shape_list.setIconSize(QSize(88, 56))
+        self.annotation_shape_list.setSpacing(6)
+        self.annotation_shape_list.setFixedHeight(168)
+        self.annotation_shape_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.annotation_shape_list.setStyleSheet(
+            "QListWidget { background: #f7fafc; border: 1px solid #dce3ec; }"
+            "QListWidget::item { padding: 4px; }"
+            "QListWidget::item:selected { background: #d9eef0; border: 1px solid #128576; }"
+        )
+        for value, label in self.ANNOTATION_SHAPE_OPTIONS:
+            item = QListWidgetItem(self._annotation_shape_icon(value), label)
+            item.setData(Qt.UserRole, value)
+            item.setTextAlignment(Qt.AlignHCenter | Qt.AlignBottom)
+            self.annotation_shape_list.addItem(item)
+        self.annotation_shape_list.setCurrentRow(0)
+        self.annotation_shape_list.currentItemChanged.connect(lambda *_args: self.on_annotation_shape_changed())
+        side_layout.addWidget(self.annotation_shape_list)
 
         side_layout.addWidget(QLabel("標註文字"))
         self.annotation_text_input = QTextEdit()
@@ -1551,7 +1724,8 @@ class VictorPdfToolsQt(QMainWindow):
         color_row.addWidget(self.annotation_color_button)
         side_layout.addLayout(color_row)
 
-        side_layout.addWidget(QLabel("X / Y 位置"))
+        self.annotation_xy_label = QLabel("X / Y 位置")
+        side_layout.addWidget(self.annotation_xy_label)
         xy = QHBoxLayout()
         self.annotation_x_input = QLineEdit("72")
         self.annotation_y_input = QLineEdit("720")
@@ -1575,10 +1749,10 @@ class VictorPdfToolsQt(QMainWindow):
         save_button = self.add_button(side_layout, "套用並另存 PDF", self.save_annotation_pdf, "primary")
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        guide = QLabel("提示：左側會即時預覽白底覆蓋與文字效果；點擊預覽可調整位置。也可直接把 PDF 拖入此分頁。")
-        guide.setObjectName("muted")
-        guide.setWordWrap(True)
-        side_layout.addWidget(guide)
+        self.annotation_guide = QLabel("提示：先選文字外框，再輸入文字；點左側預覽放置。選對話框／雲朵／標註框時，外框會包住這段文字。")
+        self.annotation_guide.setObjectName("muted")
+        self.annotation_guide.setWordWrap(True)
+        side_layout.addWidget(self.annotation_guide)
         side_layout.addStretch(1)
         layout.addWidget(wrap_side_panel(side, 320))
         self.connect_annotation_preview_updates()
@@ -1628,6 +1802,16 @@ class VictorPdfToolsQt(QMainWindow):
             pdf_y = float(self.annotation_y_input.text())
         except ValueError:
             pdf_x, pdf_y = 72.0, 720.0
+        shape = self.annotation_shape()
+        if shape in CALLOUT_KINDS:
+            pointer_x, pointer_y = pdf_x, pdf_y
+            if self.annotation_box_locked and self.annotation_box_pdf is not None:
+                box_x, box_y = self.annotation_box_pdf
+            else:
+                box_x, box_y = callout_box_from_pointer(pointer_x, pointer_y, rect_width, rect_height)
+        else:
+            box_x, box_y = pdf_x, pdf_y
+            pointer_x, pointer_y = box_x + rect_width / 2.0, box_y - 16.0
         return {
             "text": self.annotation_text_input.toPlainText(),
             "cover": self.annotation_cover_checkbox.isChecked(),
@@ -1635,11 +1819,93 @@ class VictorPdfToolsQt(QMainWindow):
             "font_size": int(self.annotation_font_size_combo.currentText()),
             "bold": self.annotation_bold_checkbox.isChecked(),
             "color_rgb": self.annotation_color_rgb,
-            "pdf_x": pdf_x,
-            "pdf_y": pdf_y,
+            "pdf_x": box_x,
+            "pdf_y": box_y,
             "rect_width": rect_width,
             "rect_height": rect_height,
+            "shape": shape,
+            "pointer_x": pointer_x,
+            "pointer_y": pointer_y,
         }
+
+    def annotation_shape(self) -> str:
+        item = self.annotation_shape_list.currentItem()
+        if item is None:
+            return "box"
+        return str(item.data(Qt.UserRole) or "box")
+
+    def set_annotation_shape(self, shape: str) -> None:
+        for row in range(self.annotation_shape_list.count()):
+            item = self.annotation_shape_list.item(row)
+            if item is not None and item.data(Qt.UserRole) == shape:
+                self.annotation_shape_list.setCurrentRow(row)
+                return
+
+    def on_annotation_shape_changed(self) -> None:
+        is_plain = self.annotation_shape() == "box"
+        self.annotation_cover_checkbox.setEnabled(is_plain)
+        if self.annotation_shape() in CALLOUT_KINDS:
+            self.annotation_cover_checkbox.setChecked(False)
+            self.annotation_xy_label.setText("插入點（箭咀尖端）")
+            self.annotation_guide.setText(
+                "提示：點預覽上要指出的文字，箭咀會落在該處，文字框自動在上方。"
+                "若要自己放文字框，從插入點拖到文字框位置。"
+            )
+        elif is_plain:
+            self.annotation_xy_label.setText("X / Y 位置")
+            self.annotation_guide.setText(
+                "提示：先選文字外框，再輸入文字；點左側預覽放置。選對話框／雲朵／標註框時，外框會包住這段文字。"
+            )
+        else:
+            self.annotation_cover_checkbox.setChecked(False)
+            self.annotation_xy_label.setText("X / Y 位置")
+            self.annotation_guide.setText(
+                "提示：此外框會包住上方輸入的文字。點預覽放置文字框左下角。"
+            )
+        if self.annotation_shape() not in CALLOUT_KINDS:
+            self.annotation_box_locked = False
+            self.annotation_box_pdf = None
+        self.update_annotation_preview_display()
+
+    def _annotation_shape_icon(self, kind: str) -> QIcon:
+        pixmap = QPixmap(88, 56)
+        pixmap.fill(QColor("#ffffff"))
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.setPen(QPen(QColor("#2b6a9e"), 2))
+        painter.setBrush(QColor("#e8f3fb"))
+        if kind == "callout":
+            painter.drawRect(18, 8, 52, 24)
+            painter.drawLine(44, 32, 44, 46)
+            painter.setBrush(QColor("#2b6a9e"))
+            painter.drawPolygon(QPolygon([QPoint(44, 48), QPoint(39, 40), QPoint(49, 40)]))
+            painter.setPen(QColor("#1f3b54"))
+            painter.drawText(QRect(18, 8, 52, 24), Qt.AlignCenter, "Aa")
+        elif kind == "speech":
+            painter.drawRoundedRect(14, 6, 60, 26, 6, 6)
+            painter.drawPolygon(QPolygon([QPoint(28, 32), QPoint(36, 32), QPoint(24, 48)]))
+            painter.setPen(QColor("#1f3b54"))
+            painter.drawText(QRect(14, 6, 60, 26), Qt.AlignCenter, "Aa")
+        elif kind == "cloud":
+            painter.drawEllipse(16, 10, 22, 16)
+            painter.drawEllipse(28, 4, 28, 20)
+            painter.drawEllipse(46, 10, 22, 16)
+            painter.setBrush(QColor("#2b6a9e"))
+            painter.drawPolygon(QPolygon([QPoint(44, 48), QPoint(38, 34), QPoint(50, 34)]))
+            painter.setPen(QColor("#1f3b54"))
+            painter.drawText(QRect(20, 8, 48, 20), Qt.AlignCenter, "Aa")
+        elif kind == "rect":
+            painter.drawRect(14, 10, 60, 32)
+            painter.setPen(QColor("#1f3b54"))
+            painter.drawText(QRect(14, 10, 60, 32), Qt.AlignCenter, "Aa")
+        else:
+            painter.setBrush(Qt.NoBrush)
+            painter.setPen(QPen(QColor("#b7c4ce"), 1, Qt.DashLine))
+            painter.drawRect(14, 10, 60, 32)
+            painter.setPen(QColor("#1f3b54"))
+            painter.drawText(QRect(14, 10, 60, 32), Qt.AlignCenter, "Aa")
+        painter.end()
+        return QIcon(pixmap)
 
     def annotation_preview_font(
         self,
@@ -1674,7 +1940,6 @@ class VictorPdfToolsQt(QMainWindow):
         if page_width <= 0 or page_height <= 0:
             return image
         canvas = image.copy()
-        draw = ImageDraw.Draw(canvas)
         image_width, image_height = canvas.size
         scale_x = image_width / page_width
         scale_y = image_height / page_height
@@ -1686,19 +1951,57 @@ class VictorPdfToolsQt(QMainWindow):
         top = bottom - height
         right = left + width
         bottom = top + height
-
-        if style["cover"]:
-            draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#b7c4ce", width=1)
-
         text = style["text"].strip()
+        shape = style.get("shape") or "box"
+
+        def to_image(x: float, y: float) -> tuple[float, float]:
+            return (x * scale_x, image_height - y * scale_y)
+
+        if shape in CALLOUT_KINDS:
+            overlay = Image.new("RGBA", canvas.size, (0, 0, 0, 0))
+            paint_callout_markup(
+                ImageDraw.Draw(overlay),
+                MarkupAnnotation(
+                    kind=shape,
+                    x0=style["pointer_x"],
+                    y0=style["pointer_y"],
+                    x1=style["pdf_x"],
+                    y1=style["pdf_y"],
+                    color_rgb=style["color_rgb"],
+                    contents=text or "註解",
+                    box_width=style["rect_width"],
+                    box_height=style["rect_height"],
+                ),
+                to_image,
+                draw_text=False,
+            )
+            canvas = Image.alpha_composite(canvas.convert("RGBA"), overlay)
+            draw = ImageDraw.Draw(canvas)
+        else:
+            draw = ImageDraw.Draw(canvas)
+            if shape == "rect":
+                fill = tuple(int(channel * 0.18 * 255 + 0.82 * 255) for channel in style["color_rgb"])
+                outline = tuple(int(channel * 255) for channel in style["color_rgb"])
+                draw.rounded_rectangle((left, top, right, bottom), radius=4, fill=fill, outline=outline, width=2)
+            elif style["cover"]:
+                draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#b7c4ce", width=1)
+
         if text:
             preview_font_size = max(style["font_size"] * scale_y * 0.92, 8)
             font = self.annotation_preview_font(preview_font_size, style["bold"], style["font_key"])
             text_color = rgb_to_hex(style["color_rgb"])
             draw.text((left + 4, top + 2), text, fill=text_color, font=font)
-        return canvas
+        return canvas.convert("RGB")
 
     # --- markup annotations (highlight / shapes / sticky notes) --------------
+    ANNOTATION_SHAPE_OPTIONS = [
+        ("box", "無外框"),
+        ("rect", "矩形框"),
+        ("callout", "標註框"),
+        ("speech", "對話框"),
+        ("cloud", "雲朵"),
+    ]
+
     MARKUP_TOOL_OPTIONS = [
         ("highlight", "螢光標示"),
         ("underline", "底線"),
@@ -1707,6 +2010,9 @@ class VictorPdfToolsQt(QMainWindow):
         ("ellipse", "橢圓框"),
         ("line", "直線"),
         ("arrow", "箭頭"),
+        ("callout", "標註框（帶指引線）"),
+        ("speech", "對話框"),
+        ("cloud", "雲朵標註"),
         ("note", "便利貼"),
     ]
 
@@ -1779,9 +2085,9 @@ class VictorPdfToolsQt(QMainWindow):
         color_row.addWidget(self.markup_color_button)
         side_layout.addLayout(color_row)
 
-        side_layout.addWidget(QLabel("便利貼 / 註解文字（選填）"))
+        side_layout.addWidget(QLabel("註解文字（標註框 / 對話框 / 便利貼）"))
         self.markup_note_input = QLineEdit()
-        self.markup_note_input.setPlaceholderText("便利貼或圖形的備註文字")
+        self.markup_note_input.setPlaceholderText("例如：請核對此數字")
         side_layout.addWidget(self.markup_note_input)
 
         side_layout.addWidget(QLabel("已加入的標註"))
@@ -1804,7 +2110,7 @@ class VictorPdfToolsQt(QMainWindow):
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
-            "提示：選好工具與顏色後，在左側預覽上拖曳框選範圍即可加入標註；"
+            "提示：標註框／對話框／雲朵請從要指出的位置拖到文字框；"
             "便利貼用單擊放置。可跨頁加入多個標註，最後一次另存。"
         )
         guide.setObjectName("muted")
@@ -1917,6 +2223,8 @@ class VictorPdfToolsQt(QMainWindow):
             elif markup.kind == "note":
                 draw.rectangle((ix0, iy0 - 16, ix0 + 16, iy0), fill=(red, green, blue, 230), outline=(60, 60, 60, 255))
                 draw.text((ix0 + 4, iy0 - 15), "N", fill=(20, 20, 20, 255))
+            elif markup.kind in CALLOUT_KINDS:
+                paint_callout_markup(draw, markup, to_image)
 
         merged = Image.alpha_composite(canvas, overlay).convert("RGB")
         pixmap = QPixmap.fromImage(ImageQt(merged))
@@ -1978,6 +2286,9 @@ class VictorPdfToolsQt(QMainWindow):
             return
         x0, y0 = self.markup_image_point_to_pdf(start)
         x1, y1 = self.markup_image_point_to_pdf(end)
+        contents = self.markup_note_input.text().strip()
+        if kind in CALLOUT_KINDS:
+            contents = contents or "註解"
         markup = MarkupAnnotation(
             kind=kind,
             x0=x0,
@@ -1985,7 +2296,7 @@ class VictorPdfToolsQt(QMainWindow):
             x1=x1,
             y1=y1,
             color_rgb=self.markup_current_color(),
-            contents=self.markup_note_input.text().strip(),
+            contents=contents,
         )
         self.markup_items.append((self.current_markup_page_index(), markup))
         self.refresh_markup_list()
@@ -1997,23 +2308,34 @@ class VictorPdfToolsQt(QMainWindow):
             self.set_status("請先載入 PDF 並更新預覽。")
             return
         kind = self.markup_tool_combo.currentData() or "highlight"
-        if kind != "note":
-            self.set_status("此工具需要拖曳框選範圍；便利貼才用單擊放置。")
+        if kind not in {"note"} | CALLOUT_KINDS:
+            self.set_status("此工具需要拖曳：從要指出的位置拉到文字框。")
             return
         x0, y0 = self.markup_image_point_to_pdf(point)
-        markup = MarkupAnnotation(
-            kind="note",
-            x0=x0,
-            y0=y0,
-            x1=x0,
-            y1=y0,
-            color_rgb=self.markup_current_color(),
-            contents=self.markup_note_input.text().strip() or "備註",
-        )
+        if kind in CALLOUT_KINDS:
+            markup = MarkupAnnotation(
+                kind=kind,
+                x0=x0,
+                y0=y0,
+                x1=x0 + 140.0,
+                y1=y0 + 50.0,
+                color_rgb=self.markup_current_color(),
+                contents=self.markup_note_input.text().strip() or "註解",
+            )
+        else:
+            markup = MarkupAnnotation(
+                kind="note",
+                x0=x0,
+                y0=y0,
+                x1=x0,
+                y1=y0,
+                color_rgb=self.markup_current_color(),
+                contents=self.markup_note_input.text().strip() or "備註",
+            )
         self.markup_items.append((self.current_markup_page_index(), markup))
         self.refresh_markup_list()
         self.update_markup_preview_display()
-        self.set_status("已加入便利貼。")
+        self.set_status(f"已加入標註：{self._markup_label(markup)}")
 
     def _markup_label(self, markup: MarkupAnnotation) -> str:
         names = dict(self.MARKUP_TOOL_OPTIONS)
@@ -2023,7 +2345,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.markup_list.clear()
         for page_index, markup in self.markup_items:
             label = f"第 {page_index + 1} 頁 · {self._markup_label(markup)}"
-            if markup.contents and markup.kind == "note":
+            if markup.contents and markup.kind in {"note"} | CALLOUT_KINDS:
                 label += f"：{markup.contents[:12]}"
             self.markup_list.addItem(label)
 
@@ -3222,6 +3544,15 @@ class VictorPdfToolsQt(QMainWindow):
         self.tool_open_output_folder_checkbox.setChecked(
             settings.value("tool_open_output_folder", True, type=bool)
         )
+        self.office_open_pdf_checkbox.setChecked(
+            settings.value("office_open_pdf", True, type=bool)
+        )
+        self.office_open_pdf_tab_checkbox.setChecked(
+            settings.value("office_open_pdf_tab", True, type=bool)
+        )
+        self.office_open_output_folder_checkbox.setChecked(
+            settings.value("office_open_output_folder", True, type=bool)
+        )
 
     def save_output_preferences(self) -> None:
         settings = self.output_settings()
@@ -3229,6 +3560,9 @@ class VictorPdfToolsQt(QMainWindow):
         settings.setValue("open_folder_after_export", self.open_folder_after_export_checkbox.isChecked())
         settings.setValue("tool_open_pdf_tab", self.tool_open_pdf_tab_checkbox.isChecked())
         settings.setValue("tool_open_output_folder", self.tool_open_output_folder_checkbox.isChecked())
+        settings.setValue("office_open_pdf", self.office_open_pdf_checkbox.isChecked())
+        settings.setValue("office_open_pdf_tab", self.office_open_pdf_tab_checkbox.isChecked())
+        settings.setValue("office_open_output_folder", self.office_open_output_folder_checkbox.isChecked())
 
     def refresh_tool_file_list(self) -> None:
         self.tool_file_list.clear()
@@ -3289,12 +3623,222 @@ class VictorPdfToolsQt(QMainWindow):
     def drop_tool_files(self, paths: list[str]) -> None:
         pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
         image_paths = [Path(path) for path in paths if Path(path).suffix.lower() in IMAGE_SUFFIXES]
+        office_paths = [Path(path) for path in paths if Path(path).suffix.lower() in OFFICE_SUFFIXES]
         if pdf_paths:
             self.add_tool_files_from_paths(pdf_paths, PDF_SUFFIXES)
         if image_paths:
             self.add_tool_files_from_paths(image_paths, IMAGE_SUFFIXES)
+        if office_paths and not pdf_paths and not image_paths:
+            self.set_status("Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁轉換。")
+            return
         if not pdf_paths and not image_paths:
             self.set_status("請拖放 PDF 或圖片檔案到工具清單。")
+
+    def refresh_office_file_list(self) -> None:
+        self.office_file_list.clear()
+        for path in self.office_file_items:
+            self.office_file_list.addItem(str(path))
+
+    def add_office_files_from_paths(self, paths: list[Path]) -> None:
+        added = 0
+        skipped = 0
+        for path in paths:
+            if path.is_file() and path.suffix.lower() in OFFICE_SUFFIXES:
+                self.office_file_items.append(path)
+                added += 1
+            else:
+                skipped += 1
+        self.refresh_office_file_list()
+        if skipped:
+            self.set_status(f"已加入 {added} 個 Office 檔，略過 {skipped} 個不支援項目。")
+        elif added:
+            self.set_status(f"已加入 {added} 個 Office 檔。")
+
+    def add_office_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "加入 Word / Excel / PPT", "", OFFICE_DIALOG_FILTER)
+        self.add_office_files_from_paths([Path(path) for path in files])
+
+    def drop_office_files(self, paths: list[str]) -> None:
+        office_paths = [Path(path) for path in paths if Path(path).suffix.lower() in OFFICE_SUFFIXES]
+        if not office_paths:
+            self.set_status("請拖放 Word、Excel 或 PowerPoint 檔案。")
+            return
+        self.add_office_files_from_paths(office_paths)
+
+    def remove_office_files(self) -> None:
+        for index in sorted((self.office_file_list.row(item) for item in self.office_file_list.selectedItems()), reverse=True):
+            self.office_file_items.pop(index)
+        self.refresh_office_file_list()
+
+    def move_office_file(self, direction: int) -> None:
+        selected = sorted(self.office_file_list.row(item) for item in self.office_file_list.selectedItems())
+        if len(selected) != 1:
+            self.set_status("請選取一個檔案來上移或下移。")
+            return
+        source = selected[0]
+        target = source + direction
+        if target < 0 or target >= len(self.office_file_items):
+            return
+        item = self.office_file_items.pop(source)
+        self.office_file_items.insert(target, item)
+        self.refresh_office_file_list()
+        self.office_file_list.item(target).setSelected(True)
+
+    def clear_office_files(self) -> None:
+        self.office_file_items.clear()
+        self.refresh_office_file_list()
+
+    def _office_progress_dialog(self, title: str) -> QProgressDialog:
+        dialog = QProgressDialog(title, None, 0, 0, self)
+        dialog.setWindowTitle("Office 轉 PDF")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setCancelButton(None)
+        dialog.setMinimumWidth(420)
+        dialog.show()
+        return dialog
+
+    def _update_office_progress(self, dialog: QProgressDialog, state: dict) -> None:
+        text = str(state.get("text") or "正在轉換…")
+        current = int(state.get("current") or 0)
+        total = int(state.get("total") or 0)
+        self.office_progress_label.setText(text)
+        dialog.setLabelText(text)
+        if total <= 0:
+            self.office_progress.setRange(0, 0)
+            dialog.setRange(0, 0)
+        else:
+            self.office_progress.setRange(0, total)
+            self.office_progress.setValue(min(current, total))
+            dialog.setRange(0, total)
+            dialog.setValue(min(current, total))
+        QApplication.processEvents()
+
+    def _finish_office_progress(self, dialog: QProgressDialog, text: str) -> None:
+        self.office_progress.setRange(0, 100)
+        self.office_progress.setValue(100)
+        self.office_progress_label.setText(text)
+        dialog.setRange(0, 100)
+        dialog.setValue(100)
+        dialog.setLabelText(text)
+        dialog.hide()
+        dialog.deleteLater()
+
+    def _open_converted_pdfs(self, paths: list[Path]) -> None:
+        if self.office_open_pdf_checkbox.isChecked():
+            for path in paths:
+                open_output_file(path)
+        if self.office_open_pdf_tab_checkbox.isChecked():
+            for path in paths:
+                self.open_pdf_as_new_tab(path)
+
+    def run_office_convert(self) -> None:
+        if not self.office_file_items:
+            self.set_status("請先加入 Word、Excel 或 PowerPoint 檔案。")
+            return
+        mode = self.office_output_mode.currentData() or "merge"
+        separate = mode == "separate" and len(self.office_file_items) > 1
+        if separate:
+            folder = QFileDialog.getExistingDirectory(
+                self, "選擇輸出資料夾", str(self.office_file_items[0].parent)
+            )
+            if not folder:
+                return
+            folder_path = Path(folder)
+            outputs: list[Path] = []
+            dialog = self._office_progress_dialog("正在轉換 Office 檔…")
+            state = {"current": 0, "total": 0, "text": "正在轉換…"}
+
+            def progress(current: int, total: int, text: str) -> None:
+                state["current"] = current
+                state["total"] = total
+                state["text"] = text
+
+            def pump() -> None:
+                self._update_office_progress(dialog, state)
+
+            def job() -> None:
+                done = 0
+                file_count = len(self.office_file_items)
+                for index, source in enumerate(self.office_file_items, start=1):
+                    target = folder_path / suggested_pdf_name_for_source(source)
+                    prefix = f"({index}/{file_count}) {source.name}："
+
+                    def nested(current: int, total: int, text: str, prefix=prefix) -> None:
+                        progress(current, total, prefix + text)
+
+                    office_files_to_pdf([source], target, progress=nested, pump=pump)
+                    outputs.append(target)
+                    done += 1
+                self._last_tool_status_message = f"已轉換 {done} 個 Office 檔 → {folder_path}"
+
+            def on_success() -> None:
+                self._finish_office_progress(dialog, self._last_tool_status_message)
+                self.set_status(self._last_tool_status_message)
+                self._open_converted_pdfs(outputs)
+                if self.office_open_output_folder_checkbox.isChecked():
+                    reveal_output(folder_path)
+
+            try:
+                self.run_pdf_job(
+                    job,
+                    "",
+                    on_success=on_success,
+                    audit_operation="office_to_pdf",
+                    audit_source=self.office_file_items[0],
+                    audit_target=folder_path,
+                    audit_detail=f"{len(self.office_file_items)} files",
+                )
+            finally:
+                if dialog.isVisible():
+                    self._finish_office_progress(dialog, self.office_progress_label.text())
+            return
+
+        source = self.office_file_items[0]
+        suggested = str(suggested_pdf_path_for_source(source))
+        target, _ = QFileDialog.getSaveFileName(self, "另存 PDF", suggested, "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        dialog = self._office_progress_dialog(f"正在轉換 {source.name}…")
+        state = {"current": 0, "total": 0, "text": f"正在轉換 {source.name}…"}
+
+        def progress(current: int, total: int, text: str) -> None:
+            state["current"] = current
+            state["total"] = total
+            state["text"] = text
+
+        def pump() -> None:
+            self._update_office_progress(dialog, state)
+
+        def job() -> None:
+            converted = office_files_to_pdf(
+                self.office_file_items, target_path, progress=progress, pump=pump
+            )
+            if converted == 1:
+                self._last_tool_status_message = f"已把 {self.office_file_items[0].name} 轉成 PDF。"
+            else:
+                self._last_tool_status_message = f"已把 {converted} 個 Office 檔合併成 PDF。"
+
+        def on_success() -> None:
+            self._finish_office_progress(dialog, self._last_tool_status_message)
+            self.set_status(self._last_tool_status_message)
+            self._open_converted_pdfs([target_path])
+
+        try:
+            self.run_pdf_job(
+                job,
+                "",
+                on_success=on_success,
+                audit_operation="office_to_pdf",
+                audit_source=self.office_file_items[0],
+                audit_target=target_path,
+            )
+        finally:
+            if dialog.isVisible():
+                self._finish_office_progress(dialog, self.office_progress_label.text())
 
     def load_annotation_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
@@ -3356,8 +3900,12 @@ class VictorPdfToolsQt(QMainWindow):
         page_width, page_height = self.annotation_page_size
         image_width, image_height = preview_image.size
         if page_width > 0 and page_height > 0:
-            x = style["pdf_x"] / page_width * image_width
-            y = (page_height - style["pdf_y"]) / page_height * image_height
+            if style["shape"] in CALLOUT_KINDS:
+                mark_x, mark_y = style["pointer_x"], style["pointer_y"]
+            else:
+                mark_x, mark_y = style["pdf_x"], style["pdf_y"]
+            x = mark_x / page_width * image_width
+            y = (page_height - mark_y) / page_height * image_height
             pen = QPen(Qt.GlobalColor.darkCyan, 2)
             painter.setPen(pen)
             painter.drawEllipse(QPoint(int(x), int(y)), 5, 5)
@@ -3377,8 +3925,38 @@ class VictorPdfToolsQt(QMainWindow):
         pdf_y = page_height - (image_y / image_height * page_height)
         self.annotation_x_input.setText(f"{pdf_x:.1f}")
         self.annotation_y_input.setText(f"{pdf_y:.1f}")
+        self.annotation_box_locked = False
+        self.annotation_box_pdf = None
         self.update_annotation_preview_display()
-        self.set_status(f"已設定文字位置：X {pdf_x:.1f}, Y {pdf_y:.1f}")
+        if self.annotation_shape() in CALLOUT_KINDS:
+            self.set_status(f"已設定插入點（箭咀）：X {pdf_x:.1f}, Y {pdf_y:.1f}")
+        else:
+            self.set_status(f"已設定文字位置：X {pdf_x:.1f}, Y {pdf_y:.1f}")
+
+    def set_annotation_from_drag(self, start: QPoint, end: QPoint) -> None:
+        if self.annotation_shape() not in CALLOUT_KINDS:
+            self.set_annotation_position_from_click(end)
+            return
+        page_width, page_height = self.annotation_page_size
+        if self.annotation_preview_image is None or page_width <= 0 or page_height <= 0:
+            return
+        pointer = self._annotation_image_to_pdf(start)
+        box = self._annotation_image_to_pdf(end)
+        self.annotation_x_input.setText(f"{pointer[0]:.1f}")
+        self.annotation_y_input.setText(f"{pointer[1]:.1f}")
+        self.annotation_box_pdf = box
+        self.annotation_box_locked = True
+        self.update_annotation_preview_display()
+        self.set_status(f"已設定指引線：箭咀 ({pointer[0]:.1f}, {pointer[1]:.1f})")
+
+    def _annotation_image_to_pdf(self, point: QPoint) -> tuple[float, float]:
+        page_width, page_height = self.annotation_page_size
+        image_width, image_height = self.annotation_preview_image.size
+        image_x = min(max(point.x(), 0), image_width)
+        image_y = min(max(point.y(), 0), image_height)
+        pdf_x = image_x / image_width * page_width
+        pdf_y = page_height - (image_y / image_height * page_height)
+        return (pdf_x, pdf_y)
 
     def save_annotation_pdf(self) -> None:
         if self.annotation_pdf_path is None:
@@ -3411,6 +3989,8 @@ class VictorPdfToolsQt(QMainWindow):
                 font_key=style["font_key"],
                 bold=style["bold"],
                 color_rgb=style["color_rgb"],
+                shape=style["shape"],
+                pointer=(style["pointer_x"], style["pointer_y"]) if style["shape"] in CALLOUT_KINDS else None,
             )
 
         self.run_pdf_job(
@@ -3538,7 +4118,7 @@ class VictorPdfToolsQt(QMainWindow):
     def _execute_batch_tool_operation(self, operation: str, folder: Path, password: str) -> None:
         sources = self._batch_sources()
         if not sources:
-            raise ValueError("批次處理需要至少一個 PDF。")
+            raise ValueError("批次處理需要至少一個支援的檔案。")
         folder.mkdir(parents=True, exist_ok=True)
         done = 0
         errors: list[str] = []
@@ -3790,6 +4370,8 @@ class VictorPdfToolsQt(QMainWindow):
         button = QPushButton(text)
         if kind:
             button.setObjectName(kind)
+        if not isinstance(layout, QVBoxLayout):
+            prevent_button_clip(button)
         button.clicked.connect(callback)
         layout.addWidget(button)
         return button

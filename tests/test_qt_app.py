@@ -9,7 +9,7 @@ from pypdf import PdfReader, PdfWriter
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QApplication, QTabWidget
+from PySide6.QtWidgets import QApplication, QPushButton, QTabWidget
 
 from pdf_core import MarkupAnnotation, TextBlock
 from document_workspace import DocumentWorkspace
@@ -88,6 +88,23 @@ class QtAppTests(unittest.TestCase):
         window.resize(target)
         self.assertEqual(window.width(), target.width())
         self.assertEqual(window.height(), target.height())
+
+    def test_organize_toolbar_keeps_full_button_text_when_narrow(self):
+        window = VictorPdfToolsQt()
+        window.show()
+        window.resize(WINDOW_MIN_SIZE)
+        self.app.processEvents()
+        buttons = window.organize_toolbar.findChildren(QPushButton)
+        self.assertGreaterEqual(len(buttons), 8)
+        labels = [button.text() for button in buttons]
+        self.assertIn("加入 PDF", labels)
+        self.assertIn("在工作台開啟", labels)
+        for button in buttons:
+            self.assertGreaterEqual(button.width(), button.sizeHint().width())
+            self.assertFalse(button.text().endswith("…"))
+        layout = window.organize_toolbar.layout()
+        self.assertTrue(layout.hasHeightForWidth())
+        self.assertGreater(layout.heightForWidth(240), layout.heightForWidth(1600))
 
     def test_add_pdf_updates_grid_and_stats(self):
         window = VictorPdfToolsQt()
@@ -562,6 +579,7 @@ class QtAppTests(unittest.TestCase):
         self.assertTrue(window.open_folder_after_export_checkbox.isChecked())
         self.assertTrue(window.tool_open_pdf_tab_checkbox.isChecked())
         self.assertTrue(window.tool_open_output_folder_checkbox.isChecked())
+        self.assertTrue(window.office_open_pdf_checkbox.isChecked())
 
     def test_folder_reveal_operations_include_zip_and_text_tools(self):
         self.assertEqual(
@@ -589,7 +607,7 @@ class QtAppTests(unittest.TestCase):
         window = VictorPdfToolsQt()
         main_tabs = window.main_tabs
         main_texts = [main_tabs.tabText(index) for index in range(main_tabs.count())]
-        self.assertEqual(main_texts, ["組織", "文件工作台", "常用工具", "進階"])
+        self.assertEqual(main_texts, ["組織", "文件工作台", "常用工具", "Office 轉 PDF", "進階"])
         advanced_tabs = window.advanced_tabs
         self.assertIsInstance(advanced_tabs, QTabWidget)
         advanced_texts = [advanced_tabs.tabText(index) for index in range(advanced_tabs.count())]
@@ -636,10 +654,13 @@ class QtAppTests(unittest.TestCase):
     def test_document_workspace_thumb_panel_is_wide_enough(self):
         from document_workspace import THUMB_PANEL_MIN_WIDTH, THUMB_PANEL_MAX_WIDTH
 
+        from PySide6.QtWidgets import QListView
+
         workspace = DocumentWorkspace()
         self.assertGreaterEqual(workspace.left_tabs.minimumWidth(), THUMB_PANEL_MIN_WIDTH)
         self.assertGreaterEqual(workspace.left_tabs.maximumWidth(), THUMB_PANEL_MAX_WIDTH - 1)
         self.assertGreaterEqual(workspace.thumb_list.iconSize().width(), 140)
+        self.assertEqual(workspace.thumb_list.viewMode(), QListView.ListMode)
 
     def test_document_workspace_accepts_pdf_drop(self):
         from PySide6.QtCore import QMimeData, QPoint, QUrl
@@ -829,6 +850,11 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(workspace.interaction, "crop")
         self.assertEqual(workspace.right_stack.currentIndex(), crop_index)
 
+    def test_document_workspace_annotate_tools_include_callout_shapes(self):
+        workspace = DocumentWorkspace()
+        slugs = {workspace.markup_tool_combo.itemData(index) for index in range(workspace.markup_tool_combo.count())}
+        self.assertTrue({"callout", "speech", "cloud", "note"}.issubset(slugs))
+
     def test_document_workspace_signature_stores_rect(self):
         workspace = DocumentWorkspace()
         workspace.open_path(self.source)
@@ -878,6 +904,71 @@ class QtAppTests(unittest.TestCase):
             "secure_redact",
         ):
             self.assertIn(key, slugs)
+        self.assertNotIn("office_to_pdf", slugs)
+
+    def test_office_convert_tab_accepts_office_files(self):
+        window = VictorPdfToolsQt()
+        word = Path(self.temp_dir.name) / "memo.docx"
+        word.write_bytes(b"fake")
+        window.add_office_files_from_paths([word])
+        self.assertEqual(len(window.office_file_items), 1)
+        window.drop_office_files([str(word)])
+        self.assertEqual(len(window.office_file_items), 2)
+        self.assertEqual(window.main_tabs.tabText(window.main_tabs.indexOf(window._office_tab)), "Office 轉 PDF")
+        self.assertNotIn("office_to_pdf", BATCHABLE_OPERATIONS)
+
+    def test_office_convert_tab_writes_output(self):
+        window = VictorPdfToolsQt()
+        word = Path(self.temp_dir.name) / "memo.docx"
+        word.write_bytes(b"fake")
+        window.office_file_items = [word]
+        window.refresh_office_file_list()
+        window.office_output_mode.setCurrentIndex(window.office_output_mode.findData("merge"))
+        target = Path(self.temp_dir.name) / "memo.pdf"
+        window.office_open_pdf_tab_checkbox.setChecked(False)
+
+        def fake_convert(paths, dest, progress=None, pump=None):
+            writer = PdfWriter()
+            writer.add_blank_page(width=300, height=400)
+            with dest.open("wb") as stream:
+                writer.write(stream)
+            return len(paths)
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "pdf")):
+            with patch("qt_app.office_files_to_pdf", side_effect=fake_convert):
+                with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
+                    window.run_office_convert()
+        self.assertTrue(target.exists())
+        self.assertIn("轉成 PDF", window._last_tool_status_message)
+
+    def test_office_convert_uses_original_filename_and_opens_pdf(self):
+        window = VictorPdfToolsQt()
+        source = Path(self.temp_dir.name) / "中海宏洋2026年中期业绩简报 v.1.pptx"
+        source.write_bytes(b"fake")
+        window.office_file_items = [source]
+        window.refresh_office_file_list()
+        window.office_open_pdf_checkbox.setChecked(True)
+        window.office_open_pdf_tab_checkbox.setChecked(False)
+        target = Path(self.temp_dir.name) / "中海宏洋2026年中期业绩简报 v.1.pdf"
+
+        def fake_convert(paths, dest, progress=None, pump=None):
+            if progress is not None:
+                progress(1, 2, "正在匯出第 1 / 1 頁")
+            if pump is not None:
+                pump()
+            writer = PdfWriter()
+            writer.add_blank_page(width=300, height=400)
+            with dest.open("wb") as stream:
+                writer.write(stream)
+            return len(paths)
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "pdf")) as save_dialog:
+            with patch("qt_app.office_files_to_pdf", side_effect=fake_convert):
+                with patch("qt_app.open_output_file") as opener:
+                    window.run_office_convert()
+        self.assertIn("中海宏洋2026年中期业绩简报 v.1.pdf", save_dialog.call_args[0][2])
+        opener.assert_called_once_with(target)
+        self.assertEqual(window.office_progress.value(), 100)
 
     def test_batchable_operations_cover_common_tools(self):
         for expected in ("rotate", "compress", "watermark", "add_page_numbers", "clean_metadata"):
@@ -931,6 +1022,36 @@ class QtAppTests(unittest.TestCase):
 
         self.assertIsNotNone(window.annotation_preview_label.pixmap())
         self.assertFalse(window.annotation_preview_label.pixmap().isNull())
+
+    def test_annotation_tab_has_text_frame_choices(self):
+        window = VictorPdfToolsQt()
+        slugs = {
+            window.annotation_shape_list.item(index).data(Qt.UserRole)
+            for index in range(window.annotation_shape_list.count())
+        }
+        self.assertTrue({"box", "rect", "callout", "speech", "cloud"}.issubset(slugs))
+        window.set_annotation_shape("speech")
+        self.assertEqual(window.annotation_shape(), "speech")
+        style = window.annotation_style_values()
+        self.assertEqual(style["shape"], "speech")
+        self.assertFalse(window.annotation_cover_checkbox.isEnabled())
+        self.assertEqual(window.annotation_xy_label.text(), "插入點（箭咀尖端）")
+
+    def test_annotation_callout_click_uses_arrow_as_insert_point(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("cloud")
+        window.annotation_width_input.setText("120")
+        window.annotation_height_input.setText("40")
+        window.annotation_page_size = (300.0, 400.0)
+        window.annotation_preview_image = _white_image(300, 400)
+        window.set_annotation_position_from_click(QPoint(150, 200))
+        style = window.annotation_style_values()
+        self.assertAlmostEqual(style["pointer_x"], 150.0, delta=1)
+        self.assertAlmostEqual(style["pointer_y"], 200.0, delta=1)
+        self.assertGreater(style["pdf_y"], style["pointer_y"])
+        self.assertAlmostEqual(style["pdf_x"], 150.0 - 60.0, delta=1)
+        self.assertIn("插入點", window.statusBar().currentMessage())
 
     def test_organize_grid_manual_reorder_setup(self):
         from PySide6.QtWidgets import QListWidget
@@ -1096,6 +1217,25 @@ class QtAppTests(unittest.TestCase):
         _page_index, markup = window.markup_items[0]
         self.assertEqual(markup.kind, "note")
         self.assertEqual(markup.contents, "看這裡")
+
+    def test_markup_callout_uses_drag_from_pointer_to_box(self):
+        window = VictorPdfToolsQt()
+        window.set_markup_pdf(self.source)
+        window.markup_page_size = (300.0, 400.0)
+        window.markup_preview_image = _white_image(300, 400)
+        callout_index = window.markup_tool_combo.findData("callout")
+        self.assertGreaterEqual(callout_index, 0)
+        window.markup_tool_combo.setCurrentIndex(callout_index)
+        window.markup_note_input.setText("請核對")
+
+        window.add_markup_from_rect(QPoint(40, 80), QPoint(180, 40))
+
+        self.assertEqual(len(window.markup_items), 1)
+        _page_index, markup = window.markup_items[0]
+        self.assertEqual(markup.kind, "callout")
+        self.assertEqual(markup.contents, "請核對")
+        slugs = {slug for slug, _label in window.MARKUP_TOOL_OPTIONS}
+        self.assertTrue({"callout", "speech", "cloud"}.issubset(slugs))
 
     def test_markup_delete_and_clear(self):
         window = VictorPdfToolsQt()

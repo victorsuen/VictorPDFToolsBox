@@ -1,9 +1,15 @@
 from __future__ import annotations
 
+import ctypes
 import io
+import math
 import re
+import shutil
+import subprocess
 import tempfile
+import threading
 import zipfile
+from collections.abc import Callable
 from copy import copy
 from dataclasses import dataclass
 from pathlib import Path
@@ -56,6 +62,17 @@ except Exception:
 
 PDF_SUFFIXES = {".pdf"}
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
+OFFICE_WORD_SUFFIXES = {".doc", ".docx", ".docm"}
+OFFICE_EXCEL_SUFFIXES = {".xls", ".xlsx", ".xlsm", ".xlsb"}
+OFFICE_POWERPOINT_SUFFIXES = {".ppt", ".pptx", ".pptm"}
+OFFICE_SUFFIXES = OFFICE_WORD_SUFFIXES | OFFICE_EXCEL_SUFFIXES | OFFICE_POWERPOINT_SUFFIXES
+OFFICE_DIALOG_FILTER = (
+    "Office files (*.doc *.docx *.docm *.xls *.xlsx *.xlsm *.xlsb *.ppt *.pptx *.pptm);;"
+    "Word (*.doc *.docx *.docm);;"
+    "Excel (*.xls *.xlsx *.xlsm *.xlsb);;"
+    "PowerPoint (*.ppt *.pptx *.pptm);;"
+    "All files (*.*)"
+)
 OCR_LANGUAGE_OPTIONS = {
     "eng": "English",
     "chi_tra": "Traditional Chinese",
@@ -216,6 +233,35 @@ def parse_pages(spec: str, page_count: int) -> list[int]:
 
 def safe_output_name(name: str) -> str:
     return re.sub(r"[^A-Za-z0-9._ -]+", "_", name).strip() or "output.pdf"
+
+
+_WINDOWS_FORBIDDEN_NAME = re.compile(r'[<>:"/\\|?*\x00-\x1f]')
+
+
+def suggested_pdf_name_for_source(source: Path) -> str:
+    """Keep the original file name (including CJK), only swapping the suffix to .pdf."""
+
+    stem = _WINDOWS_FORBIDDEN_NAME.sub("_", Path(source).stem).strip(" .") or "output"
+    return f"{stem}.pdf"
+
+
+def suggested_pdf_path_for_source(source: Path) -> Path:
+    source = Path(source)
+    return source.with_name(suggested_pdf_name_for_source(source))
+
+
+def _report_office_progress(
+    progress: Callable[[int, int, str], None] | None,
+    current: int,
+    total: int,
+    text: str,
+) -> None:
+    if progress is None:
+        return
+    try:
+        progress(current, total, text)
+    except Exception:
+        return
 
 
 def open_reader(path: Path, password: str = "") -> PdfReader:
@@ -1089,9 +1135,30 @@ def pdf_to_images(
     return len(generated)
 
 
-def images_to_pdf(paths: list[Path], target: Path) -> None:
+def images_to_pdf(
+    paths: list[Path],
+    target: Path,
+    resolution: float = 150.0,
+    lossless: bool = False,
+) -> None:
     if not paths:
         raise ValueError("請選擇圖片。")
+    dpi = float(resolution) or 150.0
+    if lossless and PYMUPDF_AVAILABLE:
+        document = fitz.open()
+        try:
+            for image_path in paths:
+                with Image.open(image_path) as image:
+                    width_px, height_px = image.size
+                page = document.new_page(
+                    width=width_px * 72.0 / dpi,
+                    height=height_px * 72.0 / dpi,
+                )
+                page.insert_image(page.rect, filename=str(image_path))
+            document.save(str(target), deflate=True)
+        finally:
+            document.close()
+        return
     converted: list[Image.Image] = []
     for image_path in paths:
         image = Image.open(image_path)
@@ -1099,9 +1166,452 @@ def images_to_pdf(paths: list[Path], target: Path) -> None:
             image = image.convert("RGB")
         converted.append(image)
     first, rest = converted[0], converted[1:]
-    first.save(target, save_all=True, append_images=rest, resolution=150.0)
+    first.save(
+        target,
+        save_all=True,
+        append_images=rest,
+        resolution=dpi,
+        quality=95,
+    )
     for image in converted:
         image.close()
+
+
+def office_app_for_path(path: Path) -> str:
+    suffix = path.suffix.lower()
+    if suffix in OFFICE_WORD_SUFFIXES:
+        return "word"
+    if suffix in OFFICE_EXCEL_SUFFIXES:
+        return "excel"
+    if suffix in OFFICE_POWERPOINT_SUFFIXES:
+        return "powerpoint"
+    raise ValueError(f"不支援的 Office 格式：{path.suffix or path.name}")
+
+
+def find_libreoffice_executable() -> Path | None:
+    for name in ("soffice", "soffice.exe", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    home = Path.home()
+    for candidate in (
+        Path(r"C:\Program Files\LibreOffice\program\soffice.exe"),
+        Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
+        Path(r"C:\Program Files\LibreOffice 24\program\soffice.exe"),
+        Path(r"C:\Program Files\LibreOffice 25\program\soffice.exe"),
+        home / r"AppData\Local\Programs\LibreOffice\program\soffice.exe",
+        Path("/usr/bin/soffice"),
+        Path("/usr/bin/libreoffice"),
+    ):
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _dispatch_com_app(win32com_client, prog_ids: tuple[str, ...]):
+    last_error: Exception | None = None
+    for prog_id in prog_ids:
+        for factory in (win32com_client.DispatchEx, win32com_client.Dispatch):
+            try:
+                return factory(prog_id)
+            except Exception as exc:
+                last_error = exc
+    raise last_error or RuntimeError("無法啟動 Office 應用程式。")
+
+
+def _libreoffice_pdf_filter(source: Path) -> str:
+    """PDF export filter that keeps original images and embeds fonts."""
+
+    exporter = {
+        "word": "writer_pdf_Export",
+        "excel": "calc_pdf_Export",
+        "powerpoint": "impress_pdf_Export",
+    }[office_app_for_path(source)]
+    options = (
+        '{"UseLosslessCompression":{"type":"boolean","value":"true"},'
+        '"ReduceImageResolution":{"type":"boolean","value":"false"},'
+        '"MaxImageResolution":{"type":"long","value":"600"},'
+        '"Quality":{"type":"long","value":"100"},'
+        '"SelectPdfVersion":{"type":"long","value":"0"},'
+        '"EmbedStandardFonts":{"type":"boolean","value":"true"}}'
+    )
+    return f"pdf:{exporter}:{options}"
+
+
+def _try_com_call(action, *fallbacks):
+    errors: list[Exception] = []
+    for attempt in (action, *fallbacks):
+        try:
+            return attempt()
+        except Exception as exc:
+            errors.append(exc)
+    raise errors[-1]
+
+
+def _hide_com_window(app) -> None:
+    """Keep Office automation in the background; PowerPoint often forbids Visible=False."""
+
+    for value in (False, 0):
+        try:
+            app.Visible = value
+            break
+        except Exception:
+            continue
+    else:
+        try:
+            app.Visible = True
+        except Exception:
+            pass
+        try:
+            app.WindowState = 2
+        except Exception:
+            pass
+    for value in (0, 1):
+        try:
+            app.DisplayAlerts = value
+            break
+        except Exception:
+            continue
+    hwnd = 0
+    try:
+        hwnd = int(app.HWND)
+    except Exception:
+        hwnd = 0
+    if hwnd:
+        try:
+            ctypes.windll.user32.ShowWindow(hwnd, 0)
+        except Exception:
+            pass
+
+
+def _prepare_word_font_embedding(document) -> None:
+    for name, value in (
+        ("EmbedTrueTypeFonts", True),
+        ("DoNotEmbedSystemFonts", False),
+        ("SaveSubsetFonts", False),
+    ):
+        try:
+            setattr(document, name, value)
+        except Exception:
+            continue
+
+
+def _export_word_pdf(word, source_s: str, target_s: str, progress=None) -> None:
+    _report_office_progress(progress, 0, 1, f"正在轉換 {Path(source_s).name}")
+    document = None
+    try:
+        document = _try_com_call(
+            lambda: word.Documents.Open(source_s, False, True, False),
+            lambda: word.Documents.Open(source_s),
+        )
+        _prepare_word_font_embedding(document)
+        _try_com_call(
+            lambda: document.ExportAsFixedFormat(
+                target_s,
+                17,
+                False,
+                0,
+                0,
+                1,
+                1,
+                0,
+                True,
+                True,
+                1,
+                True,
+                False,
+                False,
+            ),
+            lambda: document.ExportAsFixedFormat(target_s, 17, False, 0),
+            lambda: document.SaveAs(target_s, 17),
+        )
+        _report_office_progress(progress, 1, 1, "完成")
+    finally:
+        if document is not None:
+            try:
+                document.Close(False)
+            except Exception:
+                pass
+
+
+def _export_excel_pdf(excel, source_s: str, target_s: str, progress=None) -> None:
+    _report_office_progress(progress, 0, 1, f"正在轉換 {Path(source_s).name}")
+    workbook = None
+    try:
+        workbook = _try_com_call(
+            lambda: excel.Workbooks.Open(source_s, UpdateLinks=0, ReadOnly=True),
+            lambda: excel.Workbooks.Open(source_s),
+        )
+        _try_com_call(
+            lambda: workbook.ExportAsFixedFormat(0, target_s, 0, True, False, None, None, False),
+            lambda: workbook.ExportAsFixedFormat(0, target_s, 0),
+            lambda: workbook.ExportAsFixedFormat(0, target_s),
+        )
+        _report_office_progress(progress, 1, 1, "完成")
+    finally:
+        if workbook is not None:
+            try:
+                workbook.Close(False)
+            except Exception:
+                pass
+
+
+def _export_powerpoint_pdf(powerpoint, source_s: str, target_s: str, progress=None) -> None:
+    _hide_com_window(powerpoint)
+    _report_office_progress(progress, 0, 1, f"正在開啟 {Path(source_s).name}")
+    presentation = None
+    try:
+        presentation = _try_com_call(
+            lambda: powerpoint.Presentations.Open(source_s, True, False, False),
+            lambda: powerpoint.Presentations.Open(source_s, False, False, False),
+            lambda: powerpoint.Presentations.Open(source_s, WithWindow=False),
+            lambda: powerpoint.Presentations.Open(source_s),
+        )
+        _hide_com_window(powerpoint)
+        try:
+            _export_powerpoint_slides_as_pdf(presentation, Path(target_s), progress=progress)
+        except Exception:
+            _try_com_call(
+                lambda: presentation.SaveAs(target_s, 32, True),
+                lambda: presentation.SaveAs(target_s, 32),
+                lambda: presentation.ExportAsFixedFormat(target_s, 2, 2),
+            )
+    finally:
+        if presentation is not None:
+            try:
+                presentation.Saved = True
+            except Exception:
+                pass
+            try:
+                presentation.Close()
+            except Exception:
+                pass
+
+
+def _export_powerpoint_slides_as_pdf(presentation, target: Path, dpi: int = 300, progress=None) -> None:
+    """Rasterize each slide at print DPI so bevel, shadow and vectors match the deck."""
+
+    count = int(presentation.Slides.Count)
+    if count <= 0:
+        raise RuntimeError("簡報沒有投影片。")
+    width_pt = float(presentation.PageSetup.SlideWidth)
+    height_pt = float(presentation.PageSetup.SlideHeight)
+    px_w = max(int(round(width_pt / 72.0 * dpi)), 1)
+    px_h = max(int(round(height_pt / 72.0 * dpi)), 1)
+    total = count + 1
+    with tempfile.TemporaryDirectory() as temp_dir:
+        slide_dir = Path(temp_dir)
+        pngs: list[Path] = []
+        for index in range(1, count + 1):
+            _report_office_progress(progress, index - 1, total, f"正在匯出第 {index} / {count} 頁")
+            png = slide_dir / f"slide-{index:04d}.png"
+            presentation.Slides(index).Export(str(png), "PNG", px_w, px_h)
+            if not png.is_file() or png.stat().st_size == 0:
+                raise RuntimeError(f"第 {index} 頁投影片匯出失敗。")
+            pngs.append(png)
+        _report_office_progress(progress, count, total, "正在寫入 PDF")
+        images_to_pdf(pngs, target, resolution=float(dpi), lossless=True)
+        _report_office_progress(progress, total, total, "完成")
+
+
+def _export_office_via_com(source: Path, target: Path, progress=None) -> None:
+    import win32com.client
+
+    app_kind = office_app_for_path(source)
+    source_s = str(source.resolve())
+    target_s = str(target.resolve())
+    if app_kind == "word":
+        word = _dispatch_com_app(win32com.client, ("Word.Application", "Word.Application.16"))
+        _hide_com_window(word)
+        try:
+            _export_word_pdf(word, source_s, target_s, progress=progress)
+        finally:
+            try:
+                word.Quit()
+            except Exception:
+                pass
+        return
+    if app_kind == "excel":
+        excel = _dispatch_com_app(win32com.client, ("Excel.Application", "Excel.Application.16"))
+        _hide_com_window(excel)
+        try:
+            _export_excel_pdf(excel, source_s, target_s, progress=progress)
+        finally:
+            try:
+                excel.Quit()
+            except Exception:
+                pass
+        return
+    powerpoint = _dispatch_com_app(win32com.client, ("PowerPoint.Application", "PowerPoint.Application.16"))
+    try:
+        _export_powerpoint_pdf(powerpoint, source_s, target_s, progress=progress)
+    finally:
+        try:
+            powerpoint.Quit()
+        except Exception:
+            pass
+
+
+def _convert_office_with_com(
+    source: Path,
+    target: Path,
+    progress=None,
+    pump: Callable[[], None] | None = None,
+) -> tuple[bool, str]:
+    try:
+        import pythoncom  # noqa: F401
+        import win32com.client  # noqa: F401
+    except ImportError:
+        return False, "未安裝 Windows COM 元件。"
+
+    result: dict[str, object] = {"ok": False, "error": ""}
+
+    def worker() -> None:
+        try:
+            import pythoncom
+
+            pythoncom.CoInitializeEx(pythoncom.COINIT_APARTMENTTHREADED)
+            try:
+                _export_office_via_com(source, target, progress=progress)
+                if target.is_file() and target.stat().st_size > 0:
+                    result["ok"] = True
+                else:
+                    result["error"] = "Microsoft Office 沒有產生 PDF。"
+            finally:
+                pythoncom.CoUninitialize()
+        except Exception as exc:
+            result["error"] = str(exc) or type(exc).__name__
+
+    thread = threading.Thread(target=worker, name="office-com-sta", daemon=True)
+    thread.start()
+    timeout = 360 if office_app_for_path(source) == "powerpoint" else 180
+    if pump is None:
+        thread.join(timeout=timeout)
+    else:
+        waited = 0.0
+        slice_s = 0.05
+        while thread.is_alive():
+            pump()
+            thread.join(timeout=slice_s)
+            waited += slice_s
+            if waited >= timeout:
+                break
+    if thread.is_alive():
+        return False, "Office 轉換逾時。請確認 Word / Excel / PowerPoint 沒有跳出對話框。"
+    if result["ok"]:
+        return True, ""
+    return False, str(result["error"] or "Microsoft Office 無法轉換此檔。")
+
+
+def _convert_office_with_libreoffice(source: Path, target: Path, progress=None) -> None:
+    executable = find_libreoffice_executable()
+    if executable is None:
+        raise ValueError("未找到 LibreOffice。")
+    _report_office_progress(progress, 0, 1, f"正在用 LibreOffice 轉換 {source.name}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        out_dir = Path(temp_dir)
+        command = [
+            str(executable),
+            "--headless",
+            "--norestore",
+            "--nolockcheck",
+            "--convert-to",
+            _libreoffice_pdf_filter(source),
+            "--outdir",
+            str(out_dir),
+            str(source.resolve()),
+        ]
+        completed = subprocess.run(command, capture_output=True, timeout=180, check=False)
+        produced = out_dir / f"{source.stem}.pdf"
+        if not produced.exists():
+            fallback = [
+                str(executable),
+                "--headless",
+                "--norestore",
+                "--nolockcheck",
+                "--convert-to",
+                "pdf",
+                "--outdir",
+                str(out_dir),
+                str(source.resolve()),
+            ]
+            completed = subprocess.run(fallback, capture_output=True, timeout=180, check=False)
+            produced = out_dir / f"{source.stem}.pdf"
+        if not produced.exists():
+            pdfs = list(out_dir.glob("*.pdf"))
+            if not pdfs:
+                detail = (completed.stderr or completed.stdout or b"").decode("utf-8", errors="replace").strip()
+                raise ValueError(detail or "LibreOffice 沒有產生 PDF。")
+            produced = pdfs[0]
+        shutil.copy2(produced, target)
+        _report_office_progress(progress, 1, 1, "完成")
+
+
+def convert_office_file_to_pdf(
+    source: Path,
+    target: Path,
+    progress=None,
+    pump: Callable[[], None] | None = None,
+) -> None:
+    if not source.is_file():
+        raise ValueError(f"找不到檔案：{source.name}")
+    office_app_for_path(source)
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    _report_office_progress(progress, 0, 1, f"正在準備 {source.name}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        local_source = Path(temp_dir) / source.name
+        shutil.copy2(source, local_source)
+        com_ok, com_error = _convert_office_with_com(
+            local_source, target, progress=progress, pump=pump
+        )
+        if com_ok:
+            return
+        try:
+            _convert_office_with_libreoffice(local_source, target, progress=progress)
+        except Exception as libre_error:
+            details = []
+            if com_error:
+                details.append(f"Microsoft Office：{com_error}")
+            details.append(f"LibreOffice：{libre_error}")
+            raise ValueError(
+                "無法轉換 Office 檔。請確認 Word / Excel / PowerPoint 可開啟此檔，"
+                "或安裝 LibreOffice 後再試。\n" + "\n".join(details)
+            ) from libre_error
+    if not target.is_file() or target.stat().st_size == 0:
+        raise ValueError(f"轉換失敗，沒有產生 PDF：{source.name}")
+
+
+def office_files_to_pdf(
+    paths: list[Path],
+    target: Path,
+    progress=None,
+    pump: Callable[[], None] | None = None,
+) -> int:
+    office_paths = [path for path in paths if path.suffix.lower() in OFFICE_SUFFIXES]
+    if not office_paths:
+        raise ValueError("請加入 Word、Excel 或 PowerPoint 檔案。")
+    target = Path(target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if len(office_paths) == 1:
+        convert_office_file_to_pdf(office_paths[0], target, progress=progress, pump=pump)
+        return 1
+    with tempfile.TemporaryDirectory() as temp_dir:
+        converted: list[Path] = []
+        file_count = len(office_paths)
+        for index, source in enumerate(office_paths, start=1):
+            prefix = f"({index}/{file_count}) {source.name}："
+
+            def nested(current: int, total: int, text: str, prefix=prefix) -> None:
+                _report_office_progress(progress, current, total, prefix + text)
+
+            pdf_path = Path(temp_dir) / f"{index:03d}-{suggested_pdf_name_for_source(source)}"
+            convert_office_file_to_pdf(source, pdf_path, progress=nested, pump=pump)
+            converted.append(pdf_path)
+        _report_office_progress(progress, 0, 1, "正在合併 PDF")
+        merge_pdf_files(converted, target)
+        _report_office_progress(progress, 1, 1, "完成")
+    return len(office_paths)
 
 
 ANNOTATION_FONT_OPTIONS = {
@@ -1161,6 +1671,8 @@ def add_text_overlay_annotation(
     font_key: str = "helvetica",
     bold: bool = False,
     color_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    shape: str = "box",
+    pointer: tuple[float, float] | None = None,
 ) -> None:
     reader = open_reader(source, password)
     if page_index < 0 or page_index >= len(reader.pages):
@@ -1174,6 +1686,51 @@ def add_text_overlay_annotation(
     text_height = max(float(font_size) * 1.8, 24.0)
     rect_width = max(float(cover_width), 80.0)
     rect_height = max(float(cover_height), text_height)
+
+    shape = (shape or "box").strip().lower()
+    if shape in CALLOUT_KINDS:
+        pointer_x, pointer_y = pointer if pointer is not None else (x + rect_width / 2.0, y - 16.0)
+        markup = MarkupAnnotation(
+            kind=shape,
+            x0=pointer_x,
+            y0=pointer_y,
+            x1=x,
+            y1=y,
+            color_rgb=color_rgb,
+            contents=text,
+            box_width=rect_width,
+            box_height=rect_height,
+        )
+        da = build_annotation_da(font_key, font_size, bold, color_rgb)
+        for annotation in iter_markup_pdf_annotations(markup):
+            if annotation.get("/Subtype") == "/FreeText":
+                annotation[NameObject("/DA")] = TextStringObject(da)
+            add_annotation_to_page(writer, page, annotation)
+        write_pdf(writer, target)
+        return
+
+    if shape == "rect":
+        fill = tuple(channel * 0.18 + 0.82 for channel in color_rgb)
+        frame = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/Square"),
+                NameObject("/Rect"): ArrayObject(
+                    [
+                        FloatObject(x),
+                        FloatObject(y),
+                        FloatObject(x + rect_width),
+                        FloatObject(y + rect_height),
+                    ]
+                ),
+                NameObject("/C"): _color_array(color_rgb),
+                NameObject("/IC"): _color_array(fill),
+                NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), FloatObject(1.5)]),
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        add_annotation_to_page(writer, page, frame)
+        cover_original = False
 
     if cover_original:
         cover = DictionaryObject(
@@ -1408,7 +1965,12 @@ MARKUP_SUBTYPES = {
     "line": "/Line",
     "arrow": "/Line",
     "note": "/Text",
+    "callout": "/FreeText",
+    "speech": "/Polygon",
+    "cloud": "/Polygon",
 }
+
+CALLOUT_KINDS = frozenset({"callout", "speech", "cloud"})
 
 MARKUP_COLOR_PRESETS: dict[str, tuple[float, float, float]] = {
     "yellow": (1.0, 0.92, 0.23),
@@ -1436,6 +1998,20 @@ class MarkupAnnotation:
     y1: float
     color_rgb: tuple[float, float, float] = (1.0, 0.92, 0.23)
     contents: str = ""
+    box_width: float = 0.0
+    box_height: float = 0.0
+
+
+@dataclass(frozen=True)
+class CalloutLayout:
+    pointer: tuple[float, float]
+    left: float
+    bottom: float
+    right: float
+    top: float
+    attach: tuple[float, float]
+    vertices: tuple[tuple[float, float], ...]
+    text: str
 
 
 def _normalized_rect(x0: float, y0: float, x1: float, y1: float) -> tuple[float, float, float, float]:
@@ -1447,10 +2023,285 @@ def _color_array(color_rgb: tuple[float, float, float]) -> ArrayObject:
     return ArrayObject([FloatObject(red), FloatObject(green), FloatObject(blue)])
 
 
+def _closest_point_on_rect(
+    px: float,
+    py: float,
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+) -> tuple[float, float]:
+    if left < px < right and bottom < py < top:
+        candidates = (
+            (px - left, (left, py)),
+            (right - px, (right, py)),
+            (py - bottom, (px, bottom)),
+            (top - py, (px, top)),
+        )
+        return min(candidates, key=lambda item: item[0])[1]
+    return (min(max(px, left), right), min(max(py, bottom), top))
+
+
+def _speech_vertices(
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+    px: float,
+    py: float,
+    tail: float = 12.0,
+) -> tuple[tuple[float, float], ...]:
+    ax, ay = _closest_point_on_rect(px, py, left, bottom, right, top)
+    edge_scores = {
+        "bottom": abs(ay - bottom) + (0.0 if left - 0.5 <= ax <= right + 0.5 else 1e6),
+        "top": abs(ay - top) + (0.0 if left - 0.5 <= ax <= right + 0.5 else 1e6),
+        "left": abs(ax - left) + (0.0 if bottom - 0.5 <= ay <= top + 0.5 else 1e6),
+        "right": abs(ax - right) + (0.0 if bottom - 0.5 <= ay <= top + 0.5 else 1e6),
+    }
+    edge = min(edge_scores, key=edge_scores.get)
+    if edge == "bottom":
+        a1 = (max(left, ax - tail), bottom)
+        a2 = (min(right, ax + tail), bottom)
+        return ((left, bottom), a1, (px, py), a2, (right, bottom), (right, top), (left, top))
+    if edge == "right":
+        a1 = (right, max(bottom, ay - tail))
+        a2 = (right, min(top, ay + tail))
+        return ((left, bottom), (right, bottom), a1, (px, py), a2, (right, top), (left, top))
+    if edge == "top":
+        a1 = (min(right, ax + tail), top)
+        a2 = (max(left, ax - tail), top)
+        return ((left, bottom), (right, bottom), (right, top), a1, (px, py), a2, (left, top))
+    a1 = (left, min(top, ay + tail))
+    a2 = (left, max(bottom, ay - tail))
+    return ((left, bottom), (right, bottom), (right, top), (left, top), a1, (px, py), a2)
+
+
+def _cloud_vertices(
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+    px: float,
+    py: float,
+) -> tuple[tuple[float, float], ...]:
+    cx = (left + right) / 2.0
+    cy = (bottom + top) / 2.0
+    rx = max((right - left) / 2.0, 8.0) * 1.06
+    ry = max((top - bottom) / 2.0, 8.0) * 1.18
+    count = 28
+    points = []
+    for index in range(count):
+        angle = index / count * 2.0 * math.pi
+        bump = 1.0 + 0.16 * math.cos(index * 2.15)
+        points.append((cx + rx * bump * math.cos(angle), cy + ry * bump * math.sin(angle)))
+    nearest = min(range(count), key=lambda index: (points[index][0] - px) ** 2 + (points[index][1] - py) ** 2)
+    points[nearest] = (px, py)
+    return tuple(points)
+
+
+def callout_layout(markup: MarkupAnnotation) -> CalloutLayout:
+    """Pointer is (x0, y0). Box is either explicit or centred on (x1, y1)."""
+
+    px, py = markup.x0, markup.y0
+    if markup.box_width > 1 and markup.box_height > 1:
+        left = markup.x1
+        bottom = markup.y1
+        right = left + markup.box_width
+        top = bottom + markup.box_height
+        if left - 2 <= px <= right + 2 and bottom - 2 <= py <= top + 2:
+            px = left - 28.0
+            py = bottom - 16.0
+    else:
+        cx, cy = markup.x1, markup.y1
+        if abs(cx - px) < 8 and abs(cy - py) < 8:
+            cx = px + 130.0
+            cy = py + 48.0
+        width = min(max(abs(cx - px) * 0.45, 120.0), 260.0)
+        height = min(max(abs(cy - py) * 0.28, 40.0), 90.0)
+        left = cx - width / 2.0
+        right = cx + width / 2.0
+        bottom = cy - height / 2.0
+        top = cy + height / 2.0
+    attach = _closest_point_on_rect(px, py, left, bottom, right, top)
+    text = (markup.contents or "").strip() or "註解"
+    vertices = (
+        _cloud_vertices(left, bottom, right, top, px, py)
+        if markup.kind == "cloud"
+        else _speech_vertices(left, bottom, right, top, px, py)
+    )
+    return CalloutLayout((px, py), left, bottom, right, top, attach, vertices, text)
+
+
+CALLOUT_POINTER_GAP = 18.0
+
+
+def callout_box_from_pointer(
+    pointer_x: float,
+    pointer_y: float,
+    rect_width: float,
+    rect_height: float,
+    gap: float = CALLOUT_POINTER_GAP,
+) -> tuple[float, float]:
+    """Return the text-box origin so the tail/arrow sits on the pointer."""
+
+    return (pointer_x - max(float(rect_width), 1.0) / 2.0, pointer_y + gap)
+
+
+def paint_callout_markup(draw, markup: MarkupAnnotation, to_image, draw_text: bool = True) -> None:
+    """Draw a callout / speech / cloud shape onto a PIL overlay."""
+
+    from PIL import ImageFont
+
+    layout = callout_layout(markup)
+    red, green, blue = (int(max(0.0, min(channel, 1.0)) * 255) for channel in markup.color_rgb)
+    fill = (
+        int(red * 0.22 + 255 * 0.78),
+        int(green * 0.22 + 255 * 0.78),
+        int(blue * 0.22 + 255 * 0.78),
+        230,
+    )
+    outline = (red, green, blue, 255)
+
+    def image_point(x: float, y: float) -> tuple[float, float]:
+        return to_image(x, y)
+
+    p1 = image_point(layout.left, layout.top)
+    p2 = image_point(layout.right, layout.bottom)
+    box = (min(p1[0], p2[0]), min(p1[1], p2[1]), max(p1[0], p2[0]), max(p1[1], p2[1]))
+    if markup.kind == "callout":
+        draw.rectangle(box, fill=fill, outline=outline, width=2)
+        pointer = image_point(*layout.pointer)
+        attach = image_point(*layout.attach)
+        draw.line([attach, pointer], fill=outline, width=2)
+        size = 7
+        draw.polygon(
+            [
+                pointer,
+                (pointer[0] - size, pointer[1] - size),
+                (pointer[0] + size, pointer[1] - size),
+            ],
+            fill=outline,
+        )
+    else:
+        draw.polygon([image_point(x, y) for x, y in layout.vertices], fill=fill, outline=outline)
+    if not draw_text:
+        return
+    try:
+        font = ImageFont.load_default()
+    except Exception:
+        font = None
+    draw.text((box[0] + 6, box[1] + 5), layout.text[:28], fill=(28, 28, 28, 255), font=font)
+
+
+def _build_freetext_callout(markup: MarkupAnnotation) -> DictionaryObject:
+    layout = callout_layout(markup)
+    color = _color_array(markup.color_rgb)
+    return DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/FreeText"),
+            NameObject("/IT"): NameObject("/FreeTextCallout"),
+            NameObject("/Rect"): ArrayObject(
+                [
+                    FloatObject(layout.left),
+                    FloatObject(layout.bottom),
+                    FloatObject(layout.right),
+                    FloatObject(layout.top),
+                ]
+            ),
+            NameObject("/Contents"): TextStringObject(layout.text),
+            NameObject("/DA"): TextStringObject("/Helv 10 Tf 0 0 0 rg"),
+            NameObject("/C"): color,
+            NameObject("/CL"): ArrayObject(
+                [
+                    FloatObject(layout.pointer[0]),
+                    FloatObject(layout.pointer[1]),
+                    FloatObject(layout.attach[0]),
+                    FloatObject(layout.attach[1]),
+                ]
+            ),
+            NameObject("/LE"): NameObject("/OpenArrow"),
+            NameObject("/BS"): DictionaryObject(
+                {NameObject("/W"): NumberObject(1), NameObject("/S"): NameObject("/S")}
+            ),
+            NameObject("/F"): NumberObject(4),
+        }
+    )
+
+
+def _build_shape_polygon(markup: MarkupAnnotation) -> DictionaryObject:
+    layout = callout_layout(markup)
+    vertices = ArrayObject()
+    for x, y in layout.vertices:
+        vertices.append(FloatObject(x))
+        vertices.append(FloatObject(y))
+    xs = [point[0] for point in layout.vertices]
+    ys = [point[1] for point in layout.vertices]
+    fill = tuple(channel * 0.22 + 1.0 * 0.78 for channel in markup.color_rgb)
+    annotation = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/Polygon"),
+            NameObject("/Rect"): ArrayObject(
+                [
+                    FloatObject(min(xs) - 2),
+                    FloatObject(min(ys) - 2),
+                    FloatObject(max(xs) + 2),
+                    FloatObject(max(ys) + 2),
+                ]
+            ),
+            NameObject("/Vertices"): vertices,
+            NameObject("/C"): _color_array(markup.color_rgb),
+            NameObject("/IC"): _color_array(fill),
+            NameObject("/BS"): DictionaryObject({NameObject("/W"): NumberObject(1)}),
+            NameObject("/Contents"): TextStringObject(layout.text),
+            NameObject("/F"): NumberObject(4),
+        }
+    )
+    if markup.kind == "cloud":
+        annotation[NameObject("/BE")] = DictionaryObject(
+            {NameObject("/S"): NameObject("/C"), NameObject("/I"): NumberObject(1)}
+        )
+    return annotation
+
+
+def _build_box_freetext(markup: MarkupAnnotation) -> DictionaryObject:
+    layout = callout_layout(markup)
+    return DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/FreeText"),
+            NameObject("/Rect"): ArrayObject(
+                [
+                    FloatObject(layout.left + 4),
+                    FloatObject(layout.bottom + 4),
+                    FloatObject(layout.right - 4),
+                    FloatObject(layout.top - 4),
+                ]
+            ),
+            NameObject("/Contents"): TextStringObject(layout.text),
+            NameObject("/DA"): TextStringObject("/Helv 10 Tf 0 0 0 rg"),
+            NameObject("/C"): _color_array((1.0, 1.0, 1.0)),
+            NameObject("/BS"): DictionaryObject({NameObject("/W"): NumberObject(0)}),
+            NameObject("/F"): NumberObject(4),
+        }
+    )
+
+
+def iter_markup_pdf_annotations(markup: MarkupAnnotation) -> list[DictionaryObject]:
+    if markup.kind in {"speech", "cloud"}:
+        return [_build_shape_polygon(markup), _build_box_freetext(markup)]
+    return [build_markup_annotation(markup)]
+
+
 def build_markup_annotation(markup: MarkupAnnotation) -> DictionaryObject:
     kind = markup.kind
     if kind not in MARKUP_SUBTYPES:
         raise ValueError(f"未知的標註類型：{kind}")
+    if kind == "callout":
+        return _build_freetext_callout(markup)
+    if kind in {"speech", "cloud"}:
+        return _build_shape_polygon(markup)
     color = _color_array(markup.color_rgb)
 
     if kind in {"highlight", "underline", "strikeout"}:
@@ -1577,7 +2428,8 @@ def apply_markup_annotations(
     for page_index, markup in markups:
         if page_index < 0 or page_index >= page_count:
             continue
-        add_annotation_to_page(writer, writer.pages[page_index], build_markup_annotation(markup))
+        for annotation in iter_markup_pdf_annotations(markup):
+            add_annotation_to_page(writer, writer.pages[page_index], annotation)
         applied += 1
     if applied == 0:
         raise ValueError("沒有可套用的標註。")

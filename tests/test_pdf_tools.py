@@ -29,6 +29,13 @@ from pdf_core import (
     flatten_form_fields,
     images_to_pdf,
     insert_pdf_pages,
+    office_app_for_path,
+    office_files_to_pdf,
+    convert_office_file_to_pdf,
+    _libreoffice_pdf_filter,
+    suggested_pdf_name_for_source,
+    suggested_pdf_path_for_source,
+    _hide_com_window,
     list_form_fields,
     parse_page_groups,
     replace_pdf_pages,
@@ -39,6 +46,8 @@ from pdf_core import (
     add_text_stamp,
     add_watermark,
     build_annotation_da,
+    callout_layout,
+    callout_box_from_pointer,
     clean_metadata,
     merge_pdf_files,
     merge_text_blocks,
@@ -111,6 +120,189 @@ class PdfToolsTests(unittest.TestCase):
 
         annots = PdfReader(str(target)).pages[0].get("/Annots")
         self.assertEqual(len(annots), 2)
+
+    def test_add_text_overlay_speech_shape_writes_polygon(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        add_text_overlay_annotation(
+            source=source,
+            target=target,
+            page_index=0,
+            x=80,
+            y=220,
+            text="看這裡",
+            font_size=12,
+            cover_original=True,
+            cover_width=160,
+            cover_height=36,
+            shape="speech",
+            pointer=(40, 180),
+        )
+
+        annots = PdfReader(str(target)).pages[0].get("/Annots")
+        self.assertGreaterEqual(len(annots), 2)
+        subtypes = [str(item.get_object().get("/Subtype")) for item in annots]
+        self.assertIn("/Polygon", subtypes)
+        self.assertIn("/FreeText", subtypes)
+
+    def test_add_text_overlay_rect_shape_writes_frame(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        add_text_overlay_annotation(
+            source=source,
+            target=target,
+            page_index=0,
+            x=80,
+            y=220,
+            text="框住這段",
+            font_size=12,
+            cover_original=True,
+            cover_width=160,
+            cover_height=36,
+            shape="rect",
+        )
+
+        annots = PdfReader(str(target)).pages[0].get("/Annots")
+        subtypes = [str(item.get_object().get("/Subtype")) for item in annots]
+        self.assertIn("/Square", subtypes)
+        self.assertIn("/FreeText", subtypes)
+
+    def test_callout_layout_uses_explicit_box_size(self):
+        layout = callout_layout(
+            MarkupAnnotation(
+                "callout",
+                40,
+                50,
+                100,
+                200,
+                contents="註解",
+                box_width=180,
+                box_height=40,
+            )
+        )
+        self.assertAlmostEqual(layout.left, 100)
+        self.assertAlmostEqual(layout.bottom, 200)
+        self.assertAlmostEqual(layout.right, 280)
+        self.assertAlmostEqual(layout.top, 240)
+        self.assertEqual(layout.pointer, (40, 50))
+
+    def test_callout_box_from_pointer_centers_box_above_arrow(self):
+        left, bottom = callout_box_from_pointer(100, 50, 180, 40, gap=18)
+        self.assertAlmostEqual(left, 10)
+        self.assertAlmostEqual(bottom, 68)
+
+    def test_office_app_for_path_detects_word_excel_ppt(self):
+        self.assertEqual(office_app_for_path(Path("memo.docx")), "word")
+        self.assertEqual(office_app_for_path(Path("book.xlsx")), "excel")
+        self.assertEqual(office_app_for_path(Path("deck.pptx")), "powerpoint")
+        with self.assertRaises(ValueError):
+            office_app_for_path(Path("notes.txt"))
+
+    def test_libreoffice_pdf_filter_keeps_image_and_font_settings(self):
+        word_filter = _libreoffice_pdf_filter(Path("memo.docx"))
+        excel_filter = _libreoffice_pdf_filter(Path("book.xlsx"))
+        ppt_filter = _libreoffice_pdf_filter(Path("deck.pptx"))
+        self.assertIn("writer_pdf_Export", word_filter)
+        self.assertIn("calc_pdf_Export", excel_filter)
+        self.assertIn("impress_pdf_Export", ppt_filter)
+        self.assertIn("UseLosslessCompression", word_filter)
+        self.assertIn("ReduceImageResolution", word_filter)
+        self.assertIn("EmbedStandardFonts", word_filter)
+        self.assertIn('"value":"false"', word_filter)
+
+    def test_convert_office_file_requires_backend(self):
+        source = Path(self.temp_dir.name) / "memo.docx"
+        target = Path(self.temp_dir.name) / "memo.pdf"
+        source.write_bytes(b"fake-docx")
+        with patch("pdf_core._convert_office_with_com", return_value=(False, "COM 失敗")):
+            with patch("pdf_core.find_libreoffice_executable", return_value=None):
+                with self.assertRaises(ValueError) as ctx:
+                    convert_office_file_to_pdf(source, target)
+        message = str(ctx.exception)
+        self.assertIn("Office", message)
+        self.assertIn("COM 失敗", message)
+
+    def test_convert_office_file_uses_com_success(self):
+        source = Path(self.temp_dir.name) / "memo.docx"
+        target = Path(self.temp_dir.name) / "memo.pdf"
+        source.write_bytes(b"fake-docx")
+
+        def fake_com(src: Path, dest: Path, progress=None, pump=None):
+            seen.append(src)
+            writer = PdfWriter()
+            writer.add_blank_page(width=300, height=400)
+            with dest.open("wb") as stream:
+                writer.write(stream)
+            return True, ""
+
+        seen: list[Path] = []
+        with patch("pdf_core._convert_office_with_com", side_effect=fake_com):
+            with patch("pdf_core.find_libreoffice_executable") as find_lo:
+                convert_office_file_to_pdf(source, target)
+        find_lo.assert_not_called()
+        self.assertTrue(target.exists())
+        self.assertEqual(seen[0].name, source.name)
+        self.assertNotEqual(seen[0], source)
+
+    def test_suggested_pdf_name_keeps_chinese_stem(self):
+        source = Path(r"T:\Reporting\中海宏洋2026年中期业绩简报 v.1.pptx")
+        self.assertEqual(
+            suggested_pdf_name_for_source(source),
+            "中海宏洋2026年中期业绩简报 v.1.pdf",
+        )
+        self.assertEqual(
+            suggested_pdf_path_for_source(source),
+            Path(r"T:\Reporting\中海宏洋2026年中期业绩简报 v.1.pdf"),
+        )
+
+    def test_hide_com_window_prefers_invisible_app(self):
+        class FakeApp:
+            Visible = True
+            DisplayAlerts = 2
+            HWND = 0
+
+        app = FakeApp()
+        _hide_com_window(app)
+        self.assertFalse(app.Visible)
+
+    def test_images_to_pdf_lossless_keeps_page_size(self):
+        image_path = Path(self.temp_dir.name) / "slide.png"
+        Image.new("RGB", (3000, 1688), (240, 240, 240)).save(image_path)
+        target = Path(self.temp_dir.name) / "slide.pdf"
+        images_to_pdf([image_path], target, resolution=300, lossless=True)
+        page = PdfReader(str(target)).pages[0]
+        self.assertAlmostEqual(float(page.mediabox.width), 720.0, delta=2)
+        self.assertAlmostEqual(float(page.mediabox.height), 405.12, delta=2)
+
+    def test_office_files_to_pdf_merges_converted_files(self):
+        source_a = Path(self.temp_dir.name) / "a.docx"
+        source_b = Path(self.temp_dir.name) / "b.xlsx"
+        source_a.write_bytes(b"fake-a")
+        source_b.write_bytes(b"fake-b")
+        target = Path(self.temp_dir.name) / "combined.pdf"
+
+        def fake_convert(source: Path, dest: Path, progress=None, pump=None) -> None:
+            writer = PdfWriter()
+            writer.add_blank_page(width=300, height=400)
+            dest.parent.mkdir(parents=True, exist_ok=True)
+            with dest.open("wb") as stream:
+                writer.write(stream)
+
+        with patch("pdf_core.convert_office_file_to_pdf", side_effect=fake_convert):
+            count = office_files_to_pdf([source_a, source_b], target)
+
+        self.assertEqual(count, 2)
+        self.assertEqual(len(PdfReader(str(target)).pages), 2)
 
     def test_replace_text_block_overlay(self):
         source = Path(self.temp_dir.name) / "source.pdf"
@@ -499,6 +691,43 @@ class PdfToolsTests(unittest.TestCase):
         )
         self.assertEqual(annotation.get("/Subtype"), "/Text")
         self.assertEqual(str(annotation.get("/Contents")), "檢查這裡")
+
+    def test_build_markup_annotation_callout_has_leader_line(self):
+        annotation = build_markup_annotation(
+            MarkupAnnotation("callout", 40, 60, 180, 140, contents="看這裡")
+        )
+        self.assertEqual(annotation.get("/Subtype"), "/FreeText")
+        self.assertEqual(annotation.get("/IT"), "/FreeTextCallout")
+        self.assertEqual(str(annotation.get("/Contents")), "看這裡")
+        self.assertEqual(len(annotation.get("/CL")), 4)
+
+    def test_build_markup_annotation_speech_is_polygon(self):
+        annotation = build_markup_annotation(
+            MarkupAnnotation("speech", 30, 40, 160, 120, contents="說明")
+        )
+        self.assertEqual(annotation.get("/Subtype"), "/Polygon")
+        self.assertGreaterEqual(len(annotation.get("/Vertices")), 14)
+
+    def test_apply_callout_and_speech_writes_annotations(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        applied = apply_markup_annotations(
+            source,
+            target,
+            [
+                (0, MarkupAnnotation("callout", 40, 50, 180, 140, contents="A")),
+                (0, MarkupAnnotation("speech", 60, 80, 200, 160, contents="B")),
+            ],
+        )
+
+        self.assertEqual(applied, 2)
+        annots = PdfReader(str(target)).pages[0].get("/Annots")
+        self.assertGreaterEqual(len(annots), 3)
 
     def test_apply_markup_annotations_adds_per_page(self):
         source = Path(self.temp_dir.name) / "source.pdf"
