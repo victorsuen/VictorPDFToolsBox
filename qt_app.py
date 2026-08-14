@@ -3,12 +3,13 @@ from __future__ import annotations
 import os
 import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image, ImageDraw, ImageFont
 from PIL.ImageQt import ImageQt
-from PySide6.QtCore import QByteArray, QMimeData, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal
-from PySide6.QtGui import QAction, QColor, QDrag, QDragEnterEvent, QDropEvent, QIcon, QIntValidator, QPainter, QPen, QPixmap, QPolygon
+from PySide6.QtCore import QByteArray, QEvent, QMimeData, QPoint, QRect, QSettings, QSize, Qt, QTimer, Signal
+from PySide6.QtGui import QAction, QColor, QCursor, QDrag, QDragEnterEvent, QDropEvent, QFont, QIcon, QIntValidator, QKeySequence, QPainter, QPen, QPixmap, QPolygon
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QApplication,
@@ -24,6 +25,7 @@ from PySide6.QtWidgets import (
     QHeaderView,
     QLabel,
     QLineEdit,
+    QListView,
     QListWidget,
     QListWidgetItem,
     QMainWindow,
@@ -34,6 +36,8 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSizePolicy,
+    QSlider,
+    QSplitter,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -56,22 +60,33 @@ from pdf_core import (
     PDF_SUFFIXES,
     PYMUPDF_AVAILABLE,
     BookmarkItem,
+    EraseMark,
     MarkupAnnotation,
     PageItem,
     TextBlock,
     add_bates_numbering,
     add_page_numbers,
     ANNOTATION_COLOR_PRESETS,
-    add_text_overlay_annotation,
+    ANNOTATION_FILL_PRESETS,
+    add_text_overlay_annotations,
     add_watermark,
+    WATERMARK_COLORS,
+    WATERMARK_POSITIONS,
+    WATERMARK_ROTATIONS,
+    apply_erase_marks,
+    apply_erase_then_text_overlays,
     apply_markup_annotations,
     apply_outline,
     BATES_POSITIONS,
     CALLOUT_KINDS,
     callout_box_from_pointer,
+    comment_box_from_pointer,
+    comment_polyline,
     crop_pdf_pages,
     extract_outline,
+    resolve_annotation_fill,
     rgb_to_hex,
+    text_contains_cjk,
     apply_text_markups_for_query,
     clean_metadata,
     compress_pdf,
@@ -91,6 +106,8 @@ from pdf_core import (
     encrypt_pdf,
     encrypt_pdf_with_permissions,
     extract_pdf_pages,
+    extract_pdf_page_indexes,
+    apply_edits_and_extract_pages,
     extract_page_text_blocks,
     extract_pdf_text,
     font_key_for_pdf_font,
@@ -279,9 +296,22 @@ THUMB_RENDER_BATCH = 8
 THUMB_RENDER_DELAY_MS = 16
 THUMB_RENDER_SCALE = 0.22
 THUMB_PRIORITY_COUNT = 24
-ANNOT_PREVIEW_MAX_WIDTH = 760
-ANNOT_PREVIEW_MAX_HEIGHT = 760
+ANNOT_PREVIEW_MAX_WIDTH = 1100
+ANNOT_PREVIEW_MAX_HEIGHT = 1100
 ANNOT_PREVIEW_OFFSET = 12
+ADVANCED_THUMB_ICON_SIZE = QSize(168, 216)
+ADVANCED_THUMB_MAX_SIZE = (168, 216)
+ADVANCED_THUMB_PANEL_WIDTH = 220
+ADVANCED_THUMB_PANEL_MIN_WIDTH = 160
+ADVANCED_THUMB_PANEL_MAX_WIDTH = 420
+ADVANCED_THUMB_BATCH_SIZE = 6
+ADVANCED_THUMB_DELAY_MS = 20
+ADVANCED_PREVIEW_ZOOM_MIN = 0.7
+ADVANCED_PREVIEW_ZOOM_MAX = 3.5
+ADVANCED_PREVIEW_ZOOM_STEP = 0.25
+ANNOTATION_BOX_PAD_X = 12.0
+ANNOTATION_BOX_PAD_Y = 10.0
+ANNOTATION_HANDLE_SIZE = 9
 WINDOW_MIN_SIZE = QSize(880, 560)
 WINDOW_DEFAULT_SIZE = QSize(1180, 760)
 
@@ -320,6 +350,121 @@ def wrap_side_panel(panel: QWidget, max_width: int = 330) -> QScrollArea:
     scroll.setMaximumWidth(max_width + 8)
     scroll.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
     return scroll
+
+
+FONT_SIZE_PRESETS = ("8", "10", "12", "14", "16", "18", "24", "36", "48", "72")
+FONT_SIZE_MIN = 6
+FONT_SIZE_MAX = 144
+
+
+def combo_font_size(combo: QComboBox, default: int = 12) -> int:
+    try:
+        value = int(str(combo.currentText()).strip())
+    except (TypeError, ValueError):
+        value = default
+    value = min(max(value, FONT_SIZE_MIN), FONT_SIZE_MAX)
+    text = str(value)
+    if str(combo.currentText()).strip() != text:
+        combo.blockSignals(True)
+        combo.setEditText(text)
+        combo.blockSignals(False)
+    return value
+
+
+def configure_font_size_combo(combo: QComboBox, default: str, on_change) -> None:
+    combo.setEditable(True)
+    combo.setInsertPolicy(QComboBox.NoInsert)
+    combo.clear()
+    for size in FONT_SIZE_PRESETS:
+        combo.addItem(size)
+    combo.setCurrentText(default)
+    combo.setValidator(QIntValidator(FONT_SIZE_MIN, FONT_SIZE_MAX, combo))
+    combo.setToolTip(f"可選預設值，或直接輸入 {FONT_SIZE_MIN}–{FONT_SIZE_MAX}")
+    combo.activated.connect(lambda *_args: on_change())
+    line = combo.lineEdit()
+    if line is not None:
+        line.setPlaceholderText(f"{FONT_SIZE_MIN}–{FONT_SIZE_MAX}")
+        line.editingFinished.connect(on_change)
+
+
+def annotation_text_pixel_width(font, text: str) -> float:
+    if not text:
+        return 0.0
+    if hasattr(font, "getlength"):
+        try:
+            return float(font.getlength(text))
+        except Exception:
+            pass
+    try:
+        bbox = font.getbbox(text)
+        return float(bbox[2] - bbox[0])
+    except Exception:
+        return float(len(text) * 8)
+
+
+def annotation_font_line_height(font, font_size: float) -> float:
+    try:
+        bbox = font.getbbox("Hg中")
+        measured = float(bbox[3] - bbox[1])
+        if measured > 1:
+            return max(measured * 1.18, float(font_size) * 1.15)
+    except Exception:
+        pass
+    return float(font_size) * 1.35
+
+
+def wrap_annotation_text(text: str, font, max_width: float) -> list[str]:
+    """Wrap CJK and Latin text so it stays inside max_width."""
+
+    lines: list[str] = []
+    limit = max(float(max_width), 8.0)
+    for paragraph in text.replace("\r", "").split("\n"):
+        if not paragraph:
+            lines.append("")
+            continue
+        current = ""
+        for char in paragraph:
+            trial = current + char
+            if current and annotation_text_pixel_width(font, trial) > limit:
+                lines.append(current)
+                current = char
+            else:
+                current = trial
+        if current:
+            lines.append(current)
+    return lines or [""]
+
+
+def annotation_handle_rects(box: QRect, size: int = ANNOTATION_HANDLE_SIZE) -> dict[str, QRect]:
+    if box.width() < 2 or box.height() < 2:
+        return {}
+    half = size // 2
+    left, top = box.x(), box.y()
+    right, bottom = left + box.width(), top + box.height()
+    cx, cy = (left + right) // 2, (top + bottom) // 2
+    return {
+        "nw": QRect(left - half, top - half, size, size),
+        "n": QRect(cx - half, top - half, size, size),
+        "ne": QRect(right - half, top - half, size, size),
+        "e": QRect(right - half, cy - half, size, size),
+        "se": QRect(right - half, bottom - half, size, size),
+        "s": QRect(cx - half, bottom - half, size, size),
+        "sw": QRect(left - half, bottom - half, size, size),
+        "w": QRect(left - half, cy - half, size, size),
+    }
+
+
+def point_near_segment(point: QPoint, start: QPoint, end: QPoint, tolerance: int = 10) -> bool:
+    dx = end.x() - start.x()
+    dy = end.y() - start.y()
+    length2 = dx * dx + dy * dy
+    px, py = point.x(), point.y()
+    if length2 < 1:
+        return (px - start.x()) ** 2 + (py - start.y()) ** 2 <= tolerance * tolerance
+    t = max(0.0, min(1.0, ((px - start.x()) * dx + (py - start.y()) * dy) / length2))
+    qx = start.x() + t * dx
+    qy = start.y() + t * dy
+    return (px - qx) ** 2 + (py - qy) ** 2 <= tolerance * tolerance
 
 
 class ToolFileList(QListWidget):
@@ -376,22 +521,117 @@ class PreviewImageLabel(QLabel):
 class AnnotationPreviewLabel(PreviewImageLabel):
     positionClicked = Signal(QPoint)
     rectDrawn = Signal(QPoint, QPoint)
+    boxResized = Signal(str, QPoint, QPoint)
+    boxMoved = Signal(QPoint, QPoint)
+    pointerMoved = Signal(QPoint)
+    elbowMoved = Signal(QPoint)
+    boxInteractionFinished = Signal()
+    pointerInteractionFinished = Signal()
+    elbowInteractionFinished = Signal()
+    copyRequested = Signal()
+    pasteRequested = Signal()
+    undoRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
         self.band_color = QColor(43, 106, 158)
+        self.box_rect = QRect()
+        self.pointer_rect = QRect()
+        self.elbow_p1 = QPoint()
+        self.elbow_p2 = QPoint()
+        self.handles_enabled = False
+        self.pointer_enabled = False
+        self.elbow_enabled = False
         self._start: QPoint | None = None
         self._current: QPoint | None = None
+        self._mode: str | None = None
+        self._handle: str | None = None
+
+    def _handle_at(self, point: QPoint) -> str | None:
+        if not self.handles_enabled:
+            return None
+        for name, rect in annotation_handle_rects(self.box_rect).items():
+            hit = rect.adjusted(-2, -2, 2, 2)
+            if hit.contains(point):
+                return name
+        return None
+
+    def _hit_pointer(self, point: QPoint) -> bool:
+        if not self.pointer_enabled or self.pointer_rect.width() < 1:
+            return False
+        return self.pointer_rect.contains(point)
+
+    def _hit_elbow(self, point: QPoint) -> bool:
+        if not self.elbow_enabled:
+            return False
+        return point_near_segment(point, self.elbow_p1, self.elbow_p2, 12)
+
+    def _box_contains(self, point: QPoint) -> bool:
+        if not self.handles_enabled or self.box_rect.width() < 2:
+            return False
+        return self.box_rect.adjusted(-2, -2, 2, 2).contains(point)
+
+    def _cursor_for_point(self, point: QPoint):
+        handle = self._handle_at(point)
+        if handle in {"n", "s"}:
+            return Qt.SizeVerCursor
+        if handle in {"e", "w"}:
+            return Qt.SizeHorCursor
+        if handle in {"nw", "se"}:
+            return Qt.SizeFDiagCursor
+        if handle in {"ne", "sw"}:
+            return Qt.SizeBDiagCursor
+        if self._hit_pointer(point):
+            return Qt.PointingHandCursor
+        if self._hit_elbow(point):
+            return Qt.SizeHorCursor
+        if self._box_contains(point):
+            return Qt.SizeAllCursor
+        if self.pointer_enabled:
+            return Qt.PointingHandCursor
+        return Qt.CrossCursor
 
     def mousePressEvent(self, event) -> None:
-        self._start = event.position().toPoint()
-        self._current = self._start
+        point = event.position().toPoint()
+        handle = self._handle_at(point)
+        self._start = point
+        self._current = point
+        if handle:
+            self._mode = "resize"
+            self._handle = handle
+        elif self._hit_pointer(point):
+            self._mode = "pointer"
+            self._handle = None
+        elif self._hit_elbow(point):
+            self._mode = "elbow"
+            self._handle = None
+        elif self._box_contains(point):
+            self._mode = "move"
+            self._handle = None
+        elif self.pointer_enabled:
+            self._mode = "pointer"
+            self._handle = None
+        else:
+            self._mode = "place"
+            self._handle = None
         self.update()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
+        point = event.position().toPoint()
+        self.setCursor(QCursor(self._cursor_for_point(point)))
         if self._start is not None:
-            self._current = event.position().toPoint()
+            self._current = point
+            if self._mode == "resize" and self._handle:
+                self.boxResized.emit(self._handle, self._start, point)
+            elif self._mode == "move":
+                self.boxMoved.emit(self._start, point)
+            elif self._mode == "pointer":
+                self.pointerMoved.emit(point)
+            elif self._mode == "elbow":
+                self.elbowMoved.emit(point)
             self.update()
         super().mouseMoveEvent(event)
 
@@ -399,18 +639,54 @@ class AnnotationPreviewLabel(PreviewImageLabel):
         if self._start is not None:
             start = self._start
             end = event.position().toPoint()
+            mode = self._mode
+            handle = self._handle
             self._start = None
             self._current = None
+            self._mode = None
+            self._handle = None
             self.update()
-            if (start - end).manhattanLength() <= 4:
+            if mode == "resize" and handle:
+                self.boxResized.emit(handle, start, end)
+                self.boxInteractionFinished.emit()
+            elif mode == "move":
+                self.boxMoved.emit(start, end)
+                self.boxInteractionFinished.emit()
+            elif mode == "pointer":
+                self.pointerMoved.emit(end)
+                self.pointerInteractionFinished.emit()
+            elif mode == "elbow":
+                self.elbowMoved.emit(end)
+                self.elbowInteractionFinished.emit()
+            elif (start - end).manhattanLength() <= 4:
                 self.positionClicked.emit(end)
             else:
                 self.rectDrawn.emit(start, end)
         super().mouseReleaseEvent(event)
 
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Copy):
+            self.copyRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Paste):
+            self.pasteRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Undo):
+            self.undoRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self._start is None:
+            self.unsetCursor()
+        super().leaveEvent(event)
+
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
-        if self._start is not None and self._current is not None:
+        if self._mode == "place" and self._start is not None and self._current is not None:
             painter = QPainter(self)
             painter.setPen(QPen(self.band_color, 2, Qt.DashLine))
             painter.drawLine(self._start, self._current)
@@ -419,10 +695,229 @@ class AnnotationPreviewLabel(PreviewImageLabel):
 
 class TextEditPreviewLabel(PreviewImageLabel):
     positionClicked = Signal(QPoint)
+    inlineEdited = Signal(str)
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.inline_edit = QLineEdit(self)
+        self.inline_edit.hide()
+        self.inline_edit.setFrame(False)
+        self.inline_edit.textEdited.connect(self.inlineEdited.emit)
 
     def mousePressEvent(self, event) -> None:
+        if self.inline_edit.isVisible() and self.inline_edit.geometry().contains(event.position().toPoint()):
+            super().mousePressEvent(event)
+            return
         self.positionClicked.emit(event.position().toPoint())
         super().mousePressEvent(event)
+
+    def hide_inline_editor(self) -> None:
+        self.inline_edit.hide()
+        self.inline_edit.clearFocus()
+
+
+class ErasePreviewLabel(PreviewImageLabel):
+    strokePoint = Signal(QPoint)
+    strokeFinished = Signal()
+    rectDrawn = Signal(QPoint, QPoint)
+    pointClicked = Signal(QPoint)
+    boxResized = Signal(str, QPoint, QPoint)
+    boxMoved = Signal(QPoint, QPoint)
+    boxInteractionFinished = Signal()
+    inlineEdited = Signal(str)
+    copyRequested = Signal()
+    pasteRequested = Signal()
+    undoRequested = Signal()
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMouseTracking(True)
+        self.setFocusPolicy(Qt.StrongFocus)
+        self.tool = "brush"
+        self.brush_radius_px = 16.0
+        self.cover_color = QColor(255, 255, 255)
+        self.box_rect = QRect()
+        self.handles_enabled = False
+        self._start: QPoint | None = None
+        self._current: QPoint | None = None
+        self._hover: QPoint | None = None
+        self._mode: str | None = None
+        self._handle: str | None = None
+        self.inline_edit = QTextEdit(self)
+        self.inline_edit.setFrameShape(QFrame.NoFrame)
+        self.inline_edit.setAcceptRichText(False)
+        self.inline_edit.setPlaceholderText("在此輸入文字")
+        self.inline_edit.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.inline_edit.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.inline_edit.setStyleSheet("QTextEdit { background: transparent; padding: 2px 4px; }")
+        self.inline_edit.hide()
+        self.inline_edit.textChanged.connect(lambda: self.inlineEdited.emit(self.inline_edit.toPlainText()))
+        self.inline_edit.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if obj is self.inline_edit and event.type() == QEvent.KeyPress:
+            if event.matches(QKeySequence.Copy):
+                self.copyRequested.emit()
+                return True
+            if event.matches(QKeySequence.Paste):
+                self.pasteRequested.emit()
+                return True
+            if event.matches(QKeySequence.Undo):
+                self.undoRequested.emit()
+                return True
+        return super().eventFilter(obj, event)
+
+    def _handle_at(self, point: QPoint) -> str | None:
+        if not self.handles_enabled:
+            return None
+        for name, rect in annotation_handle_rects(self.box_rect).items():
+            if rect.adjusted(-2, -2, 2, 2).contains(point):
+                return name
+        return None
+
+    def _box_contains(self, point: QPoint) -> bool:
+        if not self.handles_enabled or self.box_rect.width() < 2:
+            return False
+        return self.box_rect.adjusted(-2, -2, 2, 2).contains(point)
+
+    def show_inline_editor(
+        self,
+        rect: QRect,
+        text: str,
+        font_size: int = 12,
+        *,
+        focus: bool = False,
+        bold: bool = False,
+        color_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0),
+    ) -> None:
+        pad = 6
+        self.inline_edit.setGeometry(rect.adjusted(pad, 2, -pad, -2))
+        font = self.inline_edit.font()
+        font.setPointSize(max(int(font_size * 0.75), 8))
+        font.setBold(bold)
+        self.inline_edit.setFont(font)
+        color = QColor.fromRgbF(*color_rgb)
+        self.inline_edit.setStyleSheet(
+            f"QTextEdit {{ background: transparent; padding: 2px 4px; color: {color.name()}; }}"
+        )
+        if self.inline_edit.toPlainText() != text:
+            self.inline_edit.blockSignals(True)
+            self.inline_edit.setPlainText(text)
+            self.inline_edit.blockSignals(False)
+        self.inline_edit.show()
+        if focus:
+            self.inline_edit.setFocus()
+
+    def hide_inline_editor(self) -> None:
+        self.inline_edit.hide()
+        self.inline_edit.clearFocus()
+
+    def mousePressEvent(self, event) -> None:
+        point = event.position().toPoint()
+        self._start = point
+        self._current = point
+        self._hover = point
+        self._handle = None
+        self._mode = None
+        if self.tool == "text":
+            handle = self._handle_at(point)
+            if handle:
+                self._mode = "resize"
+                self._handle = handle
+                self.hide_inline_editor()
+            elif self._box_contains(point):
+                self._mode = "move"
+                self.hide_inline_editor()
+            else:
+                self._mode = "place"
+        elif self.tool == "brush":
+            self.strokePoint.emit(self._start)
+        self.update()
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        point = event.position().toPoint()
+        self._hover = point
+        if self._start is not None:
+            self._current = point
+            if self.tool == "brush":
+                self.strokePoint.emit(self._current)
+            elif self._mode == "resize" and self._handle:
+                self.boxResized.emit(self._handle, self._start, point)
+            elif self._mode == "move":
+                self.boxMoved.emit(self._start, point)
+        self.update()
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if self._start is not None:
+            start = self._start
+            end = event.position().toPoint()
+            self._hover = end
+            mode = self._mode
+            handle = self._handle
+            self._start = None
+            self._current = None
+            self._mode = None
+            self._handle = None
+            self.update()
+            if self.tool == "brush":
+                self.strokeFinished.emit()
+            elif mode == "resize" and handle:
+                self.boxResized.emit(handle, start, end)
+                self.boxInteractionFinished.emit()
+            elif mode == "move":
+                if (start - end).manhattanLength() > 4:
+                    self.boxMoved.emit(start, end)
+                self.boxInteractionFinished.emit()
+            elif (start - end).manhattanLength() > 4:
+                self.rectDrawn.emit(start, end)
+            elif self.tool == "text":
+                self.pointClicked.emit(end)
+        super().mouseReleaseEvent(event)
+
+    def enterEvent(self, event) -> None:
+        if hasattr(event, "position"):
+            self._hover = event.position().toPoint()
+            self.update()
+        super().enterEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self._start is None:
+            self._hover = None
+            self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        fill = QColor(self.cover_color)
+        if self.tool == "brush" and self._hover is not None:
+            radius = max(int(round(self.brush_radius_px)), 4)
+            fill.setAlpha(70)
+            outline = QColor("#111827") if self.cover_color.lightness() > 160 else QColor("#f8fafc")
+            painter.setBrush(fill)
+            painter.setPen(QPen(outline, 3))
+            painter.drawEllipse(self._hover, radius, radius)
+            painter.setPen(QPen(outline, 2))
+            painter.drawLine(self._hover.x() - 5, self._hover.y(), self._hover.x() + 5, self._hover.y())
+            painter.drawLine(self._hover.x(), self._hover.y() - 5, self._hover.x(), self._hover.y() + 5)
+        elif self.tool == "rect" and self._start is not None and self._current is not None:
+            fill.setAlpha(170)
+            painter.setBrush(fill)
+            painter.setPen(QPen(QColor("#111827"), 2))
+            painter.drawRect(QRect(self._start, self._current).normalized())
+        elif self.tool == "text" and self._mode == "place" and self._start is not None and self._current is not None:
+            painter.setBrush(QColor(255, 255, 255, 40))
+            painter.setPen(QPen(QColor("#128576"), 2, Qt.DashLine))
+            painter.drawRect(QRect(self._start, self._current).normalized())
+        if self.tool == "text" and self.handles_enabled and self.box_rect.width() > 1:
+            painter.setPen(QPen(QColor("#128576"), 1))
+            painter.setBrush(QColor("#ffffff"))
+            for handle in annotation_handle_rects(self.box_rect).values():
+                painter.drawRect(handle)
+        painter.end()
 
 
 class MarkupPreviewLabel(PreviewImageLabel):
@@ -430,9 +925,13 @@ class MarkupPreviewLabel(PreviewImageLabel):
 
     rectDrawn = Signal(QPoint, QPoint)
     pointClicked = Signal(QPoint)
+    copyRequested = Signal()
+    pasteRequested = Signal()
+    undoRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
+        self.setFocusPolicy(Qt.StrongFocus)
         self.band_color = QColor(18, 133, 118)
         self._start: QPoint | None = None
         self._current: QPoint | None = None
@@ -461,6 +960,21 @@ class MarkupPreviewLabel(PreviewImageLabel):
             else:
                 self.rectDrawn.emit(start, end)
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Copy):
+            self.copyRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Paste):
+            self.pasteRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Undo):
+            self.undoRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -1045,8 +1559,30 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_page_size = (0.0, 0.0)
         self.annotation_preview_image: Image.Image | None = None
         self.annotation_color_rgb = (0.0, 0.0, 0.0)
+        self.annotation_fill_rgb = (1.0, 1.0, 1.0)
+        self.annotation_fill_none = False
         self.annotation_box_pdf: tuple[float, float] | None = None
         self.annotation_box_locked = False
+        self.annotation_items: list[dict] = []
+        self._annotation_placed = False
+        self._annotation_manual_size = False
+        self._fitting_annotation_box = False
+        self._annotation_resize_snapshot: tuple[float, float, float, float] | None = None
+        self._annotation_clipboard: dict | None = None
+        self._annotation_undo_stack: list[dict] = []
+        self._restoring_annotation = False
+        self._markup_clipboard: MarkupAnnotation | None = None
+        self._markup_undo_stack: list[list[tuple[int, MarkupAnnotation]]] = []
+        self._syncing_advanced_page = False
+        self._advanced_thumb_pending: list[int] = []
+        self._advanced_thumb_generation = 0
+        self._advanced_thumb_timer = QTimer(self)
+        self._advanced_thumb_timer.setSingleShot(True)
+        self._advanced_thumb_timer.timeout.connect(self._render_next_advanced_thumb_batch)
+        self._advanced_thumb_resize_timer = QTimer(self)
+        self._advanced_thumb_resize_timer.setSingleShot(True)
+        self._advanced_thumb_resize_timer.timeout.connect(self._refresh_advanced_thumbs_for_width)
+        self.advanced_preview_zoom = 1.15
         self.text_edit_pdf_path: Path | None = None
         self.text_edit_page_count = 0
         self.text_edit_blocks: list[TextBlock] = []
@@ -1059,11 +1595,28 @@ class VictorPdfToolsQt(QMainWindow):
         self.markup_preview_image: Image.Image | None = None
         self.markup_items: list[tuple[int, MarkupAnnotation]] = []
         self.markup_color_rgb = MARKUP_COLOR_PRESETS["yellow"]
+        self.markup_fill_rgb = (1.0, 1.0, 1.0)
+        self.markup_fill_none = False
         self.crop_pdf_path: Path | None = None
         self.crop_page_count = 0
         self.crop_page_size = (0.0, 0.0)
         self.crop_preview_image: Image.Image | None = None
         self.crop_rect: tuple[float, float, float, float] | None = None
+        self.erase_pdf_path: Path | None = None
+        self.erase_page_count = 0
+        self.erase_page_size = (0.0, 0.0)
+        self.erase_preview_image: Image.Image | None = None
+        self.erase_marks: list[EraseMark] = []
+        self._erase_live_points: list[tuple[float, float]] = []
+        self._erase_text_selected: int | None = None
+        self._erase_text_clipboard: dict | None = None
+        self._erase_undo_stack: list[tuple] = []
+        self._erase_text_seq = 0
+        self._erase_syncing_text = False
+        self._erase_resize_snapshot: tuple[float, float, float, float] | None = None
+        self._erase_last_click: QPoint | None = None
+        self.erase_text_color_rgb_value = (0.0, 0.0, 0.0)
+        self._broadcasting_advanced_pdf = False
         self.text_edit_preview_image: Image.Image | None = None
         self.placeholder_icon = QIcon(QPixmap.fromImage(ImageQt(self.placeholder_thumbnail(None))))
 
@@ -1235,14 +1788,79 @@ class VictorPdfToolsQt(QMainWindow):
         self._office_tab = self.build_office_convert_tab()
         tabs.addTab(self._office_tab, "Office 轉 PDF")
 
+        advanced_root = PdfDropPanel()
+        advanced_root.filesDropped.connect(self.drop_advanced_pdf)
+        advanced_layout = QVBoxLayout(advanced_root)
+        advanced_layout.setContentsMargins(0, 8, 0, 0)
+        advanced_layout.setSpacing(6)
+        share_hint = QLabel("將 PDF 拖到進階任一頁即可共用；拖左邊分隔線可拉寬縮圖。左側縮圖可換頁編輯，各工具都可改完多頁後才另存。")
+        share_hint.setObjectName("muted")
+        share_hint.setWordWrap(True)
+        advanced_layout.addWidget(share_hint)
+        self.advanced_thumb_panel = QFrame()
+        self.advanced_thumb_panel.setObjectName("panel")
+        self.advanced_thumb_panel.setMinimumWidth(ADVANCED_THUMB_PANEL_MIN_WIDTH)
+        self.advanced_thumb_panel.setMaximumWidth(ADVANCED_THUMB_PANEL_MAX_WIDTH)
+        thumb_layout = QVBoxLayout(self.advanced_thumb_panel)
+        thumb_layout.setContentsMargins(8, 8, 8, 8)
+        thumb_layout.setSpacing(6)
+        thumb_title = QLabel("頁面（可拉寬）")
+        thumb_layout.addWidget(thumb_title)
+        self.advanced_page_list = QListWidget()
+        self.advanced_page_list.setViewMode(QListWidget.ListMode)
+        self.advanced_page_list.setFlow(QListView.TopToBottom)
+        self.advanced_page_list.setWrapping(False)
+        self.advanced_page_list.setMovement(QListWidget.Static)
+        self.advanced_page_list.setIconSize(ADVANCED_THUMB_ICON_SIZE)
+        self.advanced_page_list.setSpacing(6)
+        self.advanced_page_list.setUniformItemSizes(True)
+        self.advanced_page_list.setWordWrap(True)
+        self.advanced_page_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.advanced_page_list.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.advanced_page_list.setStyleSheet(
+            """
+            QListWidget {
+                background: #f7f6f2;
+                border: none;
+                padding: 4px;
+            }
+            QListWidget::item {
+                background: #ffffff;
+                border: 1px solid #d2d2d2;
+                border-radius: 8px;
+                padding: 4px;
+                margin: 3px 1px;
+                color: #222;
+            }
+            QListWidget::item:selected {
+                background: #d9f0ea;
+                border: 2px solid #128576;
+            }
+            """
+        )
+        self.advanced_page_list.currentRowChanged.connect(self._on_advanced_thumb_selected)
+        thumb_layout.addWidget(self.advanced_page_list, 1)
         advanced_tabs = QTabWidget()
         advanced_tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
         advanced_tabs.addTab(self.build_markup_tab(), "螢光 / 圖形註解")
         advanced_tabs.addTab(self.build_crop_tab(), "裁切頁面")
-        advanced_tabs.addTab(self.build_text_edit_tab(), "文字編輯 Beta")
+        advanced_tabs.addTab(self.build_erase_tab(), "橡皮擦 / 遮擋")
+        self._text_edit_tab = self.build_text_edit_tab()
+        advanced_tabs.addTab(self._text_edit_tab, "文字編輯 Beta")
         advanced_tabs.addTab(self.build_bookmark_tab(), "書籤 / 目錄")
         self.advanced_tabs = advanced_tabs
-        tabs.addTab(advanced_tabs, "進階")
+        advanced_tabs.currentChanged.connect(self._on_advanced_subtab_changed)
+        self.advanced_splitter = QSplitter(Qt.Horizontal)
+        self.advanced_splitter.setChildrenCollapsible(False)
+        self.advanced_splitter.addWidget(self.advanced_thumb_panel)
+        self.advanced_splitter.addWidget(advanced_tabs)
+        self.advanced_splitter.setStretchFactor(0, 0)
+        self.advanced_splitter.setStretchFactor(1, 1)
+        self.advanced_splitter.setSizes([ADVANCED_THUMB_PANEL_WIDTH, 980])
+        self.advanced_splitter.splitterMoved.connect(self._on_advanced_splitter_moved)
+        advanced_layout.addWidget(self.advanced_splitter, 1)
+        self._advanced_tab = advanced_root
+        tabs.addTab(advanced_root, "進階")
 
         tabs.setCurrentIndex(0)
         layout.addWidget(tabs, 1)
@@ -1271,7 +1889,7 @@ class VictorPdfToolsQt(QMainWindow):
         show_office.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self._office_tab))
         window_menu.addAction(show_office)
         show_advanced = QAction("進階工具", self)
-        show_advanced.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self.advanced_tabs))
+        show_advanced.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self._advanced_tab))
         window_menu.addAction(show_advanced)
 
     def install_shortcuts(self) -> None:
@@ -1458,11 +2076,58 @@ class VictorPdfToolsQt(QMainWindow):
 
         form_layout.addWidget(QLabel("文字 / 模板"))
         self.tool_batch_text_input = QLineEdit("CONFIDENTIAL")
+        self.tool_batch_text_input.setPlaceholderText("浮水印文字，或頁碼模板 {page} / {total}")
         form_layout.addWidget(self.tool_batch_text_input)
-        template_hint = QLabel("頁碼模板可用 {page} / {total}")
+        template_hint = QLabel("頁碼模板可用 {page} / {total}；浮水印請輸入要蓋上的文字")
         template_hint.setObjectName("muted")
         template_hint.setWordWrap(True)
         form_layout.addWidget(template_hint)
+
+        form_layout.addWidget(QLabel("浮水印位置"))
+        self.tool_watermark_position_combo = QComboBox()
+        for value, label in WATERMARK_POSITIONS.items():
+            self.tool_watermark_position_combo.addItem(label, value)
+        self.tool_watermark_position_combo.setCurrentIndex(self.tool_watermark_position_combo.findData("center"))
+        form_layout.addWidget(self.tool_watermark_position_combo)
+        wm_xy_row = QHBoxLayout()
+        self.tool_watermark_x_input = QLineEdit("50")
+        self.tool_watermark_x_input.setPlaceholderText("左 %")
+        self.tool_watermark_x_input.setValidator(QIntValidator(0, 100, self))
+        wm_xy_row.addWidget(QLabel("左 %"))
+        wm_xy_row.addWidget(self.tool_watermark_x_input, 1)
+        self.tool_watermark_y_input = QLineEdit("50")
+        self.tool_watermark_y_input.setPlaceholderText("上 %")
+        self.tool_watermark_y_input.setValidator(QIntValidator(0, 100, self))
+        wm_xy_row.addWidget(QLabel("上 %"))
+        wm_xy_row.addWidget(self.tool_watermark_y_input, 1)
+        form_layout.addLayout(wm_xy_row)
+        wm_style_row = QHBoxLayout()
+        self.tool_watermark_rotation_combo = QComboBox()
+        for angle, label in WATERMARK_ROTATIONS:
+            self.tool_watermark_rotation_combo.addItem(label, angle)
+        wm_style_row.addWidget(self.tool_watermark_rotation_combo, 1)
+        self.tool_watermark_size_combo = QComboBox()
+        configure_font_size_combo(self.tool_watermark_size_combo, "48", lambda: None)
+        wm_style_row.addWidget(self.tool_watermark_size_combo)
+        form_layout.addLayout(wm_style_row)
+        wm_look_row = QHBoxLayout()
+        self.tool_watermark_opacity_combo = QComboBox()
+        for percent, alpha in (("15%", 0.15), ("25%", 0.25), ("35%", 0.35), ("50%", 0.5), ("70%", 0.7), ("100%", 1.0)):
+            self.tool_watermark_opacity_combo.addItem(percent, alpha)
+        self.tool_watermark_opacity_combo.setCurrentIndex(self.tool_watermark_opacity_combo.findData(0.25))
+        wm_look_row.addWidget(QLabel("透明度"))
+        wm_look_row.addWidget(self.tool_watermark_opacity_combo, 1)
+        self.tool_watermark_color_combo = QComboBox()
+        for key, (_rgb, label) in WATERMARK_COLORS.items():
+            self.tool_watermark_color_combo.addItem(label, key)
+        self.tool_watermark_color_combo.setCurrentIndex(self.tool_watermark_color_combo.findData("gray"))
+        wm_look_row.addWidget(QLabel("顏色"))
+        wm_look_row.addWidget(self.tool_watermark_color_combo, 1)
+        form_layout.addLayout(wm_look_row)
+        watermark_hint = QLabel("浮水印類似 Word：可自訂文字、九宮格／百分比位置、斜向或水平、大小與淡化程度。頁碼欄可指定套用頁面，留空為全部。")
+        watermark_hint.setObjectName("muted")
+        watermark_hint.setWordWrap(True)
+        form_layout.addWidget(watermark_hint)
 
         form_layout.addWidget(QLabel("空白頁靈敏度"))
         self.tool_blank_threshold_combo = QComboBox()
@@ -1623,6 +2288,7 @@ class VictorPdfToolsQt(QMainWindow):
 
     def build_annotation_tab(self) -> QWidget:
         tab = PdfDropPanel()
+        self._annotation_tab = tab
         tab.filesDropped.connect(self.drop_annotation_pdf)
         layout = QHBoxLayout(tab)
         layout.setContentsMargins(0, 10, 0, 0)
@@ -1637,8 +2303,16 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_page_input.setFixedWidth(56)
         self.annotation_page_validator = QIntValidator(1, 1, self)
         self.annotation_page_input.setValidator(self.annotation_page_validator)
-        self.annotation_page_input.editingFinished.connect(self.render_annotation_preview)
+        self.annotation_page_input.editingFinished.connect(self.on_advanced_page_input_edited)
         top.addWidget(self.annotation_page_input)
+        self.add_button(top, "上一頁", lambda: self.change_annotation_page(-1))
+        self.add_button(top, "下一頁", lambda: self.change_annotation_page(1))
+        self.add_button(top, "縮小", lambda: self.change_advanced_preview_zoom(-ADVANCED_PREVIEW_ZOOM_STEP))
+        self.advanced_zoom_label = QLabel("115%")
+        self.advanced_zoom_label.setFixedWidth(48)
+        self.advanced_zoom_label.setAlignment(Qt.AlignCenter)
+        top.addWidget(self.advanced_zoom_label)
+        self.add_button(top, "放大", lambda: self.change_advanced_preview_zoom(ADVANCED_PREVIEW_ZOOM_STEP))
         self.add_button(top, "更新預覽", self.render_annotation_preview)
         top.addStretch(1)
         left.addLayout(top)
@@ -1649,6 +2323,16 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_preview_label = AnnotationPreviewLabel()
         self.annotation_preview_label.positionClicked.connect(self.set_annotation_position_from_click)
         self.annotation_preview_label.rectDrawn.connect(self.set_annotation_from_drag)
+        self.annotation_preview_label.boxResized.connect(self.resize_annotation_box_from_handle)
+        self.annotation_preview_label.boxMoved.connect(self.move_annotation_box)
+        self.annotation_preview_label.pointerMoved.connect(self.move_annotation_pointer)
+        self.annotation_preview_label.elbowMoved.connect(self.move_annotation_elbow)
+        self.annotation_preview_label.boxInteractionFinished.connect(self.finish_annotation_box_interaction)
+        self.annotation_preview_label.pointerInteractionFinished.connect(self.finish_annotation_pointer_interaction)
+        self.annotation_preview_label.elbowInteractionFinished.connect(self.finish_annotation_elbow_interaction)
+        self.annotation_preview_label.copyRequested.connect(self.copy_annotation_box)
+        self.annotation_preview_label.pasteRequested.connect(self.paste_annotation_box)
+        self.annotation_preview_label.undoRequested.connect(self.undo_annotation_action)
         scroll.setWidget(self.annotation_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -1666,7 +2350,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_shape_list.setResizeMode(QListWidget.Adjust)
         self.annotation_shape_list.setIconSize(QSize(88, 56))
         self.annotation_shape_list.setSpacing(6)
-        self.annotation_shape_list.setFixedHeight(168)
+        self.annotation_shape_list.setFixedHeight(210)
         self.annotation_shape_list.setSelectionMode(QAbstractItemView.SingleSelection)
         self.annotation_shape_list.setStyleSheet(
             "QListWidget { background: #f7fafc; border: 1px solid #dce3ec; }"
@@ -1694,17 +2378,17 @@ class VictorPdfToolsQt(QMainWindow):
 
         side_layout.addWidget(QLabel("字體"))
         self.annotation_font_combo = QComboBox()
+        self.annotation_font_combo.addItem("中文（微軟雅黑／正黑體）", "cjk")
         self.annotation_font_combo.addItem("Helvetica", "helvetica")
         self.annotation_font_combo.addItem("Times New Roman", "times")
         self.annotation_font_combo.addItem("Courier", "courier")
+        self.annotation_font_combo.setCurrentIndex(0)
         side_layout.addWidget(self.annotation_font_combo)
 
         style_row = QHBoxLayout()
         style_row.addWidget(QLabel("大小"))
         self.annotation_font_size_combo = QComboBox()
-        for size in ("8", "10", "12", "14", "16", "18", "24", "36"):
-            self.annotation_font_size_combo.addItem(size)
-        self.annotation_font_size_combo.setCurrentText("12")
+        configure_font_size_combo(self.annotation_font_size_combo, "12", self.fit_annotation_box_to_text)
         style_row.addWidget(self.annotation_font_size_combo, 1)
         self.annotation_bold_checkbox = QCheckBox("粗體")
         style_row.addWidget(self.annotation_bold_checkbox)
@@ -1724,6 +2408,22 @@ class VictorPdfToolsQt(QMainWindow):
         color_row.addWidget(self.annotation_color_button)
         side_layout.addLayout(color_row)
 
+        fill_row = QHBoxLayout()
+        fill_row.addWidget(QLabel("底色"))
+        self.annotation_fill_combo = QComboBox()
+        self.annotation_fill_combo.addItem("白色", "white")
+        self.annotation_fill_combo.addItem("無底色", "none")
+        self.annotation_fill_combo.addItem("淡黃", "yellow")
+        self.annotation_fill_combo.addItem("淺藍", "blue")
+        self.annotation_fill_combo.addItem("淺綠", "green")
+        self.annotation_fill_combo.addItem("跟隨外框", "follow")
+        self.annotation_fill_combo.addItem("自訂...", "custom")
+        fill_row.addWidget(self.annotation_fill_combo, 1)
+        self.annotation_fill_button = QPushButton("選色")
+        self.annotation_fill_button.setFixedWidth(56)
+        fill_row.addWidget(self.annotation_fill_button)
+        side_layout.addLayout(fill_row)
+
         self.annotation_xy_label = QLabel("X / Y 位置")
         side_layout.addWidget(self.annotation_xy_label)
         xy = QHBoxLayout()
@@ -1741,6 +2441,18 @@ class VictorPdfToolsQt(QMainWindow):
         wh.addWidget(self.annotation_height_input)
         side_layout.addLayout(wh)
 
+        self.add_button(side_layout, "加入此頁標註", self.queue_current_annotation)
+        side_layout.addWidget(QLabel("已加入的標註（可跨頁，最後一次另存）"))
+        self.annotation_item_list = QListWidget()
+        self.annotation_item_list.setMinimumHeight(90)
+        self.annotation_item_list.setMaximumHeight(140)
+        side_layout.addWidget(self.annotation_item_list)
+        annotation_list_buttons = QHBoxLayout()
+        self.add_button(annotation_list_buttons, "復原", self.undo_annotation_action)
+        self.add_button(annotation_list_buttons, "刪除選取", self.delete_selected_annotation_item, "danger")
+        self.add_button(annotation_list_buttons, "清空", self.clear_annotation_items)
+        side_layout.addLayout(annotation_list_buttons)
+
         side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
         self.annotation_password_input = QLineEdit()
         self.annotation_password_input.setEchoMode(QLineEdit.Password)
@@ -1748,8 +2460,10 @@ class VictorPdfToolsQt(QMainWindow):
 
         save_button = self.add_button(side_layout, "套用並另存 PDF", self.save_annotation_pdf, "primary")
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        changed_button = self.add_button(side_layout, "另存有修改的頁", self.save_changed_pages_pdf)
+        changed_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.annotation_guide = QLabel("提示：先選文字外框，再輸入文字；點左側預覽放置。選對話框／雲朵／標註框時，外框會包住這段文字。")
+        self.annotation_guide = QLabel("提示：左邊縮圖可換頁；點預覽放置文字框或附註。點選後 Ctrl+C 複製、Ctrl+V 貼到其他位置，Ctrl+Z 或「復原」可還原。加入後換頁會把上一頁標註留在清單。全部改完再另存，或用「另存有修改的頁」只抽出有註解的頁。")
         self.annotation_guide.setObjectName("muted")
         self.annotation_guide.setWordWrap(True)
         side_layout.addWidget(self.annotation_guide)
@@ -1759,15 +2473,17 @@ class VictorPdfToolsQt(QMainWindow):
         return tab
 
     def connect_annotation_preview_updates(self) -> None:
-        self.annotation_text_input.textChanged.connect(self.update_annotation_preview_display)
+        self.annotation_text_input.textChanged.connect(self.fit_annotation_box_to_text)
         self.annotation_cover_checkbox.toggled.connect(self.update_annotation_preview_display)
-        self.annotation_font_combo.currentIndexChanged.connect(self.update_annotation_preview_display)
-        self.annotation_font_size_combo.currentTextChanged.connect(self.update_annotation_preview_display)
-        self.annotation_bold_checkbox.toggled.connect(self.update_annotation_preview_display)
+        self.annotation_font_combo.currentIndexChanged.connect(self.fit_annotation_box_to_text)
+        self.annotation_bold_checkbox.toggled.connect(self.fit_annotation_box_to_text)
         self.annotation_color_combo.currentIndexChanged.connect(self.on_annotation_color_preset_changed)
         self.annotation_color_button.clicked.connect(self.choose_annotation_color)
+        self.annotation_fill_combo.currentIndexChanged.connect(self.on_annotation_fill_preset_changed)
+        self.annotation_fill_button.clicked.connect(self.choose_annotation_fill_color)
         self.annotation_x_input.textChanged.connect(self.update_annotation_preview_display)
         self.annotation_y_input.textChanged.connect(self.update_annotation_preview_display)
+        self.annotation_width_input.editingFinished.connect(self.fit_annotation_box_to_text)
         self.annotation_width_input.textChanged.connect(self.update_annotation_preview_display)
         self.annotation_height_input.textChanged.connect(self.update_annotation_preview_display)
 
@@ -1791,6 +2507,34 @@ class VictorPdfToolsQt(QMainWindow):
             self.annotation_color_combo.setCurrentIndex(custom_index)
         self.update_annotation_preview_display()
 
+    def on_annotation_fill_preset_changed(self) -> None:
+        preset = self.annotation_fill_combo.currentData()
+        if preset == "custom":
+            self.choose_annotation_fill_color()
+            return
+        if preset == "none":
+            self.annotation_fill_none = True
+            self.annotation_fill_rgb = (1.0, 1.0, 1.0)
+        elif preset == "follow":
+            self.annotation_fill_none = False
+            self.annotation_fill_rgb = None
+        elif preset in ANNOTATION_FILL_PRESETS:
+            self.annotation_fill_none = False
+            self.annotation_fill_rgb = ANNOTATION_FILL_PRESETS[preset]
+        self.update_annotation_preview_display()
+
+    def choose_annotation_fill_color(self) -> None:
+        current = QColor.fromRgbF(*(self.annotation_fill_rgb or (1.0, 1.0, 1.0)))
+        chosen = QColorDialog.getColor(current, self, "選擇底色")
+        if not chosen.isValid():
+            return
+        self.annotation_fill_none = False
+        self.annotation_fill_rgb = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        custom_index = self.annotation_fill_combo.findData("custom")
+        if custom_index >= 0:
+            self.annotation_fill_combo.setCurrentIndex(custom_index)
+        self.update_annotation_preview_display()
+
     def annotation_style_values(self) -> dict:
         try:
             rect_width = float(self.annotation_width_input.text())
@@ -1807,6 +2551,8 @@ class VictorPdfToolsQt(QMainWindow):
             pointer_x, pointer_y = pdf_x, pdf_y
             if self.annotation_box_locked and self.annotation_box_pdf is not None:
                 box_x, box_y = self.annotation_box_pdf
+            elif shape == "comment":
+                box_x, box_y = comment_box_from_pointer(pointer_x, pointer_y, rect_width, rect_height)
             else:
                 box_x, box_y = callout_box_from_pointer(pointer_x, pointer_y, rect_width, rect_height)
         else:
@@ -1816,9 +2562,11 @@ class VictorPdfToolsQt(QMainWindow):
             "text": self.annotation_text_input.toPlainText(),
             "cover": self.annotation_cover_checkbox.isChecked(),
             "font_key": self.annotation_font_combo.currentData() or "helvetica",
-            "font_size": int(self.annotation_font_size_combo.currentText()),
+            "font_size": combo_font_size(self.annotation_font_size_combo, 12),
             "bold": self.annotation_bold_checkbox.isChecked(),
             "color_rgb": self.annotation_color_rgb,
+            "fill_rgb": None if self.annotation_fill_none else self.annotation_fill_rgb,
+            "fill_none": self.annotation_fill_none,
             "pdf_x": box_x,
             "pdf_y": box_y,
             "rect_width": rect_width,
@@ -1827,6 +2575,155 @@ class VictorPdfToolsQt(QMainWindow):
             "pointer_x": pointer_x,
             "pointer_y": pointer_y,
         }
+
+    def measure_annotation_text_box(
+        self,
+        text: str,
+        font_size: int,
+        bold: bool,
+        font_key: str,
+        box_width: float,
+    ) -> tuple[float, float]:
+        width = max(float(box_width), 80.0)
+        font = self.annotation_preview_font(font_size, bold, font_key, text or "字")
+        inner = max(width - ANNOTATION_BOX_PAD_X * 2, 16.0)
+        lines = wrap_annotation_text(text.strip() or " ", font, inner)
+        line_height = annotation_font_line_height(font, font_size)
+        height = max(len(lines) * line_height + ANNOTATION_BOX_PAD_Y * 2, font_size * 1.8, 28.0)
+        return width, height
+
+    def fit_annotation_box_to_text(self) -> None:
+        if self._fitting_annotation_box:
+            return
+        text = self.annotation_text_input.toPlainText()
+        if not text.strip():
+            self.update_annotation_preview_display()
+            return
+        try:
+            width = float(self.annotation_width_input.text())
+        except ValueError:
+            width = 220.0
+        try:
+            current_height = float(self.annotation_height_input.text())
+        except ValueError:
+            current_height = 32.0
+        font_size = combo_font_size(self.annotation_font_size_combo, 12)
+        needed_width, needed_height = self.measure_annotation_text_box(
+            text,
+            font_size,
+            self.annotation_bold_checkbox.isChecked(),
+            self.annotation_font_combo.currentData() or "helvetica",
+            width,
+        )
+        if self._annotation_manual_size:
+            new_height = max(current_height, needed_height)
+            new_width = max(width, 80.0)
+        else:
+            new_height = needed_height
+            new_width = needed_width
+        self._fitting_annotation_box = True
+        try:
+            if abs(new_height - current_height) > 0.4:
+                self.annotation_height_input.blockSignals(True)
+                self.annotation_height_input.setText(f"{new_height:.1f}")
+                self.annotation_height_input.blockSignals(False)
+            if abs(new_width - width) > 0.4:
+                self.annotation_width_input.blockSignals(True)
+                self.annotation_width_input.setText(f"{new_width:.1f}")
+                self.annotation_width_input.blockSignals(False)
+        finally:
+            self._fitting_annotation_box = False
+        self.update_annotation_preview_display()
+
+    def annotation_image_box_rect(self, style: dict) -> QRect:
+        page_width, page_height = self.annotation_page_size
+        if self.annotation_preview_image is None or page_width <= 0 or page_height <= 0:
+            return QRect()
+        image_width, image_height = self.annotation_preview_image.size
+        left = style["pdf_x"] / page_width * image_width
+        top = (page_height - (style["pdf_y"] + style["rect_height"])) / page_height * image_height
+        width = style["rect_width"] / page_width * image_width
+        height = style["rect_height"] / page_height * image_height
+        return QRect(int(round(left)), int(round(top)), max(int(round(width)), 1), max(int(round(height)), 1))
+
+    def _annotation_image_delta_to_pdf(self, start: QPoint, current: QPoint) -> tuple[float, float]:
+        page_width, page_height = self.annotation_page_size
+        image_width, image_height = self.annotation_preview_image.size
+        dx = (current.x() - start.x()) / image_width * page_width
+        dy = -((current.y() - start.y()) / image_height * page_height)
+        return dx, dy
+
+    def _set_annotation_box_values(self, pdf_x: float, pdf_y: float, width: float, height: float) -> None:
+        width = max(width, 80.0)
+        font_size = combo_font_size(self.annotation_font_size_combo, 12)
+        min_height = max(font_size * 1.8, 28.0)
+        height = max(height, min_height)
+        self.annotation_x_input.blockSignals(True)
+        self.annotation_y_input.blockSignals(True)
+        self.annotation_width_input.blockSignals(True)
+        self.annotation_height_input.blockSignals(True)
+        if self.annotation_shape() in CALLOUT_KINDS:
+            self.annotation_box_pdf = (pdf_x, pdf_y)
+            self.annotation_box_locked = True
+        else:
+            self.annotation_x_input.setText(f"{pdf_x:.1f}")
+            self.annotation_y_input.setText(f"{pdf_y:.1f}")
+        self.annotation_width_input.setText(f"{width:.1f}")
+        self.annotation_height_input.setText(f"{height:.1f}")
+        self.annotation_x_input.blockSignals(False)
+        self.annotation_y_input.blockSignals(False)
+        self.annotation_width_input.blockSignals(False)
+        self.annotation_height_input.blockSignals(False)
+        self.fit_annotation_box_to_text()
+
+    def resize_annotation_box_from_handle(self, handle: str, start: QPoint, current: QPoint) -> None:
+        if self.annotation_preview_image is None:
+            return
+        if self._annotation_resize_snapshot is None:
+            self._push_annotation_undo()
+            style = self.annotation_style_values()
+            self._annotation_resize_snapshot = (
+                style["pdf_x"],
+                style["pdf_y"],
+                style["rect_width"],
+                style["rect_height"],
+            )
+        pdf_x, pdf_y, width, height = self._annotation_resize_snapshot
+        dx, dy = self._annotation_image_delta_to_pdf(start, current)
+        if "e" in handle:
+            width += dx
+        if "w" in handle:
+            pdf_x += dx
+            width -= dx
+        if "n" in handle:
+            height += dy
+        if "s" in handle:
+            pdf_y += dy
+            height -= dy
+        self._annotation_manual_size = True
+        self._annotation_placed = True
+        self._set_annotation_box_values(pdf_x, pdf_y, width, height)
+
+    def move_annotation_box(self, start: QPoint, current: QPoint) -> None:
+        if self.annotation_preview_image is None:
+            return
+        if self._annotation_resize_snapshot is None:
+            self._push_annotation_undo()
+            style = self.annotation_style_values()
+            self._annotation_resize_snapshot = (
+                style["pdf_x"],
+                style["pdf_y"],
+                style["rect_width"],
+                style["rect_height"],
+            )
+        pdf_x, pdf_y, width, height = self._annotation_resize_snapshot
+        dx, dy = self._annotation_image_delta_to_pdf(start, current)
+        self._annotation_placed = True
+        self._set_annotation_box_values(pdf_x + dx, pdf_y + dy, width, height)
+
+    def finish_annotation_box_interaction(self) -> None:
+        self._annotation_resize_snapshot = None
+        self.set_status("已調整文字框。可繼續改文字，或拉邊框縮放。")
 
     def annotation_shape(self) -> str:
         item = self.annotation_shape_list.currentItem()
@@ -1844,12 +2741,21 @@ class VictorPdfToolsQt(QMainWindow):
     def on_annotation_shape_changed(self) -> None:
         is_plain = self.annotation_shape() == "box"
         self.annotation_cover_checkbox.setEnabled(is_plain)
-        if self.annotation_shape() in CALLOUT_KINDS:
+        if self.annotation_shape() == "comment":
             self.annotation_cover_checkbox.setChecked(False)
             self.annotation_xy_label.setText("插入點（箭咀尖端）")
             self.annotation_guide.setText(
-                "提示：點預覽上要指出的文字，箭咀會落在該處，文字框自動在上方。"
-                "若要自己放文字框，從插入點拖到文字框位置。"
+                "提示：選附註框後點預覽，方框會立刻出現。再輸入文字。"
+                "拖下方橫線可左右伸長箭咀，拖藍色十字準星改插入點，拖框身可移動文字框。"
+                "Ctrl+C／V 可複製貼上到其他位置，Ctrl+Z 還原。"
+            )
+        elif self.annotation_shape() in CALLOUT_KINDS:
+            self.annotation_cover_checkbox.setChecked(False)
+            self.annotation_xy_label.setText("插入點（箭咀尖端）")
+            self.annotation_guide.setText(
+                "提示：點預覽放置新標註。加入或換頁後，這一頁會是空白畫布，請再點一次放置。"
+                "拖藍色十字準星（或點頁上其他文字）可單獨移動箭咀插入點，文字框不會跟著走。"
+                "拖框身可改對話框位置，拖小方塊可拉大／拉小。Ctrl+C／V 複製貼上，Ctrl+Z 還原。"
             )
         elif is_plain:
             self.annotation_xy_label.setText("X / Y 位置")
@@ -1865,7 +2771,16 @@ class VictorPdfToolsQt(QMainWindow):
         if self.annotation_shape() not in CALLOUT_KINDS:
             self.annotation_box_locked = False
             self.annotation_box_pdf = None
-        self.update_annotation_preview_display()
+        if (
+            self.annotation_shape() == "comment"
+            and self.annotation_preview_image is not None
+            and not self._annotation_placed
+            and not getattr(self, "_restoring_annotation", False)
+        ):
+            image_width, image_height = self.annotation_preview_image.size
+            self.set_annotation_position_from_click(QPoint(max(image_width // 3, 48), max(image_height // 2, 48)))
+            return
+        self.fit_annotation_box_to_text()
 
     def _annotation_shape_icon(self, kind: str) -> QIcon:
         pixmap = QPixmap(88, 56)
@@ -1874,7 +2789,16 @@ class VictorPdfToolsQt(QMainWindow):
         painter.setRenderHint(QPainter.Antialiasing)
         painter.setPen(QPen(QColor("#2b6a9e"), 2))
         painter.setBrush(QColor("#e8f3fb"))
-        if kind == "callout":
+        if kind == "comment":
+            painter.drawRect(20, 6, 50, 22)
+            painter.drawLine(45, 28, 45, 36)
+            painter.drawLine(45, 36, 22, 36)
+            painter.drawLine(22, 36, 22, 46)
+            painter.setBrush(QColor("#2b6a9e"))
+            painter.drawPolygon(QPolygon([QPoint(22, 50), QPoint(17, 42), QPoint(27, 42)]))
+            painter.setPen(QColor("#1f3b54"))
+            painter.drawText(QRect(20, 6, 50, 22), Qt.AlignCenter, "Aa")
+        elif kind == "callout":
             painter.drawRect(18, 8, 52, 24)
             painter.drawLine(44, 32, 44, 46)
             painter.setBrush(QColor("#2b6a9e"))
@@ -1912,31 +2836,45 @@ class VictorPdfToolsQt(QMainWindow):
         font_size_pt: float,
         bold: bool,
         font_key: str,
+        text: str = "",
     ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         windows_fonts = Path("C:/Windows/Fonts")
-        font_files = {
+        latin_files = {
             "helvetica": ("arialbd.ttf", "arial.ttf"),
             "times": ("timesbd.ttf", "times.ttf"),
             "courier": ("courbd.ttf", "cour.ttf"),
         }
-        bold_name, regular_name = font_files.get(font_key, font_files["helvetica"])
-        primary = windows_fonts / (bold_name if bold else regular_name)
-        candidates = [
-            primary,
-            windows_fonts / ("msyhbd.ttc" if bold else "msyh.ttc"),
-            windows_fonts / ("arialbd.ttf" if bold else "arial.ttf"),
-        ]
+        cjk_names = (
+            ("msjhbd.ttc", "msjh.ttc") if bold else ("msjh.ttc", "msjhbd.ttc")
+        ) + (("msyhbd.ttc", "msyh.ttc") if bold else ("msyh.ttc", "msyhbd.ttc")) + (
+            "mingliu.ttc",
+            "simsun.ttc",
+        )
+        need_cjk = font_key in {"cjk", "yahei", "mingliu"} or text_contains_cjk(text)
+        candidates: list[Path] = []
+        if need_cjk:
+            candidates.extend(windows_fonts / name for name in cjk_names)
+        bold_name, regular_name = latin_files.get(font_key, latin_files["helvetica"])
+        candidates.append(windows_fonts / (bold_name if bold else regular_name))
+        if not need_cjk:
+            candidates.extend(windows_fonts / name for name in cjk_names)
+        candidates.append(windows_fonts / ("arialbd.ttf" if bold else "arial.ttf"))
         size = max(int(font_size_pt), 8)
         for path in candidates:
             if path.exists():
                 try:
-                    return ImageFont.truetype(str(path), size=size)
+                    return ImageFont.truetype(str(path), size=size, index=0)
                 except Exception:
                     continue
         return ImageFont.load_default()
 
-    def draw_annotation_overlay_on_image(self, image: Image.Image, style: dict) -> Image.Image:
-        page_width, page_height = self.annotation_page_size
+    def draw_annotation_overlay_on_image(
+        self,
+        image: Image.Image,
+        style: dict,
+        page_size: tuple[float, float] | None = None,
+    ) -> Image.Image:
+        page_width, page_height = page_size or self.annotation_page_size
         if page_width <= 0 or page_height <= 0:
             return image
         canvas = image.copy()
@@ -1971,6 +2909,8 @@ class VictorPdfToolsQt(QMainWindow):
                     contents=text or "註解",
                     box_width=style["rect_width"],
                     box_height=style["rect_height"],
+                    fill_rgb=style.get("fill_rgb"),
+                    fill_none=bool(style.get("fill_none")),
                 ),
                 to_image,
                 draw_text=False,
@@ -1980,23 +2920,56 @@ class VictorPdfToolsQt(QMainWindow):
         else:
             draw = ImageDraw.Draw(canvas)
             if shape == "rect":
-                fill = tuple(int(channel * 0.18 * 255 + 0.82 * 255) for channel in style["color_rgb"])
+                fill_rgb = resolve_annotation_fill(
+                    style["color_rgb"],
+                    style.get("fill_rgb"),
+                    bool(style.get("fill_none")),
+                )
                 outline = tuple(int(channel * 255) for channel in style["color_rgb"])
-                draw.rounded_rectangle((left, top, right, bottom), radius=4, fill=fill, outline=outline, width=2)
+                if fill_rgb is None:
+                    draw.rounded_rectangle((left, top, right, bottom), radius=4, outline=outline, width=2)
+                else:
+                    fill = tuple(int(channel * 255) for channel in fill_rgb)
+                    draw.rounded_rectangle((left, top, right, bottom), radius=4, fill=fill, outline=outline, width=2)
             elif style["cover"]:
                 draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#b7c4ce", width=1)
 
         if text:
             preview_font_size = max(style["font_size"] * scale_y * 0.92, 8)
-            font = self.annotation_preview_font(preview_font_size, style["bold"], style["font_key"])
+            font = self.annotation_preview_font(
+                preview_font_size, style["bold"], style["font_key"], text
+            )
+            pdf_font = self.annotation_preview_font(
+                style["font_size"], style["bold"], style["font_key"], text
+            )
+            inner_width = max(style["rect_width"] - ANNOTATION_BOX_PAD_X * 2, 16.0)
+            lines = wrap_annotation_text(text, pdf_font, inner_width)
+            line_height = annotation_font_line_height(pdf_font, style["font_size"]) * scale_y
             text_color = rgb_to_hex(style["color_rgb"])
-            draw.text((left + 4, top + 2), text, fill=text_color, font=font)
+            pad_x = ANNOTATION_BOX_PAD_X * scale_x
+            pad_y = ANNOTATION_BOX_PAD_Y * scale_y
+            max_bottom = bottom - 4
+            for index, line in enumerate(lines):
+                text_y = top + pad_y + index * line_height
+                if text_y > max_bottom:
+                    break
+                draw.text((left + pad_x, text_y), line, fill=text_color, font=font)
+        elif shape in CALLOUT_KINDS:
+            preview_font_size = max(style["font_size"] * scale_y * 0.92, 8)
+            font = self.annotation_preview_font(preview_font_size, False, style["font_key"], "註解")
+            draw.text(
+                (left + ANNOTATION_BOX_PAD_X * scale_x, top + ANNOTATION_BOX_PAD_Y * scale_y),
+                "註解",
+                fill="#8a96a3",
+                font=font,
+            )
         return canvas.convert("RGB")
 
     # --- markup annotations (highlight / shapes / sticky notes) --------------
     ANNOTATION_SHAPE_OPTIONS = [
         ("box", "無外框"),
         ("rect", "矩形框"),
+        ("comment", "附註框"),
         ("callout", "標註框"),
         ("speech", "對話框"),
         ("cloud", "雲朵"),
@@ -2010,6 +2983,7 @@ class VictorPdfToolsQt(QMainWindow):
         ("ellipse", "橢圓框"),
         ("line", "直線"),
         ("arrow", "箭頭"),
+        ("comment", "附註框（折線箭咀）"),
         ("callout", "標註框（帶指引線）"),
         ("speech", "對話框"),
         ("cloud", "雲朵標註"),
@@ -2028,6 +3002,7 @@ class VictorPdfToolsQt(QMainWindow):
 
     def build_markup_tab(self) -> QWidget:
         tab = PdfDropPanel()
+        self._markup_tab = tab
         tab.filesDropped.connect(self.drop_markup_pdf)
         layout = QHBoxLayout(tab)
         layout.setContentsMargins(0, 10, 0, 0)
@@ -2042,7 +3017,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.markup_page_input.setFixedWidth(56)
         self.markup_page_validator = QIntValidator(1, 1, self)
         self.markup_page_input.setValidator(self.markup_page_validator)
-        self.markup_page_input.editingFinished.connect(self.render_markup_preview)
+        self.markup_page_input.editingFinished.connect(self.on_advanced_page_input_edited)
         top.addWidget(self.markup_page_input)
         self.add_button(top, "上一頁", lambda: self.change_markup_page(-1))
         self.add_button(top, "下一頁", lambda: self.change_markup_page(1))
@@ -2056,6 +3031,9 @@ class VictorPdfToolsQt(QMainWindow):
         self.markup_preview_label = MarkupPreviewLabel()
         self.markup_preview_label.rectDrawn.connect(self.add_markup_from_rect)
         self.markup_preview_label.pointClicked.connect(self.add_markup_from_point)
+        self.markup_preview_label.copyRequested.connect(self.copy_markup_item)
+        self.markup_preview_label.pasteRequested.connect(self.paste_markup_item)
+        self.markup_preview_label.undoRequested.connect(self.undo_markup_action)
         scroll.setWidget(self.markup_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -2085,6 +3063,24 @@ class VictorPdfToolsQt(QMainWindow):
         color_row.addWidget(self.markup_color_button)
         side_layout.addLayout(color_row)
 
+        fill_row = QHBoxLayout()
+        fill_row.addWidget(QLabel("底色"))
+        self.markup_fill_combo = QComboBox()
+        self.markup_fill_combo.addItem("白色", "white")
+        self.markup_fill_combo.addItem("無底色", "none")
+        self.markup_fill_combo.addItem("淡黃", "yellow")
+        self.markup_fill_combo.addItem("淺藍", "blue")
+        self.markup_fill_combo.addItem("淺綠", "green")
+        self.markup_fill_combo.addItem("跟隨外框", "follow")
+        self.markup_fill_combo.addItem("自訂...", "custom")
+        self.markup_fill_combo.currentIndexChanged.connect(self.on_markup_fill_preset_changed)
+        fill_row.addWidget(self.markup_fill_combo, 1)
+        self.markup_fill_button = QPushButton("選色")
+        self.markup_fill_button.setFixedWidth(56)
+        self.markup_fill_button.clicked.connect(self.choose_markup_fill_color)
+        fill_row.addWidget(self.markup_fill_button)
+        side_layout.addLayout(fill_row)
+
         side_layout.addWidget(QLabel("註解文字（標註框 / 對話框 / 便利貼）"))
         self.markup_note_input = QLineEdit()
         self.markup_note_input.setPlaceholderText("例如：請核對此數字")
@@ -2097,6 +3093,7 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(self.markup_list)
 
         list_buttons = QHBoxLayout()
+        self.add_button(list_buttons, "復原", self.undo_markup_action)
         self.add_button(list_buttons, "刪除選取", self.delete_selected_markup, "danger")
         self.add_button(list_buttons, "清空", self.clear_markups)
         side_layout.addLayout(list_buttons)
@@ -2108,10 +3105,13 @@ class VictorPdfToolsQt(QMainWindow):
 
         save_button = self.add_button(side_layout, "套用並另存 PDF", self.save_markup_pdf, "primary")
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        changed_button = self.add_button(side_layout, "另存有修改的頁", self.save_changed_pages_pdf)
+        changed_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
-            "提示：標註框／對話框／雲朵請從要指出的位置拖到文字框；"
-            "便利貼用單擊放置。可跨頁加入多個標註，最後一次另存。"
+            "提示：標註框／對話框／雲朵／附註請從要指出的位置拖到文字框；"
+            "便利貼用單擊放置。點選後 Ctrl+C 複製、Ctrl+V 貼到其他位置，Ctrl+Z 或「復原」可還原。"
+            "可跨頁加入多個標註，最後一次另存。"
         )
         guide.setObjectName("muted")
         guide.setWordWrap(True)
@@ -2123,14 +3123,14 @@ class VictorPdfToolsQt(QMainWindow):
     def load_markup_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
         if path:
-            self.set_markup_pdf(Path(path))
+            self.load_advanced_pdf_from_path(Path(path), self.markup_password_input.text())
 
     def drop_markup_pdf(self, paths: list[str]) -> None:
         pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
         if not pdf_paths:
             self.set_status("請拖放 PDF 檔案到註解分頁。")
             return
-        self.set_markup_pdf(pdf_paths[0])
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.markup_password_input.text())
 
     def set_markup_pdf(self, path: Path) -> None:
         try:
@@ -2141,6 +3141,8 @@ class VictorPdfToolsQt(QMainWindow):
         self.markup_pdf_path = path
         self.markup_page_count = len(reader.pages)
         self.markup_items = []
+        self._markup_undo_stack = []
+        self._markup_clipboard = None
         self.refresh_markup_list()
         self.markup_page_validator.setRange(1, max(self.markup_page_count, 1))
         self.markup_page_input.setText("1")
@@ -2153,8 +3155,7 @@ class VictorPdfToolsQt(QMainWindow):
         current = int(self.markup_page_input.text() or "1")
         target = min(max(current + delta, 1), max(self.markup_page_count, 1))
         if target != current:
-            self.markup_page_input.setText(str(target))
-            self.render_markup_preview()
+            self.set_advanced_page(target - 1)
 
     def current_markup_page_index(self) -> int:
         return int(self.markup_page_input.text() or "1") - 1
@@ -2172,7 +3173,7 @@ class VictorPdfToolsQt(QMainWindow):
             document = pdfium.PdfDocument(str(self.markup_pdf_path), password=self.markup_password_input.text() or None)
             page = document.get_page(page_number - 1)
             page_width, page_height = page.get_size()
-            scale = min(ANNOT_PREVIEW_MAX_WIDTH / page_width, ANNOT_PREVIEW_MAX_HEIGHT / page_height, 1.25)
+            scale = self.advanced_preview_scale(page_width, page_height)
             image = page.render(scale=scale).to_pil().convert("RGB")
             page.close()
             document.close()
@@ -2276,6 +3277,37 @@ class VictorPdfToolsQt(QMainWindow):
         if custom_index >= 0:
             self.markup_color_combo.setCurrentIndex(custom_index)
 
+    def on_markup_fill_preset_changed(self) -> None:
+        preset = self.markup_fill_combo.currentData()
+        if preset == "custom":
+            self.choose_markup_fill_color()
+            return
+        if preset == "none":
+            self.markup_fill_none = True
+            self.markup_fill_rgb = (1.0, 1.0, 1.0)
+        elif preset == "follow":
+            self.markup_fill_none = False
+            self.markup_fill_rgb = None
+        elif preset in ANNOTATION_FILL_PRESETS:
+            self.markup_fill_none = False
+            self.markup_fill_rgb = ANNOTATION_FILL_PRESETS[preset]
+
+    def choose_markup_fill_color(self) -> None:
+        current = QColor.fromRgbF(*(self.markup_fill_rgb or (1.0, 1.0, 1.0)))
+        chosen = QColorDialog.getColor(current, self, "選擇底色")
+        if not chosen.isValid():
+            return
+        self.markup_fill_none = False
+        self.markup_fill_rgb = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        custom_index = self.markup_fill_combo.findData("custom")
+        if custom_index >= 0:
+            self.markup_fill_combo.setCurrentIndex(custom_index)
+
+    def _markup_fill_values(self) -> tuple[tuple[float, float, float] | None, bool]:
+        if self.markup_fill_none:
+            return None, True
+        return self.markup_fill_rgb, False
+
     def add_markup_from_rect(self, start: QPoint, end: QPoint) -> None:
         if self.markup_preview_image is None:
             self.set_status("請先載入 PDF 並更新預覽。")
@@ -2289,6 +3321,7 @@ class VictorPdfToolsQt(QMainWindow):
         contents = self.markup_note_input.text().strip()
         if kind in CALLOUT_KINDS:
             contents = contents or "註解"
+        fill_rgb, fill_none = self._markup_fill_values()
         markup = MarkupAnnotation(
             kind=kind,
             x0=x0,
@@ -2297,8 +3330,13 @@ class VictorPdfToolsQt(QMainWindow):
             y1=y1,
             color_rgb=self.markup_current_color(),
             contents=contents,
+            fill_rgb=fill_rgb,
+            fill_none=fill_none,
         )
+        self._push_markup_undo()
         self.markup_items.append((self.current_markup_page_index(), markup))
+        if kind in {"note"} | CALLOUT_KINDS:
+            self.markup_note_input.clear()
         self.refresh_markup_list()
         self.update_markup_preview_display()
         self.set_status(f"已加入標註：{self._markup_label(markup)}")
@@ -2312,6 +3350,7 @@ class VictorPdfToolsQt(QMainWindow):
             self.set_status("此工具需要拖曳：從要指出的位置拉到文字框。")
             return
         x0, y0 = self.markup_image_point_to_pdf(point)
+        fill_rgb, fill_none = self._markup_fill_values()
         if kind in CALLOUT_KINDS:
             markup = MarkupAnnotation(
                 kind=kind,
@@ -2321,6 +3360,8 @@ class VictorPdfToolsQt(QMainWindow):
                 y1=y0 + 50.0,
                 color_rgb=self.markup_current_color(),
                 contents=self.markup_note_input.text().strip() or "註解",
+                fill_rgb=fill_rgb,
+                fill_none=fill_none,
             )
         else:
             markup = MarkupAnnotation(
@@ -2331,8 +3372,12 @@ class VictorPdfToolsQt(QMainWindow):
                 y1=y0,
                 color_rgb=self.markup_current_color(),
                 contents=self.markup_note_input.text().strip() or "備註",
+                fill_rgb=fill_rgb,
+                fill_none=fill_none,
             )
+        self._push_markup_undo()
         self.markup_items.append((self.current_markup_page_index(), markup))
+        self.markup_note_input.clear()
         self.refresh_markup_list()
         self.update_markup_preview_display()
         self.set_status(f"已加入標註：{self._markup_label(markup)}")
@@ -2354,6 +3399,7 @@ class VictorPdfToolsQt(QMainWindow):
         if row < 0 or row >= len(self.markup_items):
             self.set_status("請先選取要刪除的標註。")
             return
+        self._push_markup_undo()
         self.markup_items.pop(row)
         self.refresh_markup_list()
         self.update_markup_preview_display()
@@ -2362,10 +3408,62 @@ class VictorPdfToolsQt(QMainWindow):
     def clear_markups(self) -> None:
         if not self.markup_items:
             return
+        self._push_markup_undo()
         self.markup_items = []
         self.refresh_markup_list()
         self.update_markup_preview_display()
         self.set_status("已清空標註。")
+
+    def _clone_markup_items(self) -> list[tuple[int, MarkupAnnotation]]:
+        return [(page_index, replace(markup)) for page_index, markup in self.markup_items]
+
+    def _push_markup_undo(self) -> None:
+        self._markup_undo_stack.append(self._clone_markup_items())
+        if len(self._markup_undo_stack) > 40:
+            self._markup_undo_stack.pop(0)
+
+    def undo_markup_action(self) -> None:
+        if not self._markup_undo_stack:
+            self.set_status("沒有可復原的標註動作。")
+            return
+        self.markup_items = self._markup_undo_stack.pop()
+        self.refresh_markup_list()
+        self.update_markup_preview_display()
+        self.set_status("已復原標註。")
+
+    def copy_markup_item(self) -> None:
+        row = self.markup_list.currentRow() if hasattr(self, "markup_list") else -1
+        if 0 <= row < len(self.markup_items):
+            _page, markup = self.markup_items[row]
+        elif self.markup_items:
+            page = self.current_markup_page_index()
+            on_page = [item for item in self.markup_items if item[0] == page]
+            _page, markup = on_page[-1] if on_page else self.markup_items[-1]
+        else:
+            self.set_status("請先加入標註後再複製。")
+            return
+        self._markup_clipboard = replace(markup)
+        QApplication.clipboard().setText(markup.contents or "")
+        self.set_status("已複製標註。到其他位置按 Ctrl+V 貼上。")
+
+    def paste_markup_item(self) -> None:
+        if self._markup_clipboard is None:
+            self.set_status("請先點選標註後按 Ctrl+C。")
+            return
+        self._push_markup_undo()
+        source = self._markup_clipboard
+        pasted = replace(
+            source,
+            x0=source.x0 + 16.0,
+            y0=source.y0 - 16.0,
+            x1=source.x1 + 16.0,
+            y1=source.y1 - 16.0,
+        )
+        self.markup_items.append((self.current_markup_page_index(), pasted))
+        self.refresh_markup_list()
+        self.markup_list.setCurrentRow(len(self.markup_items) - 1)
+        self.update_markup_preview_display()
+        self.set_status("已貼上標註。")
 
     def save_markup_pdf(self) -> None:
         if self.markup_pdf_path is None:
@@ -2415,7 +3513,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.crop_page_input.setFixedWidth(56)
         self.crop_page_validator = QIntValidator(1, 1, self)
         self.crop_page_input.setValidator(self.crop_page_validator)
-        self.crop_page_input.editingFinished.connect(self.render_crop_preview)
+        self.crop_page_input.editingFinished.connect(self.on_advanced_page_input_edited)
         top.addWidget(self.crop_page_input)
         self.add_button(top, "上一頁", lambda: self.change_crop_page(-1))
         self.add_button(top, "下一頁", lambda: self.change_crop_page(1))
@@ -2486,14 +3584,14 @@ class VictorPdfToolsQt(QMainWindow):
     def load_crop_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
         if path:
-            self.set_crop_pdf(Path(path))
+            self.load_advanced_pdf_from_path(Path(path), self.crop_password_input.text())
 
     def drop_crop_pdf(self, paths: list[str]) -> None:
         pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
         if not pdf_paths:
             self.set_status("請拖放 PDF 檔案到裁切分頁。")
             return
-        self.set_crop_pdf(pdf_paths[0])
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.crop_password_input.text())
 
     def set_crop_pdf(self, path: Path) -> None:
         try:
@@ -2516,8 +3614,7 @@ class VictorPdfToolsQt(QMainWindow):
         current = int(self.crop_page_input.text() or "1")
         target = min(max(current + delta, 1), max(self.crop_page_count, 1))
         if target != current:
-            self.crop_page_input.setText(str(target))
-            self.render_crop_preview()
+            self.set_advanced_page(target - 1)
 
     def render_crop_preview(self) -> None:
         if self.crop_pdf_path is None:
@@ -2532,7 +3629,7 @@ class VictorPdfToolsQt(QMainWindow):
             document = pdfium.PdfDocument(str(self.crop_pdf_path), password=self.crop_password_input.text() or None)
             page = document.get_page(page_number - 1)
             page_width, page_height = page.get_size()
-            scale = min(ANNOT_PREVIEW_MAX_WIDTH / page_width, ANNOT_PREVIEW_MAX_HEIGHT / page_height, 1.25)
+            scale = self.advanced_preview_scale(page_width, page_height)
             image = page.render(scale=scale).to_pil().convert("RGB")
             page.close()
             document.close()
@@ -2675,6 +3772,872 @@ class VictorPdfToolsQt(QMainWindow):
     def current_crop_page_index(self) -> int:
         return int(self.crop_page_input.text() or "1") - 1
 
+    def build_erase_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        self._erase_tab = tab
+        tab.filesDropped.connect(self.drop_erase_pdf)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(14)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        top = QHBoxLayout()
+        self.add_button(top, "載入 PDF", self.load_erase_pdf)
+        top.addWidget(QLabel("頁碼"))
+        self.erase_page_input = QLineEdit("1")
+        self.erase_page_input.setFixedWidth(56)
+        self.erase_page_validator = QIntValidator(1, 1, self)
+        self.erase_page_input.setValidator(self.erase_page_validator)
+        self.erase_page_input.editingFinished.connect(self.on_advanced_page_input_edited)
+        top.addWidget(self.erase_page_input)
+        self.add_button(top, "上一頁", lambda: self.change_erase_page(-1))
+        self.add_button(top, "下一頁", lambda: self.change_erase_page(1))
+        self.add_button(top, "更新預覽", self.render_erase_preview)
+        top.addStretch(1)
+        left.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.erase_preview_label = ErasePreviewLabel()
+        self.erase_preview_label.setCursor(Qt.BlankCursor)
+        self.erase_preview_label.strokePoint.connect(self.add_erase_stroke_point)
+        self.erase_preview_label.strokeFinished.connect(self.finish_erase_stroke)
+        self.erase_preview_label.rectDrawn.connect(self.add_erase_rect)
+        self.erase_preview_label.pointClicked.connect(self.add_erase_text_at_point)
+        self.erase_preview_label.boxResized.connect(self.resize_erase_text_box_from_handle)
+        self.erase_preview_label.boxMoved.connect(self.move_erase_text_box)
+        self.erase_preview_label.boxInteractionFinished.connect(self.finish_erase_text_box_interaction)
+        self.erase_preview_label.inlineEdited.connect(self.on_erase_inline_text_edited)
+        self.erase_preview_label.copyRequested.connect(self.copy_erase_text_box)
+        self.erase_preview_label.pasteRequested.connect(self.paste_erase_text_box)
+        self.erase_preview_label.undoRequested.connect(self.undo_erase_mark)
+        scroll.setWidget(self.erase_preview_label)
+        left.addWidget(scroll, 1)
+        layout.addLayout(left, 1)
+
+        side = QFrame()
+        side.setObjectName("panel")
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(10)
+
+        side_layout.addWidget(QLabel("工具"))
+        tool_row = QHBoxLayout()
+        self.erase_brush_button = QPushButton("橡皮刷")
+        self.erase_brush_button.setCheckable(True)
+        self.erase_brush_button.setChecked(True)
+        self.erase_rect_button = QPushButton("長方形")
+        self.erase_rect_button.setCheckable(True)
+        self.erase_text_button = QPushButton("文字方塊")
+        self.erase_text_button.setCheckable(True)
+        self.erase_brush_button.clicked.connect(lambda: self.set_erase_tool("brush"))
+        self.erase_rect_button.clicked.connect(lambda: self.set_erase_tool("rect"))
+        self.erase_text_button.clicked.connect(lambda: self.set_erase_tool("text"))
+        tool_row.addWidget(self.erase_brush_button, 1)
+        tool_row.addWidget(self.erase_rect_button, 1)
+        tool_row.addWidget(self.erase_text_button, 1)
+        side_layout.addLayout(tool_row)
+
+        side_layout.addWidget(QLabel("顏色"))
+        self.erase_color_combo = QComboBox()
+        self.erase_color_combo.addItem("白色", "white")
+        self.erase_color_combo.addItem("黑色", "black")
+        self.erase_color_combo.currentIndexChanged.connect(self.update_erase_preview_display)
+        side_layout.addWidget(self.erase_color_combo)
+
+        side_layout.addWidget(QLabel("橡皮刷大小"))
+        size_row = QHBoxLayout()
+        self.erase_size_slider = QSlider(Qt.Horizontal)
+        self.erase_size_slider.setRange(8, 80)
+        self.erase_size_slider.setValue(28)
+        self.erase_size_slider.valueChanged.connect(self.on_erase_size_changed)
+        size_row.addWidget(self.erase_size_slider, 1)
+        self.erase_size_label = QLabel("直徑 28 pt")
+        self.erase_size_label.setFixedWidth(78)
+        size_row.addWidget(self.erase_size_label)
+        side_layout.addLayout(size_row)
+
+        self.erase_remove_content_checkbox = QCheckBox("徹底刪除底層文字／圖（塗銷）")
+        self.erase_remove_content_checkbox.setChecked(True)
+        side_layout.addWidget(self.erase_remove_content_checkbox)
+
+        side_layout.addWidget(QLabel("文字方塊內容（點預覽即出現方塊，可直接打字）"))
+        self.erase_text_input = QTextEdit()
+        self.erase_text_input.setPlaceholderText("點預覽放置方塊後，在框內或這裡輸入文字")
+        self.erase_text_input.setFixedHeight(72)
+        self.erase_text_input.textChanged.connect(self.on_erase_sidebar_text_changed)
+        side_layout.addWidget(self.erase_text_input)
+        text_size_row = QHBoxLayout()
+        text_size_row.addWidget(QLabel("文字大小"))
+        self.erase_text_size_combo = QComboBox()
+        configure_font_size_combo(self.erase_text_size_combo, "18", self.on_erase_text_style_changed)
+        text_size_row.addWidget(self.erase_text_size_combo, 1)
+        self.erase_text_bold_checkbox = QCheckBox("粗體")
+        self.erase_text_bold_checkbox.toggled.connect(self.on_erase_text_style_changed)
+        text_size_row.addWidget(self.erase_text_bold_checkbox)
+        side_layout.addLayout(text_size_row)
+        font_row = QHBoxLayout()
+        font_row.addWidget(QLabel("字型"))
+        self.erase_text_font_combo = QComboBox()
+        self.erase_text_font_combo.addItem("中文（微軟雅黑／正黑體）", "cjk")
+        self.erase_text_font_combo.addItem("Helvetica", "helvetica")
+        self.erase_text_font_combo.currentIndexChanged.connect(self.on_erase_text_style_changed)
+        font_row.addWidget(self.erase_text_font_combo, 1)
+        side_layout.addLayout(font_row)
+        text_color_row = QHBoxLayout()
+        text_color_row.addWidget(QLabel("文字顏色"))
+        self.erase_text_color_combo = QComboBox()
+        self.erase_text_color_combo.addItem("黑色", "black")
+        self.erase_text_color_combo.addItem("紅色", "red")
+        self.erase_text_color_combo.addItem("藍色", "blue")
+        self.erase_text_color_combo.addItem("白色", "white")
+        self.erase_text_color_combo.addItem("自訂...", "custom")
+        self.erase_text_color_combo.currentIndexChanged.connect(self.on_erase_text_color_changed)
+        text_color_row.addWidget(self.erase_text_color_combo, 1)
+        self.erase_text_color_button = QPushButton("選色")
+        self.erase_text_color_button.setFixedWidth(56)
+        self.erase_text_color_button.clicked.connect(self.choose_erase_text_color)
+        text_color_row.addWidget(self.erase_text_color_button)
+        side_layout.addLayout(text_color_row)
+
+        side_layout.addWidget(QLabel("本頁標記"))
+        self.erase_mark_list = QListWidget()
+        self.erase_mark_list.setMinimumHeight(90)
+        self.erase_mark_list.setMaximumHeight(160)
+        side_layout.addWidget(self.erase_mark_list)
+
+        undo_row = QHBoxLayout()
+        self.add_button(undo_row, "復原上一筆", self.undo_erase_mark)
+        self.add_button(undo_row, "清除本頁", self.clear_erase_marks_on_page)
+        side_layout.addLayout(undo_row)
+
+        side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.erase_password_input = QLineEdit()
+        self.erase_password_input.setEchoMode(QLineEdit.Password)
+        side_layout.addWidget(self.erase_password_input)
+
+        save_button = self.add_button(side_layout, "套用並另存 PDF", self.save_erase_pdf, "primary")
+        save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        changed_button = self.add_button(side_layout, "另存有修改的頁", self.save_changed_pages_pdf)
+        changed_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        guide = QLabel(
+            "選「文字方塊」後點預覽，方塊會立刻出現。可直接在框內打字、拖角縮放、改字型顏色。"
+            "點選方塊後 Ctrl+C 複製、Ctrl+V 貼到其他位置，Ctrl+Z 或「復原上一筆」可還原。"
+        )
+        guide.setObjectName("muted")
+        guide.setWordWrap(True)
+        side_layout.addWidget(guide)
+        side_layout.addStretch(1)
+        layout.addWidget(wrap_side_panel(side, 320))
+        return tab
+
+    def load_erase_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
+        if path:
+            self.load_advanced_pdf_from_path(Path(path), self.erase_password_input.text())
+
+    def drop_erase_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到橡皮擦分頁。")
+            return
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.erase_password_input.text())
+
+    def set_erase_pdf(self, path: Path) -> None:
+        try:
+            reader = open_reader(path, self.erase_password_input.text())
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.erase_pdf_path = path
+        self.erase_page_count = len(reader.pages)
+        self.erase_marks = []
+        self._erase_live_points = []
+        self._erase_text_selected = None
+        self._erase_undo_stack = []
+        self._erase_text_clipboard = None
+        self.erase_page_validator.setRange(1, max(self.erase_page_count, 1))
+        self.erase_page_input.setText("1")
+        self.refresh_erase_list()
+        self.render_erase_preview()
+        self.set_status(f"已載入 {path.name}，共 {self.erase_page_count} 頁。")
+
+    def change_erase_page(self, delta: int) -> None:
+        if self.erase_pdf_path is None:
+            return
+        current = int(self.erase_page_input.text() or "1")
+        target = min(max(current + delta, 1), max(self.erase_page_count, 1))
+        if target != current:
+            self.set_advanced_page(target - 1)
+
+    def current_erase_page_index(self) -> int:
+        return int(self.erase_page_input.text() or "1") - 1
+
+    def erase_brush_radius(self) -> float:
+        return float(self.erase_size_slider.value()) / 2.0
+
+    def erase_color_rgb(self) -> tuple[float, float, float]:
+        if self.erase_color_combo.currentData() == "black":
+            return (0.0, 0.0, 0.0)
+        return (1.0, 1.0, 1.0)
+
+    def set_erase_tool(self, tool: str) -> None:
+        self.erase_brush_button.setChecked(tool == "brush")
+        self.erase_rect_button.setChecked(tool == "rect")
+        self.erase_text_button.setChecked(tool == "text")
+        self.erase_preview_label.tool = tool
+        self.erase_size_slider.setEnabled(tool == "brush")
+        if tool == "brush":
+            self.erase_preview_label.setCursor(Qt.BlankCursor)
+            self.set_status("橡皮刷：預覽上的圈圈就是實際大小，按住拖動。擦完可改選「文字方塊」蓋上新字。")
+        elif tool == "rect":
+            self.erase_preview_label.setCursor(Qt.CrossCursor)
+            self.set_status("長方形：拖出範圍後會立刻遮擋。擦完可改選「文字方塊」。")
+        else:
+            self.erase_preview_label.setCursor(Qt.IBeamCursor)
+            self.set_status("文字方塊：點預覽即出現方塊，可在框內打字、拖角縮放。Ctrl+C／V 複製貼上，Ctrl+Z 還原。")
+        if tool != "text":
+            self.clear_erase_text_selection()
+        else:
+            self.update_erase_preview_display()
+        self.sync_erase_brush_cursor()
+
+    def on_erase_size_changed(self, value: int) -> None:
+        self.erase_size_label.setText(f"直徑 {value} pt")
+        self.sync_erase_brush_cursor()
+
+    def sync_erase_brush_cursor(self) -> None:
+        image = self.erase_preview_image
+        page_width, _page_height = self.erase_page_size
+        if image is not None and page_width > 0:
+            scale_x = image.width / page_width
+            radius_px = self.erase_brush_radius() * scale_x
+        else:
+            radius_px = self.erase_brush_radius()
+        self.erase_preview_label.brush_radius_px = max(radius_px, 4.0)
+        red, green, blue = self.erase_color_rgb()
+        self.erase_preview_label.cover_color = QColor(int(red * 255), int(green * 255), int(blue * 255))
+        self.erase_preview_label.update()
+
+    def render_erase_preview(self) -> None:
+        if self.erase_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        if not PDF_RENDER_AVAILABLE or pdfium is None:
+            self.set_status("PDF 預覽元件未啟用。")
+            return
+        try:
+            page_number = min(max(int(self.erase_page_input.text() or "1"), 1), self.erase_page_count)
+            self.erase_page_input.setText(str(page_number))
+            document = pdfium.PdfDocument(
+                str(self.erase_pdf_path),
+                password=self.erase_password_input.text() or None,
+            )
+            page = document.get_page(page_number - 1)
+            page_width, page_height = page.get_size()
+            scale = self.advanced_preview_scale(page_width, page_height)
+            image = page.render(scale=scale).to_pil().convert("RGB")
+            page.close()
+            document.close()
+            self.erase_page_size = (float(page_width), float(page_height))
+            self.erase_preview_image = image
+            self.update_erase_preview_display()
+            self.refresh_erase_list()
+        except Exception as exc:
+            self.show_error(exc)
+
+    def erase_image_point_to_pdf(self, point: QPoint) -> tuple[float, float]:
+        page_width, page_height = self.erase_page_size
+        image = self.erase_preview_image
+        if image is None or page_width <= 0 or page_height <= 0:
+            return (0.0, 0.0)
+        ix = min(max(point.x(), 0), image.width)
+        iy = min(max(point.y(), 0), image.height)
+        return (ix / image.width * page_width, page_height - (iy / image.height * page_height))
+
+    def add_erase_stroke_point(self, point: QPoint) -> None:
+        if self.erase_preview_image is None:
+            self.set_status("請先載入 PDF。")
+            return
+        pdf_point = self.erase_image_point_to_pdf(point)
+        radius = self.erase_brush_radius()
+        if self._erase_live_points:
+            last_x, last_y = self._erase_live_points[-1]
+            gap = ((pdf_point[0] - last_x) ** 2 + (pdf_point[1] - last_y) ** 2) ** 0.5
+            if gap < radius * 0.4:
+                return
+        self._erase_live_points.append(pdf_point)
+        self.update_erase_preview_display()
+
+    def finish_erase_stroke(self) -> None:
+        if not self._erase_live_points:
+            return
+        self.erase_marks.append(
+            EraseMark(
+                page_index=self.current_erase_page_index(),
+                kind="stroke",
+                color_rgb=self.erase_color_rgb(),
+                points=tuple(self._erase_live_points),
+                radius=self.erase_brush_radius(),
+            )
+        )
+        self._erase_undo_stack.append(("mark", self.current_erase_page_index()))
+        self._erase_live_points = []
+        self.refresh_erase_list()
+        self.update_erase_preview_display()
+        self.set_status(f"已加入橡皮刷，共 {len(self.erase_marks)} 筆標記。")
+
+    def add_erase_rect(self, start: QPoint, end: QPoint) -> None:
+        if self.erase_preview_image is None:
+            self.set_status("請先載入 PDF。")
+            return
+        x0, y0 = self.erase_image_point_to_pdf(start)
+        x1, y1 = self.erase_image_point_to_pdf(end)
+        if abs(x1 - x0) < 4 or abs(y1 - y0) < 4:
+            if self.erase_preview_label.tool == "text":
+                self.add_erase_text_at_point(end)
+            return
+        if self.erase_preview_label.tool == "text":
+            self._begin_new_erase_text_box()
+            self.add_erase_text_box(min(x0, x1), min(y0, y1), abs(x1 - x0), abs(y1 - y0))
+            return
+        self.erase_marks.append(
+            EraseMark(
+                page_index=self.current_erase_page_index(),
+                kind="rect",
+                color_rgb=self.erase_color_rgb(),
+                points=((x0, y0), (x1, y1)),
+                radius=self.erase_brush_radius(),
+            )
+        )
+        self._erase_undo_stack.append(("mark", self.current_erase_page_index()))
+        self.refresh_erase_list()
+        self.update_erase_preview_display()
+        self.set_status(f"已加入長方形遮擋，共 {len(self.erase_marks)} 筆標記。")
+
+    def erase_text_color_rgb(self) -> tuple[float, float, float]:
+        preset = self.erase_text_color_combo.currentData() if hasattr(self, "erase_text_color_combo") else None
+        if preset == "white":
+            return (1.0, 1.0, 1.0)
+        if preset in ANNOTATION_COLOR_PRESETS:
+            return ANNOTATION_COLOR_PRESETS[preset]
+        return self.erase_text_color_rgb_value
+
+    def on_erase_text_color_changed(self) -> None:
+        preset = self.erase_text_color_combo.currentData()
+        if preset == "custom":
+            self.choose_erase_text_color()
+            return
+        if preset == "white":
+            self.erase_text_color_rgb_value = (1.0, 1.0, 1.0)
+        elif preset in ANNOTATION_COLOR_PRESETS:
+            self.erase_text_color_rgb_value = ANNOTATION_COLOR_PRESETS[preset]
+        self.on_erase_text_style_changed()
+
+    def choose_erase_text_color(self) -> None:
+        current = QColor.fromRgbF(*self.erase_text_color_rgb_value)
+        chosen = QColorDialog.getColor(current, self, "選擇文字顏色")
+        if not chosen.isValid():
+            return
+        self.erase_text_color_rgb_value = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        custom_index = self.erase_text_color_combo.findData("custom")
+        if custom_index >= 0:
+            self.erase_text_color_combo.setCurrentIndex(custom_index)
+        self.on_erase_text_style_changed()
+
+    def erase_item_image_rect(self, item: dict) -> QRect:
+        page_width, page_height = self.erase_page_size
+        image = self.erase_preview_image
+        if image is None or page_width <= 0 or page_height <= 0:
+            return QRect()
+        left = item["pdf_x"] / page_width * image.width
+        top = (page_height - (item["pdf_y"] + item["rect_height"])) / page_height * image.height
+        width = item["rect_width"] / page_width * image.width
+        height = item["rect_height"] / page_height * image.height
+        return QRect(int(round(left)), int(round(top)), max(int(round(width)), 1), max(int(round(height)), 1))
+
+    def selected_erase_text_item(self) -> dict | None:
+        index = self._erase_text_selected
+        if index is None or index < 0 or index >= len(self.annotation_items):
+            return None
+        return self.annotation_items[index]
+
+    def clear_erase_text_selection(self) -> None:
+        self._erase_text_selected = None
+        self._erase_resize_snapshot = None
+        if hasattr(self, "erase_preview_label"):
+            self.erase_preview_label.handles_enabled = False
+            self.erase_preview_label.box_rect = QRect()
+            self.erase_preview_label.hide_inline_editor()
+
+    def _erase_text_hit_index(self, point: QPoint) -> int | None:
+        page_index = self.current_erase_page_index()
+        for index in range(len(self.annotation_items) - 1, -1, -1):
+            item = self.annotation_items[index]
+            if item.get("page_index") != page_index:
+                continue
+            if self.erase_item_image_rect(item).adjusted(-6, -6, 6, 6).contains(point):
+                return index
+        return None
+
+    def select_erase_text_item(self, index: int) -> None:
+        if index < 0 or index >= len(self.annotation_items):
+            self.clear_erase_text_selection()
+            return
+        self._erase_text_selected = index
+        item = self.annotation_items[index]
+        self._erase_syncing_text = True
+        try:
+            self.erase_text_input.setPlainText(str(item.get("text") or ""))
+            self.erase_text_size_combo.setCurrentText(str(int(item.get("font_size") or 18)))
+            font_key = str(item.get("font_key") or "cjk")
+            font_row = self.erase_text_font_combo.findData(font_key)
+            if font_row >= 0:
+                self.erase_text_font_combo.setCurrentIndex(font_row)
+            self.erase_text_bold_checkbox.setChecked(bool(item.get("bold")))
+        finally:
+            self._erase_syncing_text = False
+        self.update_erase_preview_display()
+        self.erase_preview_label.inline_edit.setFocus()
+
+    def _erase_tab_active(self) -> bool:
+        return (
+            hasattr(self, "_erase_tab")
+            and hasattr(self, "_advanced_tab")
+            and self.main_tabs.currentWidget() is self._advanced_tab
+            and self.advanced_tabs.currentWidget() is self._erase_tab
+        )
+
+    def _erase_text_tool_active(self) -> bool:
+        return self._erase_tab_active() and getattr(self.erase_preview_label, "tool", "") == "text"
+
+    def _begin_new_erase_text_box(self) -> None:
+        if self._erase_text_selected is None:
+            return
+        self._erase_syncing_text = True
+        try:
+            self.erase_text_input.clear()
+        finally:
+            self._erase_syncing_text = False
+
+    def add_erase_text_at_point(self, point: QPoint) -> None:
+        if self.erase_preview_label.tool != "text":
+            return
+        self._erase_last_click = QPoint(point)
+        hit = self._erase_text_hit_index(point)
+        if hit is not None:
+            self.select_erase_text_item(hit)
+            return
+        self._begin_new_erase_text_box()
+        font_size = combo_font_size(self.erase_text_size_combo, 18)
+        width, height = self.measure_annotation_text_box("文字", font_size, False, "cjk", 180.0)
+        pdf_x, pdf_y_top = self.erase_image_point_to_pdf(point)
+        self.add_erase_text_box(pdf_x, pdf_y_top - height, width, height)
+        self._erase_last_click = None
+
+    def add_erase_text_box(self, pdf_x: float, pdf_y: float, width: float, height: float) -> None:
+        text = self.erase_text_input.toPlainText()
+        font_size = combo_font_size(self.erase_text_size_combo, 18)
+        font_key = self.erase_text_font_combo.currentData() or "cjk"
+        bold = self.erase_text_bold_checkbox.isChecked()
+        if text.strip():
+            fitted_width, fitted_height = self.measure_annotation_text_box(
+                text, font_size, bold, font_key, max(width, 80.0)
+            )
+            width = max(width, fitted_width)
+            height = max(height, fitted_height)
+        else:
+            width = max(width, 160.0)
+            height = max(height, font_size * 1.8, 32.0)
+        self._erase_text_seq += 1
+        item = {
+            "text": text,
+            "cover": False,
+            "font_key": font_key,
+            "font_size": font_size,
+            "bold": bold,
+            "color_rgb": self.erase_text_color_rgb(),
+            "fill_rgb": (1.0, 1.0, 1.0),
+            "fill_none": False,
+            "pdf_x": pdf_x,
+            "pdf_y": pdf_y,
+            "rect_width": width,
+            "rect_height": height,
+            "shape": "rect",
+            "pointer_x": pdf_x + width / 2.0,
+            "pointer_y": pdf_y - 16.0,
+            "page_index": self.current_erase_page_index(),
+            "_uid": self._erase_text_seq,
+        }
+        self.annotation_items.append(item)
+        self._erase_undo_stack.append(("text", item["page_index"], item["_uid"]))
+        self.refresh_annotation_item_list()
+        self.select_erase_text_item(len(self.annotation_items) - 1)
+        self.refresh_erase_list()
+        self.set_status("已放置文字方塊。可直接打字、拖角縮放，或 Ctrl+C／V 複製到其他位置。")
+
+    def on_erase_inline_text_edited(self, text: str) -> None:
+        item = self.selected_erase_text_item()
+        if item is None or self._erase_syncing_text:
+            return
+        item["text"] = text
+        self._erase_syncing_text = True
+        try:
+            if self.erase_text_input.toPlainText() != text:
+                self.erase_text_input.setPlainText(text)
+        finally:
+            self._erase_syncing_text = False
+        self.refresh_erase_list()
+
+    def on_erase_sidebar_text_changed(self) -> None:
+        if self._erase_syncing_text:
+            return
+        item = self.selected_erase_text_item()
+        if item is None:
+            return
+        text = self.erase_text_input.toPlainText()
+        item["text"] = text
+        editor = self.erase_preview_label.inline_edit
+        if editor.toPlainText() != text:
+            editor.blockSignals(True)
+            editor.setPlainText(text)
+            editor.blockSignals(False)
+        self.refresh_erase_list()
+
+    def on_erase_text_style_changed(self, *_args) -> None:
+        if self._erase_syncing_text:
+            return
+        item = self.selected_erase_text_item()
+        if item is None:
+            return
+        item["font_size"] = combo_font_size(self.erase_text_size_combo, 18)
+        item["font_key"] = self.erase_text_font_combo.currentData() or "cjk"
+        item["bold"] = self.erase_text_bold_checkbox.isChecked()
+        item["color_rgb"] = self.erase_text_color_rgb()
+        self.update_erase_preview_display()
+
+    def _erase_image_delta_to_pdf(self, start: QPoint, current: QPoint) -> tuple[float, float]:
+        page_width, page_height = self.erase_page_size
+        image = self.erase_preview_image
+        if image is None or page_width <= 0 or page_height <= 0:
+            return (0.0, 0.0)
+        dx = (current.x() - start.x()) / image.width * page_width
+        dy = -((current.y() - start.y()) / image.height * page_height)
+        return dx, dy
+
+    def resize_erase_text_box_from_handle(self, handle: str, start: QPoint, current: QPoint) -> None:
+        item = self.selected_erase_text_item()
+        if item is None:
+            return
+        if self._erase_resize_snapshot is None:
+            self._erase_resize_snapshot = (
+                item["pdf_x"],
+                item["pdf_y"],
+                item["rect_width"],
+                item["rect_height"],
+            )
+            self._erase_undo_stack.append(("text_edit", item.get("page_index", 0), item.get("_uid"), dict(item)))
+        pdf_x, pdf_y, width, height = self._erase_resize_snapshot
+        dx, dy = self._erase_image_delta_to_pdf(start, current)
+        if "e" in handle:
+            width += dx
+        if "w" in handle:
+            pdf_x += dx
+            width -= dx
+        if "n" in handle:
+            height += dy
+        if "s" in handle:
+            pdf_y += dy
+            height -= dy
+        item["pdf_x"] = pdf_x
+        item["pdf_y"] = pdf_y
+        item["rect_width"] = max(width, 80.0)
+        item["rect_height"] = max(height, 28.0)
+        self.update_erase_preview_display()
+
+    def move_erase_text_box(self, start: QPoint, current: QPoint) -> None:
+        item = self.selected_erase_text_item()
+        if item is None:
+            return
+        if self._erase_resize_snapshot is None:
+            self._erase_resize_snapshot = (
+                item["pdf_x"],
+                item["pdf_y"],
+                item["rect_width"],
+                item["rect_height"],
+            )
+            self._erase_undo_stack.append(("text_edit", item.get("page_index", 0), item.get("_uid"), dict(item)))
+        pdf_x, pdf_y, width, height = self._erase_resize_snapshot
+        dx, dy = self._erase_image_delta_to_pdf(start, current)
+        item["pdf_x"] = pdf_x + dx
+        item["pdf_y"] = pdf_y + dy
+        item["rect_width"] = width
+        item["rect_height"] = height
+        self.update_erase_preview_display()
+
+    def finish_erase_text_box_interaction(self) -> None:
+        self._erase_resize_snapshot = None
+        self.update_erase_preview_display()
+        self.set_status("已調整文字方塊。")
+
+    def copy_erase_text_box(self) -> None:
+        item = self.selected_erase_text_item()
+        if item is None:
+            return
+        self._erase_text_clipboard = dict(item)
+        QApplication.clipboard().setText(str(item.get("text") or ""))
+        self.set_status("已複製文字方塊。到其他位置按 Ctrl+V 貼上。")
+
+    def paste_erase_text_box(self) -> None:
+        if self.erase_preview_label.tool != "text" or self._erase_text_clipboard is None:
+            return
+        source = dict(self._erase_text_clipboard)
+        if self._erase_last_click is not None:
+            pdf_x, pdf_y_top = self.erase_image_point_to_pdf(self._erase_last_click)
+            pdf_y = pdf_y_top - float(source.get("rect_height") or 32)
+        else:
+            pdf_x = float(source.get("pdf_x") or 72) + 16
+            pdf_y = float(source.get("pdf_y") or 200) - 16
+        self.erase_text_input.blockSignals(True)
+        self.erase_text_input.setPlainText(str(source.get("text") or ""))
+        self.erase_text_input.blockSignals(False)
+        if source.get("font_size"):
+            self.erase_text_size_combo.setCurrentText(str(int(source["font_size"])))
+        self.add_erase_text_box(pdf_x, pdf_y, float(source.get("rect_width") or 180), float(source.get("rect_height") or 32))
+        pasted = self.selected_erase_text_item()
+        if pasted is not None:
+            pasted["text"] = source.get("text") or ""
+            pasted["font_key"] = source.get("font_key") or pasted["font_key"]
+            pasted["font_size"] = source.get("font_size") or pasted["font_size"]
+            pasted["bold"] = bool(source.get("bold"))
+            pasted["color_rgb"] = source.get("color_rgb") or pasted["color_rgb"]
+            pasted["fill_rgb"] = source.get("fill_rgb") or pasted.get("fill_rgb")
+        self.select_erase_text_item(self._erase_text_selected or 0)
+        self._erase_last_click = None
+        self.set_status("已貼上文字方塊。")
+
+    def undo_erase_mark(self) -> None:
+        page_index = self.current_erase_page_index()
+        for stack_index in range(len(self._erase_undo_stack) - 1, -1, -1):
+            action = self._erase_undo_stack[stack_index]
+            if action[1] != page_index:
+                continue
+            self._erase_undo_stack.pop(stack_index)
+            kind = action[0]
+            if kind == "mark":
+                for index in range(len(self.erase_marks) - 1, -1, -1):
+                    if self.erase_marks[index].page_index == page_index:
+                        self.erase_marks.pop(index)
+                        break
+                self.set_status("已復原上一筆標記。")
+            elif kind == "text":
+                uid = action[2]
+                self.annotation_items = [item for item in self.annotation_items if item.get("_uid") != uid]
+                self.clear_erase_text_selection()
+                self.set_status("已復原文字方塊。")
+            elif kind == "text_edit":
+                uid = action[2]
+                before = action[3]
+                restored_index = None
+                for index, item in enumerate(self.annotation_items):
+                    if item.get("_uid") == uid:
+                        item.clear()
+                        item.update(before)
+                        restored_index = index
+                        break
+                if restored_index is not None:
+                    self._erase_text_selected = restored_index
+                self.set_status("已還原文字方塊調整。")
+            self.refresh_erase_list()
+            self.refresh_annotation_item_list()
+            self.update_erase_preview_display()
+            return
+        self.set_status("本頁沒有可復原的標記。")
+
+    def clear_erase_marks_on_page(self) -> None:
+        page_index = self.current_erase_page_index()
+        before_marks = len(self.erase_marks)
+        self.erase_marks = [mark for mark in self.erase_marks if mark.page_index != page_index]
+        before_text = len(self.annotation_items)
+        self.annotation_items = [item for item in self.annotation_items if item.get("page_index") != page_index]
+        self._erase_live_points = []
+        self.clear_erase_text_selection()
+        self.refresh_erase_list()
+        self.refresh_annotation_item_list()
+        self.update_erase_preview_display()
+        removed = (before_marks - len(self.erase_marks)) + (before_text - len(self.annotation_items))
+        self.set_status(f"已清除本頁 {removed} 筆標記。")
+
+    def refresh_erase_list(self) -> None:
+        self.erase_mark_list.clear()
+        page_index = self.current_erase_page_index()
+        for mark in self.erase_marks:
+            if mark.page_index != page_index:
+                continue
+            color_name = "黑" if mark.color_rgb[0] < 0.5 else "白"
+            if mark.kind == "rect":
+                label = f"長方形（{color_name}）"
+            else:
+                label = f"橡皮刷 {len(mark.points)} 點／{int(mark.radius * 2)} pt（{color_name}）"
+            self.erase_mark_list.addItem(label)
+        for item in self.annotation_items:
+            if item.get("page_index") != page_index:
+                continue
+            preview = str(item.get("text") or "").replace("\n", " ")
+            if len(preview) > 16:
+                preview = f"{preview[:16]}…"
+            self.erase_mark_list.addItem(f"文字方塊：{preview}")
+
+    def update_erase_preview_display(self) -> None:
+        if self.erase_preview_image is None:
+            self.erase_preview_label.clear()
+            self.erase_preview_label.hide_inline_editor()
+            return
+        page_width, page_height = self.erase_page_size
+        canvas = self.erase_preview_image.copy()
+        if page_width <= 0 or page_height <= 0:
+            self.erase_preview_label.set_preview_pixmap(QPixmap.fromImage(ImageQt(canvas)))
+            self.erase_preview_label.hide_inline_editor()
+            return
+        draw = ImageDraw.Draw(canvas)
+        scale_x = canvas.width / page_width
+        scale_y = canvas.height / page_height
+
+        def paint_mark(mark: EraseMark) -> None:
+            fill = tuple(int(channel * 255) for channel in mark.color_rgb)
+            if mark.kind == "rect" and len(mark.points) >= 2:
+                (x0, y0), (x1, y1) = mark.points[0], mark.points[1]
+                left = min(x0, x1) * scale_x
+                right = max(x0, x1) * scale_x
+                top = canvas.height - max(y0, y1) * scale_y
+                bottom = canvas.height - min(y0, y1) * scale_y
+                draw.rectangle((left, top, right, bottom), fill=fill)
+                return
+            radius = max(mark.radius * scale_x, 2.0)
+            for pdf_x, pdf_y in mark.points:
+                cx = pdf_x * scale_x
+                cy = canvas.height - pdf_y * scale_y
+                draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=fill)
+
+        page_index = self.current_erase_page_index()
+        for mark in self.erase_marks:
+            if mark.page_index == page_index:
+                paint_mark(mark)
+        if self._erase_live_points:
+            paint_mark(
+                EraseMark(
+                    page_index=page_index,
+                    kind="stroke",
+                    color_rgb=self.erase_color_rgb(),
+                    points=tuple(self._erase_live_points),
+                    radius=self.erase_brush_radius(),
+                )
+            )
+        page_index = self.current_erase_page_index()
+        selected = self.selected_erase_text_item()
+        for index, item in enumerate(self.annotation_items):
+            if item.get("page_index") != page_index:
+                continue
+            draw_item = dict(item)
+            if selected is item and self.erase_preview_label.tool == "text":
+                draw_item["text"] = ""
+            canvas = self.draw_annotation_overlay_on_image(canvas.convert("RGB"), draw_item, self.erase_page_size)
+        self.erase_preview_label.set_preview_pixmap(QPixmap.fromImage(ImageQt(canvas.convert("RGB"))))
+        if selected is not None and self.erase_preview_label.tool == "text":
+            box = self.erase_item_image_rect(selected)
+            self.erase_preview_label.box_rect = box
+            self.erase_preview_label.handles_enabled = True
+            interacting = self.erase_preview_label._mode in ("resize", "move") or self._erase_resize_snapshot is not None
+            if interacting:
+                self.erase_preview_label.hide_inline_editor()
+            else:
+                self.erase_preview_label.show_inline_editor(
+                    box,
+                    str(selected.get("text") or ""),
+                    int(selected.get("font_size") or 18),
+                    bold=bool(selected.get("bold")),
+                    color_rgb=tuple(selected.get("color_rgb") or (0.0, 0.0, 0.0)),
+                )
+        else:
+            self.erase_preview_label.handles_enabled = False
+            self.erase_preview_label.box_rect = QRect()
+            self.erase_preview_label.hide_inline_editor()
+        self.sync_erase_brush_cursor()
+
+    def paint_erase_marks_on_image(
+        self,
+        image: Image.Image,
+        page_size: tuple[float, float],
+        page_index: int,
+    ) -> Image.Image:
+        page_width, page_height = page_size
+        if page_width <= 0 or page_height <= 0 or not self.erase_marks:
+            return image
+        canvas = image.copy()
+        draw = ImageDraw.Draw(canvas)
+        scale_x = canvas.width / page_width
+        scale_y = canvas.height / page_height
+        for mark in self.erase_marks:
+            if mark.page_index != page_index:
+                continue
+            fill = tuple(int(channel * 255) for channel in mark.color_rgb)
+            if mark.kind == "rect" and len(mark.points) >= 2:
+                (x0, y0), (x1, y1) = mark.points[0], mark.points[1]
+                left = min(x0, x1) * scale_x
+                right = max(x0, x1) * scale_x
+                top = canvas.height - max(y0, y1) * scale_y
+                bottom = canvas.height - min(y0, y1) * scale_y
+                draw.rectangle((left, top, right, bottom), fill=fill)
+                continue
+            radius = max(mark.radius * scale_x, 2.0)
+            for pdf_x, pdf_y in mark.points:
+                cx = pdf_x * scale_x
+                cy = canvas.height - pdf_y * scale_y
+                draw.ellipse((cx - radius, cy - radius, cx + radius, cy + radius), fill=fill)
+        return canvas.convert("RGB")
+
+    def save_erase_pdf(self) -> None:
+        if self.erase_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        overlays = [item for item in self.annotation_items if str(item.get("text") or "").strip()]
+        if not self.erase_marks and not overlays:
+            self.set_status("請先用橡皮刷遮擋，或加入文字方塊。")
+            return
+        target, _ = QFileDialog.getSaveFileName(self, "另存橡皮擦 PDF", "erased.pdf", "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        marks = list(self.erase_marks)
+        remove_content = self.erase_remove_content_checkbox.isChecked()
+        applied = {"value": 0}
+
+        def job() -> None:
+            applied["value"] = apply_erase_then_text_overlays(
+                self.erase_pdf_path,
+                target_path,
+                marks,
+                overlays,
+                self.erase_password_input.text(),
+                remove_content,
+            )
+
+        def after_save() -> None:
+            self.erase_marks = []
+            self.annotation_items = []
+            self.clear_erase_text_selection()
+            self.refresh_erase_list()
+            self.refresh_annotation_item_list()
+            self.update_erase_preview_display()
+            self.open_pdf_as_new_tab(target_path)
+            extra = f"，並加入 {len(overlays)} 個文字方塊" if overlays else ""
+            self.set_status(f"已套用橡皮擦／遮擋{extra}並另存：{target_path.name}")
+
+        self.run_pdf_job(job, "", on_success=after_save)
+
     def build_text_edit_tab(self) -> QWidget:
         tab = PdfDropPanel()
         tab.filesDropped.connect(self.drop_text_edit_pdf)
@@ -2690,7 +4653,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_page_input.setFixedWidth(56)
         self.text_edit_page_validator = QIntValidator(1, 1, self)
         self.text_edit_page_input.setValidator(self.text_edit_page_validator)
-        self.text_edit_page_input.editingFinished.connect(self.refresh_text_edit_page)
+        self.text_edit_page_input.editingFinished.connect(self.on_advanced_page_input_edited)
         top.addWidget(self.text_edit_page_input)
         self.add_button(top, "上一頁", lambda: self.change_text_edit_page(-1))
         self.add_button(top, "下一頁", lambda: self.change_text_edit_page(1))
@@ -2703,6 +4666,7 @@ class VictorPdfToolsQt(QMainWindow):
         scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
         self.text_edit_preview_label = TextEditPreviewLabel()
         self.text_edit_preview_label.positionClicked.connect(self.select_text_edit_block_at_point)
+        self.text_edit_preview_label.inlineEdited.connect(self.on_text_edit_inline_edited)
         scroll.setWidget(self.text_edit_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -2800,9 +4764,9 @@ class VictorPdfToolsQt(QMainWindow):
         redact_all_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
-            "Beta：預設「無痕替換」會先移除原文字再以相同字型/大小/顏色寫回，效果最接近 Adobe Pro；"
-            "若 PDF 較複雜可改「覆蓋替換」。安全遮蔽會嘗試移除簡單英文/數字底層文字再加黑框；"
-            "直接改內容流只適合半形英文/數字且新舊同長度。掃描 PDF 請先用 OCR 轉可搜尋 PDF。"
+            "點預覽上的文字即可直接改，像 Adobe Acrobat；左邊會即時顯示替換效果。"
+            "預設「無痕替換」會先移除原文字再寫回。中文請不要用「直接改內容流」。"
+            "掃描件請先 OCR，或改用橡皮擦。"
         )
         guide.setObjectName("muted")
         guide.setWordWrap(True)
@@ -2897,14 +4861,14 @@ class VictorPdfToolsQt(QMainWindow):
     def load_bookmark_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
         if path:
-            self.set_bookmark_pdf(Path(path))
+            self.load_advanced_pdf_from_path(Path(path), self.bookmark_password_input.text())
 
     def drop_bookmark_pdf(self, paths: list[str]) -> None:
         pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
         if not pdf_paths:
             self.set_status("請拖放 PDF 檔案到書籤分頁。")
             return
-        self.set_bookmark_pdf(pdf_paths[0])
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.bookmark_password_input.text())
 
     def set_bookmark_pdf(self, path: Path) -> None:
         try:
@@ -3052,14 +5016,14 @@ class VictorPdfToolsQt(QMainWindow):
     def load_text_edit_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
         if path:
-            self.set_text_edit_pdf(Path(path))
+            self.load_advanced_pdf_from_path(Path(path), self.text_edit_password_input.text())
 
     def drop_text_edit_pdf(self, paths: list[str]) -> None:
         pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
         if not pdf_paths:
             self.set_status("請拖放 PDF 檔案到文字編輯分頁。")
             return
-        self.set_text_edit_pdf(pdf_paths[0])
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.text_edit_password_input.text())
 
     def set_text_edit_pdf(self, path: Path) -> None:
         try:
@@ -3084,8 +5048,7 @@ class VictorPdfToolsQt(QMainWindow):
             boundary = "第一頁" if delta < 0 else "最後一頁"
             self.set_status(f"已在{boundary}。")
             return
-        self.text_edit_page_input.setText(str(next_page))
-        self.refresh_text_edit_page()
+        self.set_advanced_page(next_page - 1)
 
     def refresh_text_edit_page(self) -> None:
         if self.text_edit_pdf_path is None:
@@ -3114,7 +5077,10 @@ class VictorPdfToolsQt(QMainWindow):
             item.setData(Qt.UserRole, block)
             self.text_edit_block_list.addItem(item)
         if not self.text_edit_blocks:
-            self.text_edit_block_info.setText("此頁沒有偵測到文字層。掃描 PDF 請先 OCR。")
+            self.text_edit_block_info.setText(
+                "此頁沒有偵測到可編輯文字層。掃描件或投影片轉成的圖片 PDF 請先 OCR，"
+                "或改用「橡皮擦 / 遮擋」蓋掉畫面。"
+            )
         self.update_text_edit_search_feedback()
 
     def find_next_text_edit_block(self) -> None:
@@ -3231,7 +5197,7 @@ class VictorPdfToolsQt(QMainWindow):
                 page = document.get_page(page_index)
                 try:
                     page_width, page_height = page.get_size()
-                    scale = min(760 / page_width, 980 / page_height, 1.8)
+                    scale = self.advanced_preview_scale(page_width, page_height)
                     self.text_edit_preview_image = page.render(scale=scale).to_pil().convert("RGB")
                 finally:
                     page.close()
@@ -3249,6 +5215,8 @@ class VictorPdfToolsQt(QMainWindow):
         if not isinstance(block, TextBlock):
             return
         self.text_edit_replacement_input.setPlainText(block.text)
+        if text_contains_cjk(block.text) and (self.text_edit_mode_combo.currentData() or "") == "content_stream":
+            self.text_edit_mode_combo.setCurrentIndex(self.text_edit_mode_combo.findData("seamless"))
         self.text_edit_block_info.setText(
             f"位置 X {block.x:.1f}, Y {block.y:.1f}；字體 {block.font_size:.1f}pt；"
             f"字型 {block.font_name or '未知'}"
@@ -3316,10 +5284,7 @@ class VictorPdfToolsQt(QMainWindow):
         if query:
             for block in self.text_edit_blocks:
                 if self.text_edit_block_matches_query(block, query):
-                    left = block.x * scale_x
-                    bottom = image.height - block.y * scale_y
-                    top = bottom - block.height * scale_y
-                    right = left + block.width * scale_x
+                    left, top, right, bottom = self.text_block_to_image_rect(block)
                     draw.rectangle((left, top, right, bottom), outline="#f97316", width=2)
 
         if selected_block is not None:
@@ -3331,31 +5296,82 @@ class VictorPdfToolsQt(QMainWindow):
                 scale_y,
                 image.height,
             )
-            mode = self.text_edit_mode_combo.currentData() or "seamless"
             if replacement:
-                if mode != "seamless":
-                    draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#cbd5e1", width=1)
-                preview_font_size = max(selected_block.font_size * scale_y * 0.92, 8)
-                font = self.text_edit_preview_font(selected_block, preview_font_size)
+                draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#e2e8f0", width=1)
+                preview_font_size = max(selected_block.font_size * scale_y * 0.85, 8)
+                font = self.text_edit_preview_font(selected_block, preview_font_size, replacement)
                 text_color = rgb_to_hex(selected_block.color_rgb)
-                draw.text((left + 2, top + 1), replacement, fill=text_color, font=font)
+                draw.text((left + 3, top + 1), replacement, fill=text_color, font=font)
             draw.rectangle((left, top, right, bottom), outline="#0f766e", width=3)
+            pixmap = QPixmap.fromImage(ImageQt(image))
+            self.text_edit_preview_label.set_preview_pixmap(pixmap)
+            self.show_text_edit_inline_editor(selected_block, replacement, left, top, right, bottom, scale_y)
+            return
+        self.text_edit_preview_label.hide_inline_editor()
         pixmap = QPixmap.fromImage(ImageQt(image))
         self.text_edit_preview_label.set_preview_pixmap(pixmap)
+
+    def show_text_edit_inline_editor(
+        self,
+        block: TextBlock,
+        replacement: str,
+        left: float,
+        top: float,
+        right: float,
+        bottom: float,
+        scale_y: float,
+    ) -> None:
+        editor = self.text_edit_preview_label.inline_edit
+        width = max(int(right - left), 48)
+        height = max(int(bottom - top), 20)
+        editor.setGeometry(int(left), int(top), width, height)
+        family = "Microsoft JhengHei"
+        if not QFont(family).exactMatch():
+            family = "Microsoft YaHei"
+        font = QFont(family, max(int(block.font_size * scale_y * 0.55), 9))
+        font.setBold(bool(block.font_flags & 16) or "bold" in (block.font_name or "").lower())
+        editor.setFont(font)
+        color = rgb_to_hex(block.color_rgb)
+        editor.setStyleSheet(
+            f"QLineEdit {{ background: #ffffff; color: {color}; border: 2px solid #0f766e; padding: 0 4px; }}"
+        )
+        if editor.text() != replacement:
+            editor.blockSignals(True)
+            editor.setText(replacement)
+            editor.blockSignals(False)
+        editor.show()
+        editor.raise_()
+
+    def on_text_edit_inline_edited(self, text: str) -> None:
+        self.text_edit_replacement_input.blockSignals(True)
+        self.text_edit_replacement_input.setPlainText(text)
+        self.text_edit_replacement_input.blockSignals(False)
+        self.update_text_edit_replacement_hint()
+        editor = self.text_edit_preview_label.inline_edit
+        extra = max(editor.fontMetrics().horizontalAdvance(text) + 18, 48)
+        editor.resize(max(extra, editor.width()), editor.height())
 
     def text_edit_preview_font(
         self,
         block: TextBlock,
         font_size_pt: float,
+        text: str = "",
     ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
         size = max(int(font_size_pt), 8)
-        if block.font_file:
+        bold = bool(block.font_flags & 16) or "bold" in (block.font_name or "").lower()
+        need_cjk = text_contains_cjk(text or block.text)
+        font_file = block.font_file or ""
+        font_name = Path(font_file).name.lower()
+        cjk_file = any(
+            token in font_name for token in ("msyh", "msjh", "mingliu", "simsun", "simhei", "noto", "cjk")
+        )
+        if font_file and (not need_cjk or cjk_file):
             try:
-                return ImageFont.truetype(block.font_file, size=size)
+                return ImageFont.truetype(font_file, size=size, index=0)
             except Exception:
                 pass
-        bold = bool(block.font_flags & 16) or "bold" in (block.font_name or "").lower()
-        return self.annotation_preview_font(font_size_pt, bold, font_key_for_pdf_font(block.font_name))
+        font_key = "cjk" if need_cjk else font_key_for_pdf_font(block.font_name)
+        return self.annotation_preview_font(font_size_pt, bold, font_key, text or block.text)
 
     def text_replacement_preview_rect(
         self,
@@ -3368,9 +5384,9 @@ class VictorPdfToolsQt(QMainWindow):
         if block.bbox != (0.0, 0.0, 0.0, 0.0):
             x0, y0, x1, y1 = block.bbox
             left = x0 * scale_x
-            top = image_height - y1 * scale_y
+            top = y0 * scale_y
             right = x1 * scale_x
-            bottom = image_height - y0 * scale_y
+            bottom = y1 * scale_y
             if replacement and len(replacement) > len(block.text.strip()):
                 extra = (len(replacement) - len(block.text.strip())) * block.font_size * 0.55 * scale_x
                 right += extra
@@ -3404,6 +5420,9 @@ class VictorPdfToolsQt(QMainWindow):
             return (0.0, 0.0, 0.0, 0.0)
         scale_x = self.text_edit_preview_image.width / page_width
         scale_y = self.text_edit_preview_image.height / page_height
+        if block.bbox != (0.0, 0.0, 0.0, 0.0):
+            x0, y0, x1, y1 = block.bbox
+            return (x0 * scale_x, y0 * scale_y, x1 * scale_x, y1 * scale_y)
         left = block.x * scale_x
         bottom = self.text_edit_preview_image.height - block.y * scale_y
         top = bottom - block.height * scale_y
@@ -3446,24 +5465,42 @@ class VictorPdfToolsQt(QMainWindow):
             return
         target_path = Path(target)
         mode = self.text_edit_mode_combo.currentData() or "seamless"
+        if mode == "content_stream" and (
+            text_contains_cjk(getattr(block, "text", "")) or text_contains_cjk(replacement)
+        ):
+            mode = "seamless"
+            self.text_edit_mode_combo.setCurrentIndex(self.text_edit_mode_combo.findData("seamless"))
         replacement_job = replace_text_block_seamless
         if mode == "overlay":
             replacement_job = replace_text_block_overlay
         elif mode == "content_stream":
             replacement_job = replace_text_block_content_stream
+        page_number = int(self.text_edit_page_input.text() or "1")
 
         self.run_pdf_job(
             lambda: replacement_job(
                 self.text_edit_pdf_path,
                 target_path,
-                int(self.text_edit_page_input.text() or "1") - 1,
+                page_number - 1,
                 block,
                 replacement,
                 self.text_edit_password_input.text(),
             ),
-            f"已替換文字並另存：{target_path.name}",
-            on_success=lambda: self.open_pdf_as_new_tab(target_path),
+            f"已替換文字並更新預覽：{target_path.name}",
+            on_success=lambda: self.show_text_edit_result(target_path, page_number),
         )
+
+    def show_text_edit_result(self, target_path: Path, page_number: int) -> None:
+        self.open_pdf_as_new_tab(target_path)
+        if not target_path.exists():
+            return
+        self.load_advanced_pdf_from_path(target_path)
+        self.text_edit_page_input.setText(str(page_number))
+        self.refresh_text_edit_page()
+        text_edit_index = self.advanced_tabs.indexOf(self._text_edit_tab)
+        if text_edit_index >= 0:
+            self.advanced_tabs.setCurrentIndex(text_edit_index)
+        self.main_tabs.setCurrentWidget(self._advanced_tab)
 
     def redact_text_edit_pdf(self) -> None:
         if self.text_edit_pdf_path is None:
@@ -3840,17 +5877,283 @@ class VictorPdfToolsQt(QMainWindow):
             if dialog.isVisible():
                 self._finish_office_progress(dialog, self.office_progress_label.text())
 
+    def drop_advanced_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到進階分頁。")
+            return
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.advanced_password_text())
+
+    def advanced_password_text(self) -> str:
+        for field in (
+            getattr(self, "annotation_password_input", None),
+            getattr(self, "markup_password_input", None),
+            getattr(self, "crop_password_input", None),
+            getattr(self, "erase_password_input", None),
+            getattr(self, "text_edit_password_input", None),
+            getattr(self, "bookmark_password_input", None),
+        ):
+            if field is not None and field.text():
+                return field.text()
+        return ""
+
+    def load_advanced_pdf_from_path(self, path: Path, password: str = "") -> None:
+        if self._broadcasting_advanced_pdf:
+            return
+        self._broadcasting_advanced_pdf = True
+        try:
+            if password:
+                for field in (
+                    self.annotation_password_input,
+                    self.markup_password_input,
+                    self.crop_password_input,
+                    self.erase_password_input,
+                    self.text_edit_password_input,
+                    self.bookmark_password_input,
+                ):
+                    field.setText(password)
+            self.set_annotation_pdf(path)
+            self.set_markup_pdf(path)
+            self.set_crop_pdf(path)
+            self.set_erase_pdf(path)
+            self.set_text_edit_pdf(path)
+            self.set_bookmark_pdf(path)
+            self.rebuild_advanced_thumbnails()
+            self.set_status(f"已載入進階共用 PDF：{path.name}（標註／註解／裁切／橡皮擦／文字編輯／書籤）")
+        finally:
+            self._broadcasting_advanced_pdf = False
+
+    def _advanced_page_count(self) -> int:
+        return (
+            self.annotation_page_count
+            or self.markup_page_count
+            or self.crop_page_count
+            or self.erase_page_count
+            or self.text_edit_page_count
+            or self.bookmark_page_count
+            or 0
+        )
+
+    def _advanced_pdf_path(self) -> Path | None:
+        return (
+            self.annotation_pdf_path
+            or self.markup_pdf_path
+            or self.crop_pdf_path
+            or self.erase_pdf_path
+            or self.text_edit_pdf_path
+            or self.bookmark_pdf_path
+        )
+
+    def _advanced_page_inputs(self) -> list[QLineEdit]:
+        return [
+            self.annotation_page_input,
+            self.markup_page_input,
+            self.crop_page_input,
+            self.erase_page_input,
+            self.text_edit_page_input,
+        ]
+
+    def on_advanced_page_input_edited(self) -> None:
+        if self._syncing_advanced_page:
+            return
+        sender = self.sender()
+        raw = sender.text() if sender is not None else self.annotation_page_input.text()
+        try:
+            page_number = int(raw or "1")
+        except (TypeError, ValueError):
+            page_number = 1
+        self.set_advanced_page(page_number - 1)
+
+    def change_annotation_page(self, delta: int) -> None:
+        if self.annotation_pdf_path is None:
+            self.set_status("請先載入 PDF。")
+            return
+        current = int(self.annotation_page_input.text() or "1")
+        target = min(max(current + delta, 1), max(self.annotation_page_count, 1))
+        if target == current:
+            boundary = "第一頁" if delta < 0 else "最後一頁"
+            self.set_status(f"已在{boundary}。")
+            return
+        self.set_advanced_page(target - 1)
+
+    def set_advanced_page(self, page_index: int, *, from_thumbs: bool = False) -> None:
+        page_count = self._advanced_page_count()
+        if page_count <= 0:
+            return
+        page_index = min(max(int(page_index), 0), page_count - 1)
+        page_number = page_index + 1
+        current_page = int(self.annotation_page_input.text() or "1")
+        if page_number != current_page:
+            self._maybe_queue_annotation_on_page_leave()
+            self._reset_live_annotation_placement()
+            self._clear_annotation_draft_text()
+        if self._syncing_advanced_page:
+            return
+        self._syncing_advanced_page = True
+        try:
+            for field in self._advanced_page_inputs():
+                field.setText(str(page_number))
+            if not from_thumbs and hasattr(self, "advanced_page_list"):
+                self.advanced_page_list.blockSignals(True)
+                self.advanced_page_list.setCurrentRow(page_index)
+                self.advanced_page_list.blockSignals(False)
+            self._erase_live_points = []
+            self.clear_erase_text_selection()
+            if self.annotation_pdf_path is not None:
+                self.render_annotation_preview()
+            if self.markup_pdf_path is not None:
+                self.render_markup_preview()
+            if self.crop_pdf_path is not None:
+                self.render_crop_preview()
+            if self.erase_pdf_path is not None:
+                self.render_erase_preview()
+            if self.text_edit_pdf_path is not None:
+                self.refresh_text_edit_page()
+        finally:
+            self._syncing_advanced_page = False
+
+    def _on_advanced_thumb_selected(self, row: int) -> None:
+        if row < 0 or self._syncing_advanced_page:
+            return
+        self.set_advanced_page(row, from_thumbs=True)
+
+    def _on_advanced_subtab_changed(self, _index: int) -> None:
+        if self.annotation_preview_image is not None:
+            self.update_annotation_preview_display()
+        if self.erase_preview_image is not None:
+            self.update_erase_preview_display()
+
+    def advanced_preview_scale(self, page_width: float, page_height: float) -> float:
+        zoom = max(ADVANCED_PREVIEW_ZOOM_MIN, min(self.advanced_preview_zoom, ADVANCED_PREVIEW_ZOOM_MAX))
+        fitted = min(
+            ANNOT_PREVIEW_MAX_WIDTH / max(page_width, 1.0),
+            ANNOT_PREVIEW_MAX_HEIGHT / max(page_height, 1.0),
+            1.35,
+        )
+        return max(0.35, min(fitted * zoom, 4.0))
+
+    def change_advanced_preview_zoom(self, delta: float) -> None:
+        self.advanced_preview_zoom = max(
+            ADVANCED_PREVIEW_ZOOM_MIN,
+            min(self.advanced_preview_zoom + delta, ADVANCED_PREVIEW_ZOOM_MAX),
+        )
+        if hasattr(self, "advanced_zoom_label"):
+            self.advanced_zoom_label.setText(f"{int(round(self.advanced_preview_zoom * 100))}%")
+        if self.annotation_pdf_path is not None:
+            self.render_annotation_preview()
+        if self.markup_pdf_path is not None:
+            self.render_markup_preview()
+        if self.crop_pdf_path is not None:
+            self.render_crop_preview()
+        if self.erase_pdf_path is not None:
+            self.render_erase_preview()
+        if self.text_edit_pdf_path is not None:
+            self.render_text_edit_preview()
+
+    def _advanced_thumb_target_size(self) -> tuple[int, int]:
+        panel_width = ADVANCED_THUMB_PANEL_WIDTH
+        if hasattr(self, "advanced_thumb_panel"):
+            panel_width = max(self.advanced_thumb_panel.width(), ADVANCED_THUMB_PANEL_MIN_WIDTH)
+        icon_width = max(panel_width - 40, 96)
+        icon_height = int(icon_width * 1.28)
+        return icon_width, icon_height
+
+    def _apply_advanced_thumb_metrics(self) -> None:
+        if not hasattr(self, "advanced_page_list"):
+            return
+        icon_width, icon_height = self._advanced_thumb_target_size()
+        self.advanced_page_list.setIconSize(QSize(icon_width, icon_height))
+        hint_width = max(icon_width + 12, 120)
+        for row in range(self.advanced_page_list.count()):
+            item = self.advanced_page_list.item(row)
+            if item is not None:
+                item.setSizeHint(QSize(hint_width, icon_height + 22))
+
+    def _on_advanced_splitter_moved(self, *_args) -> None:
+        self._apply_advanced_thumb_metrics()
+        self._advanced_thumb_resize_timer.start(180)
+
+    def _refresh_advanced_thumbs_for_width(self) -> None:
+        self.rebuild_advanced_thumbnails(keep_page=True)
+
+    def rebuild_advanced_thumbnails(self, keep_page: bool = False) -> None:
+        if not hasattr(self, "advanced_page_list"):
+            return
+        current = self.advanced_page_list.currentRow() if keep_page else 0
+        self._advanced_thumb_timer.stop()
+        self._advanced_thumb_generation += 1
+        self._advanced_thumb_pending = []
+        self.advanced_page_list.clear()
+        path = self._advanced_pdf_path()
+        count = self._advanced_page_count()
+        if path is None or count <= 0:
+            return
+        icon_width, icon_height = self._advanced_thumb_target_size()
+        self.advanced_page_list.setIconSize(QSize(icon_width, icon_height))
+        for index in range(count):
+            item = QListWidgetItem(self.placeholder_icon, f"第 {index + 1} 頁")
+            item.setSizeHint(QSize(icon_width + 12, icon_height + 22))
+            self.advanced_page_list.addItem(item)
+        row = min(max(current, 0), count - 1)
+        self.advanced_page_list.blockSignals(True)
+        self.advanced_page_list.setCurrentRow(row)
+        self.advanced_page_list.blockSignals(False)
+        self._advanced_thumb_pending = list(range(count))
+        self._advanced_thumb_timer.start(ADVANCED_THUMB_DELAY_MS)
+
+    def _render_next_advanced_thumb_batch(self) -> None:
+        if not self._advanced_thumb_pending:
+            return
+        generation = self._advanced_thumb_generation
+        path = self._advanced_pdf_path()
+        if path is None or not PDF_RENDER_AVAILABLE or pdfium is None:
+            return
+        batch = self._advanced_thumb_pending[:ADVANCED_THUMB_BATCH_SIZE]
+        self._advanced_thumb_pending = self._advanced_thumb_pending[ADVANCED_THUMB_BATCH_SIZE:]
+        password = self.advanced_password_text()
+        icon_width, icon_height = self._advanced_thumb_target_size()
+        max_size = (icon_width, icon_height)
+        try:
+            document = pdfium.PdfDocument(str(path), password=password or None)
+        except Exception:
+            return
+        try:
+            for index in batch:
+                if generation != self._advanced_thumb_generation:
+                    return
+                item = self.advanced_page_list.item(index)
+                if item is None:
+                    continue
+                try:
+                    page = document.get_page(index)
+                    width, height = page.get_size()
+                    scale = min(
+                        max_size[0] / max(width, 1),
+                        max_size[1] / max(height, 1),
+                        0.45,
+                    )
+                    image = page.render(scale=scale).to_pil().convert("RGB")
+                    page.close()
+                    image.thumbnail(max_size, Image.Resampling.BILINEAR)
+                    item.setIcon(QIcon(QPixmap.fromImage(ImageQt(image))))
+                except Exception:
+                    continue
+        finally:
+            document.close()
+        if self._advanced_thumb_pending and generation == self._advanced_thumb_generation:
+            self._advanced_thumb_timer.start(ADVANCED_THUMB_DELAY_MS)
+
     def load_annotation_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
         if path:
-            self.set_annotation_pdf(Path(path))
+            self.load_advanced_pdf_from_path(Path(path), self.annotation_password_input.text())
 
     def drop_annotation_pdf(self, paths: list[str]) -> None:
         pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
         if not pdf_paths:
             self.set_status("請拖放 PDF 檔案到標註分頁。")
             return
-        self.set_annotation_pdf(pdf_paths[0])
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.annotation_password_input.text())
 
     def set_annotation_pdf(self, path: Path) -> None:
         try:
@@ -3860,9 +6163,25 @@ class VictorPdfToolsQt(QMainWindow):
             return
         self.annotation_pdf_path = path
         self.annotation_page_count = len(reader.pages)
+        self.annotation_items = []
+        self._annotation_placed = False
+        self._annotation_manual_size = False
+        self._annotation_resize_snapshot = None
+        self._annotation_undo_stack = []
+        self._annotation_clipboard = None
+        self.refresh_annotation_item_list()
         self.annotation_page_validator.setRange(1, max(self.annotation_page_count, 1))
         self.annotation_page_input.setText("1")
         self.render_annotation_preview()
+        if (
+            self.annotation_shape() == "comment"
+            and self.annotation_preview_image is not None
+            and not self._annotation_placed
+        ):
+            image_width, image_height = self.annotation_preview_image.size
+            self.set_annotation_position_from_click(QPoint(max(image_width // 3, 48), max(image_height // 2, 48)))
+        if not self._broadcasting_advanced_pdf:
+            self.rebuild_advanced_thumbnails()
         self.set_status(f"已載入 {path.name}，共 {self.annotation_page_count} 頁。")
 
     def render_annotation_preview(self) -> None:
@@ -3878,7 +6197,7 @@ class VictorPdfToolsQt(QMainWindow):
             document = pdfium.PdfDocument(str(self.annotation_pdf_path), password=self.annotation_password_input.text() or None)
             page = document.get_page(page_number - 1)
             page_width, page_height = page.get_size()
-            scale = min(ANNOT_PREVIEW_MAX_WIDTH / page_width, ANNOT_PREVIEW_MAX_HEIGHT / page_height, 1.25)
+            scale = self.advanced_preview_scale(page_width, page_height)
             image = page.render(scale=scale).to_pil().convert("RGB")
             page.close()
             document.close()
@@ -3891,51 +6210,387 @@ class VictorPdfToolsQt(QMainWindow):
     def update_annotation_preview_display(self) -> None:
         if self.annotation_preview_image is None:
             self.annotation_preview_label.clear()
+            self.annotation_preview_label.box_rect = QRect()
+            self.annotation_preview_label.pointer_rect = QRect()
+            self.annotation_preview_label.handles_enabled = False
+            self.annotation_preview_label.pointer_enabled = False
+            self.annotation_preview_label.elbow_enabled = False
             return
+        page_index = int(self.annotation_page_input.text() or "1") - 1
+        preview_image = self.annotation_preview_image.copy()
+        preview_image = self.paint_erase_marks_on_image(preview_image, self.annotation_page_size, page_index)
+        for item in self.annotation_items:
+            if item.get("page_index") == page_index:
+                preview_image = self.draw_annotation_overlay_on_image(preview_image, item)
         style = self.annotation_style_values()
-        preview_image = self.draw_annotation_overlay_on_image(self.annotation_preview_image, style)
+        live_overlay = bool(self._annotation_placed)
+        if live_overlay:
+            preview_image = self.draw_annotation_overlay_on_image(preview_image, style)
         pixmap = QPixmap.fromImage(ImageQt(preview_image))
         painter = QPainter(pixmap)
         painter.setRenderHint(QPainter.Antialiasing)
         page_width, page_height = self.annotation_page_size
         image_width, image_height = preview_image.size
-        if page_width > 0 and page_height > 0:
+        if live_overlay and page_width > 0 and page_height > 0:
             if style["shape"] in CALLOUT_KINDS:
                 mark_x, mark_y = style["pointer_x"], style["pointer_y"]
             else:
                 mark_x, mark_y = style["pdf_x"], style["pdf_y"]
             x = mark_x / page_width * image_width
             y = (page_height - mark_y) / page_height * image_height
+            pointer_center = QPoint(int(x), int(y))
             pen = QPen(Qt.GlobalColor.darkCyan, 2)
             painter.setPen(pen)
-            painter.drawEllipse(QPoint(int(x), int(y)), 5, 5)
-            painter.drawLine(int(x) - 12, int(y), int(x) + 12, int(y))
-            painter.drawLine(int(x), int(y) - 12, int(x), int(y) + 12)
+            painter.setBrush(QColor("#7fdbff"))
+            painter.drawEllipse(pointer_center, 7, 7)
+            painter.setBrush(Qt.NoBrush)
+            painter.drawLine(int(x) - 14, int(y), int(x) + 14, int(y))
+            painter.drawLine(int(x), int(y) - 14, int(x), int(y) + 14)
+            box_rect = self.annotation_image_box_rect(style)
+            handle_pen = QPen(QColor("#128576"), 1)
+            painter.setPen(handle_pen)
+            painter.setBrush(QColor("#ffffff"))
+            for handle in annotation_handle_rects(box_rect).values():
+                painter.drawRect(handle)
+            self.annotation_preview_label.box_rect = box_rect
+            self.annotation_preview_label.pointer_rect = QRect(int(x) - 16, int(y) - 16, 32, 32)
+            self.annotation_preview_label.handles_enabled = True
+            self.annotation_preview_label.pointer_enabled = style["shape"] in CALLOUT_KINDS
+            if style["shape"] == "comment":
+                path = comment_polyline(
+                    style["pdf_x"],
+                    style["pdf_y"],
+                    style["pdf_x"] + style["rect_width"],
+                    style["pdf_y"] + style["rect_height"],
+                    style["pointer_x"],
+                    style["pointer_y"],
+                )
+                def _to_image(pdf_x: float, pdf_y: float) -> QPoint:
+                    return QPoint(
+                        int(round(pdf_x / page_width * image_width)),
+                        int(round((page_height - pdf_y) / page_height * image_height)),
+                    )
+
+                elbow_a = _to_image(*path[1])
+                elbow_b = _to_image(*path[2])
+                self.annotation_preview_label.elbow_p1 = elbow_a
+                self.annotation_preview_label.elbow_p2 = elbow_b
+                self.annotation_preview_label.elbow_enabled = True
+                mid = QPoint((elbow_a.x() + elbow_b.x()) // 2, (elbow_a.y() + elbow_b.y()) // 2)
+                painter.setPen(QPen(QColor("#128576"), 1))
+                painter.setBrush(QColor("#ffffff"))
+                painter.drawRect(mid.x() - 5, mid.y() - 5, 10, 10)
+                painter.drawRect(elbow_b.x() - 4, elbow_b.y() - 4, 8, 8)
+            else:
+                self.annotation_preview_label.elbow_enabled = False
+        else:
+            self.annotation_preview_label.box_rect = QRect()
+            self.annotation_preview_label.pointer_rect = QRect()
+            self.annotation_preview_label.handles_enabled = False
+            self.annotation_preview_label.pointer_enabled = False
+            self.annotation_preview_label.elbow_enabled = False
         painter.end()
         self.annotation_preview_label.set_preview_pixmap(pixmap)
+
+    def _lock_annotation_box_at_current(self) -> None:
+        if self.annotation_shape() not in CALLOUT_KINDS:
+            return
+        if self.annotation_box_locked and self.annotation_box_pdf is not None:
+            return
+        style = self.annotation_style_values()
+        self.annotation_box_pdf = (style["pdf_x"], style["pdf_y"])
+        self.annotation_box_locked = True
+
+    def _reset_live_annotation_placement(self) -> None:
+        self._annotation_placed = False
+        self.annotation_box_locked = False
+        self.annotation_box_pdf = None
+        self._annotation_manual_size = False
+        self._annotation_resize_snapshot = None
+
+    def _clear_annotation_draft_text(self) -> None:
+        if hasattr(self, "annotation_text_input"):
+            self.annotation_text_input.blockSignals(True)
+            self.annotation_text_input.clear()
+            self.annotation_text_input.blockSignals(False)
+        if hasattr(self, "markup_note_input"):
+            self.markup_note_input.clear()
+        if hasattr(self, "erase_text_input"):
+            self._erase_syncing_text = True
+            try:
+                self.erase_text_input.clear()
+            finally:
+                self._erase_syncing_text = False
+
+    def _annotation_tab_active(self) -> bool:
+        return (
+            hasattr(self, "_annotation_tab")
+            and hasattr(self, "_advanced_tab")
+            and self.main_tabs.currentWidget() is self._advanced_tab
+            and self.advanced_tabs.currentWidget() is self._annotation_tab
+        )
+
+    def _markup_tab_active(self) -> bool:
+        return (
+            hasattr(self, "_markup_tab")
+            and hasattr(self, "_advanced_tab")
+            and self.main_tabs.currentWidget() is self._advanced_tab
+            and self.advanced_tabs.currentWidget() is self._markup_tab
+        )
+
+    def _workspace_tab_active(self) -> bool:
+        return hasattr(self, "_workspace_tab") and self.main_tabs.currentWidget() is self._workspace_tab
+
+    def _focused_text_editor(self):
+        widget = QApplication.focusWidget()
+        if isinstance(widget, (QLineEdit, QTextEdit)):
+            return widget
+        return None
+
+    def _copy_text_selection_or_run(self, copy_box) -> None:
+        editor = self._focused_text_editor()
+        if isinstance(editor, QTextEdit) and editor.textCursor().hasSelection():
+            editor.copy()
+            return
+        if isinstance(editor, QLineEdit) and editor.hasSelectedText():
+            editor.copy()
+            return
+        copy_box()
+
+    def _paste_into_editor_or_run(self, paste_box) -> None:
+        editor = self._focused_text_editor()
+        if editor is not None:
+            editor.paste()
+            return
+        paste_box()
+
+    def _annotation_undo_snapshot(self) -> dict:
+        return {
+            "items": [dict(item) for item in self.annotation_items],
+            "placed": self._annotation_placed,
+            "text": self.annotation_text_input.toPlainText() if hasattr(self, "annotation_text_input") else "",
+            "x": self.annotation_x_input.text() if hasattr(self, "annotation_x_input") else "72",
+            "y": self.annotation_y_input.text() if hasattr(self, "annotation_y_input") else "720",
+            "width": self.annotation_width_input.text() if hasattr(self, "annotation_width_input") else "220",
+            "height": self.annotation_height_input.text() if hasattr(self, "annotation_height_input") else "32",
+            "box_pdf": self.annotation_box_pdf,
+            "box_locked": self.annotation_box_locked,
+            "manual_size": self._annotation_manual_size,
+            "shape": self.annotation_shape() if hasattr(self, "annotation_shape_list") else "box",
+            "cover": self.annotation_cover_checkbox.isChecked() if hasattr(self, "annotation_cover_checkbox") else True,
+            "font_key": self.annotation_font_combo.currentData() if hasattr(self, "annotation_font_combo") else "cjk",
+            "font_size": self.annotation_font_size_combo.currentText() if hasattr(self, "annotation_font_size_combo") else "12",
+            "bold": self.annotation_bold_checkbox.isChecked() if hasattr(self, "annotation_bold_checkbox") else False,
+            "color_rgb": self.annotation_color_rgb,
+            "fill_rgb": self.annotation_fill_rgb,
+            "fill_none": self.annotation_fill_none,
+        }
+
+    def _push_annotation_undo(self) -> None:
+        if not hasattr(self, "annotation_text_input"):
+            return
+        self._annotation_undo_stack.append(self._annotation_undo_snapshot())
+        if len(self._annotation_undo_stack) > 40:
+            self._annotation_undo_stack.pop(0)
+
+    def _restore_annotation_undo(self, snap: dict) -> None:
+        self._restoring_annotation = True
+        try:
+            self.annotation_items = [dict(item) for item in snap.get("items", [])]
+            self._annotation_placed = bool(snap.get("placed"))
+            self.annotation_box_pdf = snap.get("box_pdf")
+            self.annotation_box_locked = bool(snap.get("box_locked"))
+            self._annotation_manual_size = bool(snap.get("manual_size"))
+            self.set_annotation_shape(str(snap.get("shape") or "box"))
+            self.annotation_text_input.blockSignals(True)
+            self.annotation_text_input.setPlainText(str(snap.get("text") or ""))
+            self.annotation_text_input.blockSignals(False)
+            self.annotation_x_input.setText(str(snap.get("x") or "72"))
+            self.annotation_y_input.setText(str(snap.get("y") or "720"))
+            self.annotation_width_input.setText(str(snap.get("width") or "220"))
+            self.annotation_height_input.setText(str(snap.get("height") or "32"))
+            self.annotation_cover_checkbox.setChecked(bool(snap.get("cover", True)))
+            font_row = self.annotation_font_combo.findData(snap.get("font_key") or "cjk")
+            if font_row >= 0:
+                self.annotation_font_combo.setCurrentIndex(font_row)
+            if snap.get("font_size"):
+                self.annotation_font_size_combo.setCurrentText(str(snap["font_size"]))
+            self.annotation_bold_checkbox.setChecked(bool(snap.get("bold")))
+            if snap.get("color_rgb"):
+                self.annotation_color_rgb = tuple(snap["color_rgb"])
+            self.annotation_fill_rgb = snap.get("fill_rgb")
+            self.annotation_fill_none = bool(snap.get("fill_none"))
+            self.refresh_annotation_item_list()
+            self.update_annotation_preview_display()
+        finally:
+            self._restoring_annotation = False
+
+    def undo_annotation_action(self) -> None:
+        if not self._annotation_undo_stack:
+            self.set_status("沒有可復原的標註動作。")
+            return
+        snap = self._annotation_undo_stack.pop()
+        self._restore_annotation_undo(snap)
+        self.set_status("已復原標註。")
+
+    def _current_annotation_copy_item(self) -> dict | None:
+        if self._annotation_placed:
+            item = dict(self.annotation_style_values())
+            item["page_index"] = int(self.annotation_page_input.text() or "1") - 1
+            return item
+        row = self.annotation_item_list.currentRow() if hasattr(self, "annotation_item_list") else -1
+        if 0 <= row < len(self.annotation_items):
+            return dict(self.annotation_items[row])
+        if self.annotation_items:
+            return dict(self.annotation_items[-1])
+        return None
+
+    def copy_annotation_box(self) -> None:
+        item = self._current_annotation_copy_item()
+        if item is None:
+            self.set_status("請先放置標註後再複製。")
+            return
+        self._annotation_clipboard = dict(item)
+        QApplication.clipboard().setText(str(item.get("text") or ""))
+        self.set_status("已複製標註。到其他位置按 Ctrl+V 貼上。")
+
+    def _apply_annotation_item(self, item: dict, *, offset: bool = False) -> None:
+        dx, dy = (16.0, -16.0) if offset else (0.0, 0.0)
+        self._restoring_annotation = True
+        try:
+            self.set_annotation_shape(str(item.get("shape") or "box"))
+            self.annotation_text_input.blockSignals(True)
+            self.annotation_text_input.setPlainText(str(item.get("text") or ""))
+            self.annotation_text_input.blockSignals(False)
+            self.annotation_cover_checkbox.setChecked(bool(item.get("cover")))
+            font_row = self.annotation_font_combo.findData(item.get("font_key") or "cjk")
+            if font_row >= 0:
+                self.annotation_font_combo.setCurrentIndex(font_row)
+            if item.get("font_size"):
+                self.annotation_font_size_combo.setCurrentText(str(int(item["font_size"])))
+            self.annotation_bold_checkbox.setChecked(bool(item.get("bold")))
+            if item.get("color_rgb"):
+                self.annotation_color_rgb = tuple(item["color_rgb"])
+            if item.get("fill_none"):
+                self.annotation_fill_none = True
+            else:
+                self.annotation_fill_none = False
+                if item.get("fill_rgb") is not None:
+                    self.annotation_fill_rgb = tuple(item["fill_rgb"])
+            width = float(item.get("rect_width") or 220)
+            height = float(item.get("rect_height") or 32)
+            pdf_x = float(item.get("pdf_x") or 72) + dx
+            pdf_y = float(item.get("pdf_y") or 200) + dy
+            pointer_x = float(item.get("pointer_x") or pdf_x) + dx
+            pointer_y = float(item.get("pointer_y") or pdf_y) + dy
+            self.annotation_width_input.setText(f"{width:.1f}")
+            self.annotation_height_input.setText(f"{height:.1f}")
+            shape = str(item.get("shape") or "box")
+            if shape in CALLOUT_KINDS:
+                self.annotation_x_input.setText(f"{pointer_x:.1f}")
+                self.annotation_y_input.setText(f"{pointer_y:.1f}")
+                self.annotation_box_pdf = (pdf_x, pdf_y)
+                self.annotation_box_locked = True
+            else:
+                self.annotation_x_input.setText(f"{pdf_x:.1f}")
+                self.annotation_y_input.setText(f"{pdf_y:.1f}")
+                self.annotation_box_pdf = None
+                self.annotation_box_locked = False
+            self._annotation_placed = True
+            self._annotation_manual_size = True
+            self.update_annotation_preview_display()
+        finally:
+            self._restoring_annotation = False
+
+    def paste_annotation_box(self) -> None:
+        if self._annotation_clipboard is None:
+            self.set_status("請先點選標註後按 Ctrl+C。")
+            return
+        self._push_annotation_undo()
+        current = None
+        if self._annotation_placed:
+            current = self.collect_current_annotation_item()
+            if current is None and str(self.annotation_text_input.toPlainText() or "").strip() == "":
+                style = dict(self.annotation_style_values())
+                style["page_index"] = int(self.annotation_page_input.text() or "1") - 1
+                current = style
+        if current is not None and str(current.get("text") or "").strip():
+            self.annotation_items.append(current)
+            self.refresh_annotation_item_list()
+        self._apply_annotation_item(self._annotation_clipboard, offset=True)
+        self.set_status("已貼上標註。可再調整位置或文字。")
 
     def set_annotation_position_from_click(self, point: QPoint) -> None:
         page_width, page_height = self.annotation_page_size
         if self.annotation_preview_image is None or page_width <= 0 or page_height <= 0:
             return
+        self._push_annotation_undo()
         image_width, image_height = self.annotation_preview_image.size
         image_x = min(max(point.x(), 0), image_width)
         image_y = min(max(point.y(), 0), image_height)
         pdf_x = image_x / image_width * page_width
         pdf_y = page_height - (image_y / image_height * page_height)
+        already_placed = self._annotation_placed and self.annotation_shape() in CALLOUT_KINDS
+        box_was_locked = self.annotation_box_locked and self.annotation_box_pdf is not None
         self.annotation_x_input.setText(f"{pdf_x:.1f}")
         self.annotation_y_input.setText(f"{pdf_y:.1f}")
+        self._annotation_placed = True
+        if already_placed and box_was_locked:
+            self.update_annotation_preview_display()
+            self.set_status(f"已移動插入點（箭咀）：X {pdf_x:.1f}, Y {pdf_y:.1f}")
+            return
+        if self.annotation_shape() in CALLOUT_KINDS:
+            self.annotation_box_locked = False
+            self.annotation_box_pdf = None
+            self._annotation_manual_size = False
+            self.fit_annotation_box_to_text()
+            self._lock_annotation_box_at_current()
+            self.update_annotation_preview_display()
+            self.set_status(f"已設定插入點（箭咀）：X {pdf_x:.1f}, Y {pdf_y:.1f}。可拖橫線左右伸長，或拖十字準星改插入點。")
+            return
         self.annotation_box_locked = False
         self.annotation_box_pdf = None
+        self._annotation_manual_size = False
+        self.fit_annotation_box_to_text()
+        self.set_status(f"已設定文字位置：X {pdf_x:.1f}, Y {pdf_y:.1f}")
+
+    def move_annotation_pointer(self, point: QPoint) -> None:
+        if self.annotation_preview_image is None:
+            return
+        self._lock_annotation_box_at_current()
+        pdf_x, pdf_y = self._annotation_image_to_pdf(point)
+        self.annotation_x_input.blockSignals(True)
+        self.annotation_y_input.blockSignals(True)
+        self.annotation_x_input.setText(f"{pdf_x:.1f}")
+        self.annotation_y_input.setText(f"{pdf_y:.1f}")
+        self.annotation_x_input.blockSignals(False)
+        self.annotation_y_input.blockSignals(False)
+        self._annotation_placed = True
         self.update_annotation_preview_display()
-        if self.annotation_shape() in CALLOUT_KINDS:
-            self.set_status(f"已設定插入點（箭咀）：X {pdf_x:.1f}, Y {pdf_y:.1f}")
-        else:
-            self.set_status(f"已設定文字位置：X {pdf_x:.1f}, Y {pdf_y:.1f}")
+
+    def finish_annotation_pointer_interaction(self) -> None:
+        self.set_status("已移動箭咀插入點。可再拖十字準星對準不同文字。")
+
+    def move_annotation_elbow(self, point: QPoint) -> None:
+        if self.annotation_preview_image is None:
+            return
+        self._lock_annotation_box_at_current()
+        pdf_x, _pdf_y = self._annotation_image_to_pdf(point)
+        self.annotation_x_input.blockSignals(True)
+        self.annotation_x_input.setText(f"{pdf_x:.1f}")
+        self.annotation_x_input.blockSignals(False)
+        self._annotation_placed = True
+        self.update_annotation_preview_display()
+
+    def finish_annotation_elbow_interaction(self) -> None:
+        self.set_status("已左右伸長附註箭咀。可再拖橫線對準不同文字。")
 
     def set_annotation_from_drag(self, start: QPoint, end: QPoint) -> None:
         if self.annotation_shape() not in CALLOUT_KINDS:
             self.set_annotation_position_from_click(end)
+            return
+        if self._annotation_placed and self.annotation_box_locked:
+            self.move_annotation_pointer(end)
             return
         page_width, page_height = self.annotation_page_size
         if self.annotation_preview_image is None or page_width <= 0 or page_height <= 0:
@@ -3946,7 +6601,9 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_y_input.setText(f"{pointer[1]:.1f}")
         self.annotation_box_pdf = box
         self.annotation_box_locked = True
-        self.update_annotation_preview_display()
+        self._annotation_placed = True
+        self._annotation_manual_size = False
+        self.fit_annotation_box_to_text()
         self.set_status(f"已設定指引線：箭咀 ({pointer[0]:.1f}, {pointer[1]:.1f})")
 
     def _annotation_image_to_pdf(self, point: QPoint) -> tuple[float, float]:
@@ -3962,42 +6619,172 @@ class VictorPdfToolsQt(QMainWindow):
         if self.annotation_pdf_path is None:
             self.set_status("請先載入 PDF。")
             return
-        text = self.annotation_text_input.toPlainText().strip()
-        if not text:
-            self.set_status("請輸入標註文字。")
+        items = list(self.annotation_items)
+        current = self.collect_current_annotation_item()
+        if current is not None and (self._annotation_placed or not items):
+            items.append(current)
+        items = [item for item in items if str(item.get("text") or "").strip()]
+        if not items:
+            self.set_status("請先放置或加入標註。可在多頁加入後一次另存。")
             return
         target, _ = QFileDialog.getSaveFileName(self, "另存標註 PDF", "annotated.pdf", "PDF files (*.pdf)")
         if not target:
             return
         target_path = Path(target)
-
-        style = self.annotation_style_values()
+        marks = list(self.erase_marks)
+        remove_content = self.erase_remove_content_checkbox.isChecked()
 
         def job() -> None:
-            add_text_overlay_annotation(
-                source=self.annotation_pdf_path,
-                target=target_path,
-                page_index=int(self.annotation_page_input.text() or "1") - 1,
-                x=style["pdf_x"],
-                y=style["pdf_y"],
-                text=text,
-                font_size=style["font_size"],
-                cover_original=style["cover"],
-                cover_width=style["rect_width"],
-                cover_height=style["rect_height"],
-                password=self.annotation_password_input.text(),
-                font_key=style["font_key"],
-                bold=style["bold"],
-                color_rgb=style["color_rgb"],
-                shape=style["shape"],
-                pointer=(style["pointer_x"], style["pointer_y"]) if style["shape"] in CALLOUT_KINDS else None,
-            )
+            if marks:
+                apply_erase_then_text_overlays(
+                    self.annotation_pdf_path,
+                    target_path,
+                    marks,
+                    items,
+                    self.annotation_password_input.text(),
+                    remove_content,
+                )
+            else:
+                add_text_overlay_annotations(
+                    source=self.annotation_pdf_path,
+                    target=target_path,
+                    overlays=items,
+                    password=self.annotation_password_input.text(),
+                )
+
+        def after_save() -> None:
+            self.annotation_items = []
+            self.erase_marks = []
+            self._reset_live_annotation_placement()
+            self.refresh_annotation_item_list()
+            self.refresh_erase_list()
+            self.open_pdf_as_new_tab(target_path)
 
         self.run_pdf_job(
             job,
-            f"已套用文字標註：{target_path.name}",
-            on_success=lambda: self.open_pdf_as_new_tab(target_path),
+            f"已套用 {len(items)} 筆文字標註：{target_path.name}",
+            on_success=after_save,
         )
+
+    def pending_annotation_overlays(self) -> list[dict]:
+        items = list(self.annotation_items)
+        current = self.collect_current_annotation_item()
+        if current is not None and (self._annotation_placed or not items):
+            items.append(current)
+        return [item for item in items if str(item.get("text") or "").strip()]
+
+    def changed_advanced_page_indexes(self) -> list[int]:
+        pages: set[int] = set()
+        for item in self.pending_annotation_overlays():
+            pages.add(int(item.get("page_index", 0)))
+        for mark in self.erase_marks:
+            pages.add(int(mark.page_index))
+        for page_index, _markup in self.markup_items:
+            pages.add(int(page_index))
+        return sorted(pages)
+
+    def save_changed_pages_pdf(self) -> None:
+        source = self._advanced_pdf_path()
+        if source is None:
+            self.set_status("請先載入 PDF。")
+            return
+        overlays = self.pending_annotation_overlays()
+        marks = list(self.erase_marks)
+        markups = list(self.markup_items)
+        page_indexes = self.changed_advanced_page_indexes()
+        if not page_indexes:
+            self.set_status("目前沒有已加入註解或修改的頁。請先放置標註、螢光或橡皮擦。")
+            return
+        suggested = safe_output_name(f"{source.stem}-modified-pages.pdf")
+        target, _ = QFileDialog.getSaveFileName(self, "另存有修改的頁", suggested, "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        password = self.advanced_password_text()
+        remove_content = True
+        if hasattr(self, "erase_remove_content_checkbox"):
+            remove_content = self.erase_remove_content_checkbox.isChecked()
+        page_count = {"value": 0}
+
+        def job() -> None:
+            page_count["value"] = apply_edits_and_extract_pages(
+                source,
+                target_path,
+                page_indexes,
+                overlays=overlays,
+                erase_marks=marks,
+                markups=markups,
+                password=password,
+                remove_content=remove_content,
+            )
+
+        def after_save() -> None:
+            self.open_pdf_as_new_tab(target_path)
+            numbers = "、".join(str(index + 1) for index in page_indexes)
+            self.set_status(f"已擷取 {page_count['value']} 頁有修改的內容（第 {numbers} 頁）：{target_path.name}")
+
+        self.run_pdf_job(job, "", on_success=after_save)
+
+    def collect_current_annotation_item(self) -> dict | None:
+        text = self.annotation_text_input.toPlainText().strip()
+        if not text:
+            return None
+        style = self.annotation_style_values()
+        style["text"] = text
+        style["page_index"] = int(self.annotation_page_input.text() or "1") - 1
+        return style
+
+    def queue_current_annotation(self, *_args, silent: bool = False) -> bool:
+        item = self.collect_current_annotation_item()
+        if item is None:
+            if not silent:
+                self.set_status("請輸入標註文字後再加入。")
+            return False
+        self._push_annotation_undo()
+        self.annotation_items.append(item)
+        self._reset_live_annotation_placement()
+        self._clear_annotation_draft_text()
+        self.refresh_annotation_item_list()
+        self.update_annotation_preview_display()
+        if not silent:
+            self.set_status(
+                f"已加入第 {item['page_index'] + 1} 頁標註，共 {len(self.annotation_items)} 筆。可到其他頁繼續，最後再另存。"
+            )
+        return True
+
+    def _maybe_queue_annotation_on_page_leave(self) -> None:
+        if self._annotation_placed and self.annotation_text_input.toPlainText().strip():
+            self.queue_current_annotation(silent=True)
+
+    def refresh_annotation_item_list(self) -> None:
+        if not hasattr(self, "annotation_item_list"):
+            return
+        self.annotation_item_list.clear()
+        for item in self.annotation_items:
+            preview = str(item.get("text") or "").replace("\n", " ")
+            if len(preview) > 16:
+                preview = f"{preview[:16]}…"
+            self.annotation_item_list.addItem(f"第 {int(item.get('page_index', 0)) + 1} 頁 · {preview}")
+
+    def delete_selected_annotation_item(self) -> None:
+        row = self.annotation_item_list.currentRow()
+        if row < 0 or row >= len(self.annotation_items):
+            self.set_status("請先選取要刪除的標註。")
+            return
+        self._push_annotation_undo()
+        self.annotation_items.pop(row)
+        self.refresh_annotation_item_list()
+        self.update_annotation_preview_display()
+        self.set_status("已刪除標註。")
+
+    def clear_annotation_items(self) -> None:
+        if not self.annotation_items:
+            return
+        self._push_annotation_undo()
+        self.annotation_items = []
+        self.refresh_annotation_item_list()
+        self.update_annotation_preview_display()
+        self.set_status("已清空標註。")
 
     def _batch_sources(self) -> list[Path]:
         return [path for path in self.tool_file_items if path.suffix.lower() == ".pdf"]
@@ -4014,6 +6801,29 @@ class VictorPdfToolsQt(QMainWindow):
     def _batch_output_path(self, source: Path, folder: Path, operation: str) -> Path:
         extension = ".txt" if operation in {"extract_text", "ocr_text", "info"} else ".pdf"
         return folder / safe_output_name(f"{source.stem}_{operation}{extension}")
+
+    def watermark_options(self) -> dict:
+        try:
+            x_percent = float(self.tool_watermark_x_input.text().strip() or "50")
+        except ValueError:
+            x_percent = 50.0
+        try:
+            y_percent = float(self.tool_watermark_y_input.text().strip() or "50")
+        except ValueError:
+            y_percent = 50.0
+        color_key = self.tool_watermark_color_combo.currentData() or "gray"
+        color_rgb, _label = WATERMARK_COLORS.get(color_key, WATERMARK_COLORS["gray"])
+        rotation = self.tool_watermark_rotation_combo.currentData()
+        opacity = self.tool_watermark_opacity_combo.currentData()
+        return {
+            "position": self.tool_watermark_position_combo.currentData() or "center",
+            "rotation": int(45 if rotation is None else rotation),
+            "font_size": combo_font_size(self.tool_watermark_size_combo, 48),
+            "opacity": float(0.25 if opacity is None else opacity),
+            "color_rgb": color_rgb,
+            "x_percent": min(max(x_percent, 0.0), 100.0),
+            "y_percent": min(max(y_percent, 0.0), 100.0),
+        }
 
     def run_tool_operation(self) -> None:
         if not self.tool_file_items:
@@ -4240,7 +7050,23 @@ class VictorPdfToolsQt(QMainWindow):
             template = self.tool_batch_text_input.text().strip() or "Page {page} of {total}"
             add_page_numbers(source, target_path, template, password)
         elif operation == "watermark":
-            add_watermark(source, target_path, self.tool_batch_text_input.text(), password)
+            options = self.watermark_options()
+            page_count = add_watermark(
+                source,
+                target_path,
+                self.tool_batch_text_input.text(),
+                password,
+                position=options["position"],
+                rotation=options["rotation"],
+                font_size=options["font_size"],
+                opacity=options["opacity"],
+                color_rgb=options["color_rgb"],
+                pages_spec=self.tool_pages_input.text(),
+                x_percent=options["x_percent"],
+                y_percent=options["y_percent"],
+            )
+            self._last_tool_status_message = f"已在 {page_count} 頁加入浮水印。"
+            return
         elif operation == "remove_blank_pages":
             removed = remove_blank_pages(
                 source,
@@ -4515,6 +7341,15 @@ class VictorPdfToolsQt(QMainWindow):
             workspace["undo"].pop(0)
 
     def undo_last_action(self) -> None:
+        if self._erase_tab_active():
+            self.undo_erase_mark()
+            return
+        if self._annotation_tab_active():
+            self.undo_annotation_action()
+            return
+        if self._markup_tab_active():
+            self.undo_markup_action()
+            return
         grid = self.current_grid()
         if grid is None:
             self.set_status("沒有可復原的動作。")
@@ -4767,6 +7602,18 @@ class VictorPdfToolsQt(QMainWindow):
         self.set_status(f"已移除 {len(indexes)} 頁。")
 
     def copy_selected_pages(self) -> None:
+        if self._erase_text_tool_active():
+            self.copy_erase_text_box()
+            return
+        if self._annotation_tab_active():
+            self._copy_text_selection_or_run(self.copy_annotation_box)
+            return
+        if self._markup_tab_active():
+            self._copy_text_selection_or_run(self.copy_markup_item)
+            return
+        if self._workspace_tab_active():
+            self._copy_text_selection_or_run(self.document_workspace.copy_markup_item)
+            return
         indexes = self.selected_indexes()
         if not indexes:
             self.set_status("請先選取要複製的頁面。")
@@ -4787,6 +7634,21 @@ class VictorPdfToolsQt(QMainWindow):
         self.set_status(f"已剪下 {len(self.page_clipboard)} 頁，可切到其他 Tab 後貼上。")
 
     def paste_pages(self) -> None:
+        if self._erase_text_tool_active():
+            if self._erase_text_clipboard is None:
+                self.set_status("請先點選文字方塊後按 Ctrl+C。")
+                return
+            self.paste_erase_text_box()
+            return
+        if self._annotation_tab_active():
+            self._paste_into_editor_or_run(self.paste_annotation_box)
+            return
+        if self._markup_tab_active():
+            self._paste_into_editor_or_run(self.paste_markup_item)
+            return
+        if self._workspace_tab_active():
+            self._paste_into_editor_or_run(self.document_workspace.paste_markup_item)
+            return
         if not self.page_clipboard:
             self.set_status("剪貼簿沒有頁面。")
             return
@@ -4968,6 +7830,12 @@ class VictorPdfToolsQt(QMainWindow):
                 pass
 
     def release_all_pdfium_documents(self) -> None:
+        if getattr(self, "_advanced_thumb_timer", None) is not None:
+            self._advanced_thumb_timer.stop()
+        if getattr(self, "_advanced_thumb_resize_timer", None) is not None:
+            self._advanced_thumb_resize_timer.stop()
+        self._advanced_thumb_generation += 1
+        self._advanced_thumb_pending = []
         for key in list(self._pdfium_docs):
             document = self._pdfium_docs.pop(key, None)
             if document is None:

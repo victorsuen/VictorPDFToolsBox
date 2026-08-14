@@ -9,7 +9,7 @@ from pypdf import PdfReader, PdfWriter
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QPoint, Qt
-from PySide6.QtWidgets import QApplication, QPushButton, QTabWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QTabWidget
 
 from pdf_core import MarkupAnnotation, TextBlock
 from document_workspace import DocumentWorkspace
@@ -17,13 +17,17 @@ from qt_app import (
     AuditLogDialog,
     BATCHABLE_OPERATIONS,
     FOLDER_REVEAL_OPERATIONS,
+    FONT_SIZE_MAX,
+    FONT_SIZE_MIN,
     TOOL_OPERATIONS,
     WINDOW_MIN_SIZE,
     MergeFilesDialog,
     VictorPdfToolsQt,
+    combo_font_size,
     document_tab_title,
     preferred_window_geometry,
     reveal_output,
+    wrap_annotation_text,
 )
 
 
@@ -300,6 +304,154 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.annotation_page_count, 2)
         self.assertEqual(window.annotation_page_validator.top(), 2)
 
+    def test_advanced_tabs_share_dropped_pdf(self):
+        window = VictorPdfToolsQt()
+        window.drop_annotation_pdf([str(self.source)])
+
+        self.assertEqual(window.annotation_pdf_path, self.source)
+        self.assertEqual(window.markup_pdf_path, self.source)
+        self.assertEqual(window.crop_pdf_path, self.source)
+        self.assertEqual(window.erase_pdf_path, self.source)
+        self.assertEqual(window.text_edit_pdf_path, self.source)
+        self.assertEqual(window.bookmark_pdf_path, self.source)
+        self.assertEqual(window.advanced_page_list.count(), 2)
+        self.assertEqual(window.advanced_page_list.currentRow(), 0)
+
+    def test_advanced_thumb_select_changes_page_across_tools(self):
+        window = VictorPdfToolsQt()
+        window.drop_annotation_pdf([str(self.source)])
+
+        window.advanced_page_list.setCurrentRow(1)
+
+        self.assertEqual(window.annotation_page_input.text(), "2")
+        self.assertEqual(window.markup_page_input.text(), "2")
+        self.assertEqual(window.crop_page_input.text(), "2")
+        self.assertEqual(window.erase_page_input.text(), "2")
+        self.assertEqual(window.text_edit_page_input.text(), "2")
+
+    def test_annotation_page_leave_queues_placed_text(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.annotation_text_input.setPlainText("note 1")
+        window._annotation_placed = True
+
+        window.set_advanced_page(1)
+
+        self.assertEqual(len(window.annotation_items), 1)
+        self.assertEqual(window.annotation_items[0]["page_index"], 0)
+        self.assertEqual(window.annotation_items[0]["text"], "note 1")
+        self.assertEqual(window.annotation_page_input.text(), "2")
+        self.assertEqual(window.annotation_item_list.count(), 1)
+        self.assertFalse(window._annotation_placed)
+        self.assertFalse(window.annotation_preview_label.handles_enabled)
+        self.assertFalse(window.annotation_preview_label.pointer_enabled)
+        self.assertEqual(window.annotation_text_input.toPlainText(), "")
+
+    def test_queued_annotation_does_not_draw_live_overlay_on_other_page(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("speech")
+        window.annotation_text_input.setPlainText("how are u")
+        window._annotation_placed = True
+        window.queue_current_annotation()
+
+        self.assertFalse(window._annotation_placed)
+        self.assertFalse(window.annotation_preview_label.handles_enabled)
+
+        window.set_advanced_page(1)
+
+        self.assertEqual(window.annotation_page_input.text(), "2")
+        self.assertFalse(window._annotation_placed)
+        self.assertFalse(window.annotation_preview_label.handles_enabled)
+        self.assertEqual(window.annotation_item_list.count(), 1)
+        self.assertIn("第 1 頁", window.annotation_item_list.item(0).text())
+        self.assertEqual(window.annotation_text_input.toPlainText(), "")
+
+    def test_page_change_does_not_reuse_comment_text(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("add S")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(200, 400))
+        window.queue_current_annotation()
+
+        self.assertEqual(window.annotation_text_input.toPlainText(), "")
+        window.set_advanced_page(1)
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(180, 360))
+
+        self.assertEqual(window.annotation_items[0]["text"], "add S")
+        self.assertEqual(window.annotation_items[0]["page_index"], 0)
+        self.assertEqual(window.annotation_text_input.toPlainText(), "")
+        self.assertEqual(window.annotation_style_values()["text"].strip(), "")
+        self.assertTrue(window._annotation_placed)
+
+    def test_annotation_save_applies_queued_overlays(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.annotation_text_input.setPlainText("page one")
+        window.queue_current_annotation()
+        window.set_advanced_page(1)
+        window.annotation_text_input.setPlainText("page two")
+        window._annotation_placed = True
+        target = Path(self.temp_dir.name) / "annotated.pdf"
+        captured = {}
+
+        def fake_apply(source, target, overlays, password=""):
+            captured["overlays"] = list(overlays)
+            Path(target).write_bytes(Path(source).read_bytes())
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch("qt_app.add_text_overlay_annotations", side_effect=fake_apply):
+                with patch.object(window, "open_pdf_as_new_tab"):
+                    window.save_annotation_pdf()
+
+        self.assertEqual(len(captured["overlays"]), 2)
+        self.assertEqual(captured["overlays"][0]["page_index"], 0)
+        self.assertEqual(captured["overlays"][0]["text"], "page one")
+        self.assertEqual(captured["overlays"][1]["page_index"], 1)
+        self.assertEqual(captured["overlays"][1]["text"], "page two")
+        self.assertEqual(window.annotation_items, [])
+
+    def test_changed_pages_save_extracts_only_edited_pages(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.annotation_text_input.setPlainText("page one")
+        window.queue_current_annotation()
+        window.markup_items.append((1, MarkupAnnotation("rect", 10, 20, 80, 90)))
+
+        self.assertEqual(window.changed_advanced_page_indexes(), [0, 1])
+        labels = [
+            button.text()
+            for button in window.findChildren(QPushButton)
+            if button.text() == "另存有修改的頁"
+        ]
+        self.assertGreaterEqual(len(labels), 3)
+
+        target = Path(self.temp_dir.name) / "changed.pdf"
+        captured = {}
+
+        def fake_extract(source, target, page_indexes, overlays=None, erase_marks=None, markups=None, password="", remove_content=True):
+            captured["pages"] = list(page_indexes)
+            captured["overlay_count"] = len(overlays or [])
+            captured["markup_count"] = len(markups or [])
+            Path(target).write_bytes(Path(source).read_bytes())
+            return len(page_indexes)
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch("qt_app.apply_edits_and_extract_pages", side_effect=fake_extract):
+                with patch.object(window, "open_pdf_as_new_tab"):
+                    window.save_changed_pages_pdf()
+
+        self.assertEqual(captured["pages"], [0, 1])
+        self.assertEqual(captured["overlay_count"], 1)
+        self.assertEqual(captured["markup_count"], 1)
+        self.assertEqual(len(window.annotation_items), 1)
+        self.assertEqual(len(window.markup_items), 1)
+
     def test_text_edit_tab_loads_pdf(self):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)
@@ -343,6 +495,19 @@ class QtAppTests(unittest.TestCase):
 
         window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
 
+        self.assertEqual(window.text_edit_block_list.currentRow(), 0)
+
+    def test_text_edit_preview_click_uses_pymupdf_bbox(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("Hello", 72, 300, 100, 20, 12, bbox=(40.0, 50.0, 160.0, 80.0))
+        ]
+        window.render_text_edit_preview()
+        window.refresh_text_edit_blocks()
+        left, top, right, bottom = window.text_block_to_image_rect(window.text_edit_blocks[0])
+        self.assertGreater(bottom, top)
+        window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
         self.assertEqual(window.text_edit_block_list.currentRow(), 0)
 
     def test_text_edit_search_selects_next_matching_block(self):
@@ -441,6 +606,7 @@ class QtAppTests(unittest.TestCase):
 
         self.assertIsNotNone(window.text_edit_preview_label.pixmap())
         self.assertFalse(window.text_edit_preview_label.pixmap().isNull())
+        self.assertFalse(window.text_edit_preview_label.inline_edit.isHidden())
 
     def test_text_edit_replacement_preview_expands_for_long_text(self):
         window = VictorPdfToolsQt()
@@ -615,6 +781,7 @@ class QtAppTests(unittest.TestCase):
             "文字標註 / 覆蓋",
             "螢光 / 圖形註解",
             "裁切頁面",
+            "橡皮擦 / 遮擋",
             "文字編輯 Beta",
             "書籤 / 目錄",
         ):
@@ -657,10 +824,13 @@ class QtAppTests(unittest.TestCase):
         from PySide6.QtWidgets import QListView
 
         workspace = DocumentWorkspace()
+        self.assertTrue(hasattr(workspace, "body_splitter"))
         self.assertGreaterEqual(workspace.left_tabs.minimumWidth(), THUMB_PANEL_MIN_WIDTH)
         self.assertGreaterEqual(workspace.left_tabs.maximumWidth(), THUMB_PANEL_MAX_WIDTH - 1)
         self.assertGreaterEqual(workspace.thumb_list.iconSize().width(), 140)
         self.assertEqual(workspace.thumb_list.viewMode(), QListView.ListMode)
+        workspace.body_splitter.setSizes([320, 760, 300])
+        self.assertGreaterEqual(workspace.body_splitter.sizes()[0], THUMB_PANEL_MIN_WIDTH)
 
     def test_document_workspace_accepts_pdf_drop(self):
         from PySide6.QtCore import QMimeData, QPoint, QUrl
@@ -729,6 +899,8 @@ class QtAppTests(unittest.TestCase):
             if not action.shortcut().isEmpty()
         }
         self.assertIn("Ctrl+Z", shortcuts)
+        self.assertIn("Ctrl+C", shortcuts)
+        self.assertIn("Ctrl+V", shortcuts)
         self.assertIn("Ctrl+S", shortcuts)
         self.assertIn("Left", shortcuts)
         self.assertIn("Right", shortcuts)
@@ -838,6 +1010,25 @@ class QtAppTests(unittest.TestCase):
         workspace.markup_items.append((0, MarkupAnnotation("rect", 1, 2, 3, 4)))
         workspace.undo()
         self.assertEqual(workspace.markup_items, [])
+
+    def test_document_workspace_markup_copy_paste_and_undo(self):
+        workspace = DocumentWorkspace()
+        workspace.open_path(self.source)
+        workspace.preview_image = _white_image(300, 400)
+        workspace.page_size = (300.0, 400.0)
+        comment_index = workspace.markup_tool_combo.findData("comment")
+        self.assertGreaterEqual(comment_index, 0)
+        workspace.markup_tool_combo.setCurrentIndex(comment_index)
+        workspace.markup_note_input.setText("工作台附註")
+        workspace._add_markup_from_point(QPoint(50, 60))
+        self.assertEqual(len(workspace.markup_items), 1)
+
+        workspace.copy_markup_item()
+        workspace.paste_markup_item()
+        self.assertEqual(len(workspace.markup_items), 2)
+        self.assertEqual(workspace.markup_items[1][1].contents, "工作台附註")
+        workspace.undo()
+        self.assertEqual(len(workspace.markup_items), 1)
 
     def test_document_workspace_modes_include_crop(self):
         workspace = DocumentWorkspace()
@@ -975,6 +1166,65 @@ class QtAppTests(unittest.TestCase):
             self.assertIn(expected, BATCHABLE_OPERATIONS)
         self.assertNotIn("merge", BATCHABLE_OPERATIONS)
 
+    def test_watermark_controls_accept_word_like_layout(self):
+        window = VictorPdfToolsQt()
+        self.assertGreaterEqual(window.tool_watermark_position_combo.count(), 9)
+        self.assertEqual(window.tool_watermark_position_combo.currentData(), "center")
+        self.assertEqual(window.tool_watermark_rotation_combo.currentData(), 45)
+        self.assertTrue(window.tool_watermark_size_combo.isEditable())
+        window.tool_watermark_position_combo.setCurrentIndex(window.tool_watermark_position_combo.findData("custom"))
+        window.tool_watermark_rotation_combo.setCurrentIndex(window.tool_watermark_rotation_combo.findData(0))
+        window.tool_watermark_size_combo.setEditText("36")
+        window.tool_watermark_opacity_combo.setCurrentIndex(window.tool_watermark_opacity_combo.findData(0.5))
+        window.tool_watermark_color_combo.setCurrentIndex(window.tool_watermark_color_combo.findData("red"))
+        window.tool_watermark_x_input.setText("20")
+        window.tool_watermark_y_input.setText("80")
+        options = window.watermark_options()
+        self.assertEqual(options["position"], "custom")
+        self.assertEqual(options["rotation"], 0)
+        self.assertEqual(options["font_size"], 36)
+        self.assertEqual(options["opacity"], 0.5)
+        self.assertEqual(options["x_percent"], 20.0)
+        self.assertEqual(options["y_percent"], 80.0)
+        self.assertEqual(options["color_rgb"], (0.72, 0.16, 0.16))
+
+    def test_watermark_tool_passes_layout_options(self):
+        window = VictorPdfToolsQt()
+        window.tool_file_items = [self.source]
+        window.refresh_tool_file_list()
+        window.tool_operation.setCurrentIndex(window.tool_operation.findData("watermark"))
+        window.tool_batch_text_input.setText("INTERNAL")
+        window.tool_pages_input.setText("1")
+        window.tool_watermark_position_combo.setCurrentIndex(window.tool_watermark_position_combo.findData("top-left"))
+        window.tool_watermark_rotation_combo.setCurrentIndex(window.tool_watermark_rotation_combo.findData(0))
+        window.tool_watermark_size_combo.setEditText("28")
+        for checkbox in (
+            window.tool_open_pdf_tab_checkbox,
+            window.tool_open_output_folder_checkbox,
+        ):
+            checkbox.blockSignals(True)
+            checkbox.setChecked(False)
+            checkbox.blockSignals(False)
+        target = Path(self.temp_dir.name) / "watermarked.pdf"
+        captured = {}
+
+        def fake_add(source, target_path, text, password="", **kwargs):
+            captured["text"] = text
+            captured["kwargs"] = kwargs
+            Path(target_path).write_bytes(Path(source).read_bytes())
+            return 1
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "pdf")):
+            with patch("qt_app.add_watermark", side_effect=fake_add):
+                with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
+                    window.run_tool_operation()
+        self.assertEqual(captured["text"], "INTERNAL")
+        self.assertEqual(captured["kwargs"]["position"], "top-left")
+        self.assertEqual(captured["kwargs"]["rotation"], 0)
+        self.assertEqual(captured["kwargs"]["font_size"], 28)
+        self.assertEqual(captured["kwargs"]["pages_spec"], "1")
+        self.assertIn("浮水印", window._last_tool_status_message)
+
     def test_tool_batch_rotate_writes_each_pdf(self):
         window = VictorPdfToolsQt()
         window.tool_file_items = [self.source, self.second_source]
@@ -1023,13 +1273,24 @@ class QtAppTests(unittest.TestCase):
         self.assertIsNotNone(window.annotation_preview_label.pixmap())
         self.assertFalse(window.annotation_preview_label.pixmap().isNull())
 
+    def test_annotation_font_defaults_to_cjk_and_preview_avoids_courier_for_chinese(self):
+        window = VictorPdfToolsQt()
+        self.assertEqual(window.annotation_font_combo.currentData(), "cjk")
+        font = window.annotation_preview_font(18, False, "courier", "這個要修改")
+        font_path = Path(getattr(font, "path", "") or "")
+        if font_path.exists():
+            self.assertNotIn("cour", font_path.name.lower())
+            self.assertTrue(
+                any(token in font_path.name.lower() for token in ("msjh", "msyh", "mingliu", "simsun", "arial"))
+            )
+
     def test_annotation_tab_has_text_frame_choices(self):
         window = VictorPdfToolsQt()
         slugs = {
             window.annotation_shape_list.item(index).data(Qt.UserRole)
             for index in range(window.annotation_shape_list.count())
         }
-        self.assertTrue({"box", "rect", "callout", "speech", "cloud"}.issubset(slugs))
+        self.assertTrue({"box", "rect", "comment", "callout", "speech", "cloud"}.issubset(slugs))
         window.set_annotation_shape("speech")
         self.assertEqual(window.annotation_shape(), "speech")
         style = window.annotation_style_values()
@@ -1052,6 +1313,169 @@ class QtAppTests(unittest.TestCase):
         self.assertGreater(style["pdf_y"], style["pointer_y"])
         self.assertAlmostEqual(style["pdf_x"], 150.0 - 60.0, delta=1)
         self.assertIn("插入點", window.statusBar().currentMessage())
+
+    def test_wrap_annotation_text_breaks_to_width(self):
+        class DummyFont:
+            def getlength(self, text):
+                return len(text) * 10
+
+        self.assertEqual(wrap_annotation_text("abcdefghij", DummyFont(), 25), ["ab", "cd", "ef", "gh", "ij"])
+        self.assertEqual(wrap_annotation_text("一\n二", DummyFont(), 100), ["一", "二"])
+
+    def test_annotation_speech_grows_with_multiline_text(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_shape("speech")
+        window.annotation_font_size_combo.setCurrentText("18")
+        window.annotation_width_input.setText("220")
+        window.annotation_height_input.setText("32")
+        window.annotation_text_input.setPlainText("請加入note 1\n請加入note 1\n請加入note 1\n請加入note 1")
+
+        height = float(window.annotation_height_input.text())
+        self.assertGreater(height, 80)
+        style = window.annotation_style_values()
+        self.assertGreaterEqual(style["rect_height"], height - 0.5)
+
+    def test_font_size_combo_accepts_typed_values(self):
+        window = VictorPdfToolsQt()
+        self.assertTrue(window.erase_text_size_combo.isEditable())
+        self.assertTrue(window.annotation_font_size_combo.isEditable())
+        presets = [window.erase_text_size_combo.itemText(i) for i in range(window.erase_text_size_combo.count())]
+        self.assertIn("24", presets)
+        self.assertIn("48", presets)
+        self.assertIn("72", presets)
+
+        window.erase_text_size_combo.setEditText("60")
+        self.assertEqual(combo_font_size(window.erase_text_size_combo, 18), 60)
+
+        window.annotation_font_size_combo.setEditText("48")
+        self.assertEqual(window.annotation_style_values()["font_size"], 48)
+
+        combo = QComboBox()
+        combo.setEditable(True)
+        combo.setEditText("200")
+        self.assertEqual(combo_font_size(combo, 18), FONT_SIZE_MAX)
+        combo.setEditText("3")
+        self.assertEqual(combo_font_size(combo, 12), FONT_SIZE_MIN)
+        combo.setEditText("")
+        self.assertEqual(combo_font_size(combo, 18), 18)
+
+    def test_annotation_box_resize_handle_changes_size(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("speech")
+        window.annotation_text_input.setPlainText("請加入 note 1")
+        window.annotation_page_size = (300.0, 400.0)
+        window.annotation_preview_image = _white_image(300, 400)
+        window.annotation_width_input.setText("100")
+        window.annotation_height_input.setText("80")
+        window.annotation_x_input.setText("40")
+        window.annotation_y_input.setText("80")
+        window.annotation_box_locked = True
+        window.annotation_box_pdf = (50.0, 200.0)
+        window._annotation_manual_size = True
+        window.update_annotation_preview_display()
+
+        window.resize_annotation_box_from_handle("se", QPoint(150, 160), QPoint(190, 190))
+        window.finish_annotation_box_interaction()
+
+        self.assertGreater(float(window.annotation_width_input.text()), 100)
+        self.assertTrue(window.annotation_box_locked)
+
+    def test_annotation_pointer_drag_keeps_text_box(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("speech")
+        window.annotation_text_input.setPlainText("how are u")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.annotation_width_input.setText("120")
+        window.annotation_height_input.setText("40")
+        window.set_annotation_position_from_click(QPoint(300, 400))
+
+        before = window.annotation_style_values()
+        self.assertTrue(window.annotation_box_locked)
+        self.assertAlmostEqual(before["pointer_x"], 300.0, delta=1)
+        self.assertAlmostEqual(before["pointer_y"], 400.0, delta=1)
+        box_x, box_y = before["pdf_x"], before["pdf_y"]
+
+        window.move_annotation_pointer(QPoint(100, 500))
+        after = window.annotation_style_values()
+
+        self.assertAlmostEqual(after["pdf_x"], box_x, delta=1)
+        self.assertAlmostEqual(after["pdf_y"], box_y, delta=1)
+        self.assertAlmostEqual(after["pointer_x"], 100.0, delta=1)
+        self.assertAlmostEqual(after["pointer_y"], 300.0, delta=1)
+        self.assertTrue(window.annotation_preview_label.pointer_enabled)
+
+        window.set_annotation_position_from_click(QPoint(80, 450))
+        clicked = window.annotation_style_values()
+        self.assertAlmostEqual(clicked["pdf_x"], box_x, delta=1)
+        self.assertAlmostEqual(clicked["pdf_y"], box_y, delta=1)
+        self.assertAlmostEqual(clicked["pointer_x"], 80.0, delta=1)
+
+    def test_annotation_comment_places_cranked_arrow(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("附註")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.annotation_width_input.setText("180")
+        window.annotation_height_input.setText("40")
+        window._annotation_placed = False
+        window.annotation_box_locked = False
+        window.annotation_box_pdf = None
+        window.set_annotation_position_from_click(QPoint(200, 500))
+
+        style = window.annotation_style_values()
+        self.assertEqual(style["shape"], "comment")
+        self.assertAlmostEqual(style["pointer_x"], 200.0, delta=1)
+        self.assertGreater(style["pdf_x"] + style["rect_width"] / 2.0, style["pointer_x"] + 40)
+        self.assertGreater(style["pdf_y"], style["pointer_y"])
+        self.assertTrue(window.annotation_preview_label.elbow_enabled)
+
+        box_x, box_y = style["pdf_x"], style["pdf_y"]
+        pointer_y = style["pointer_y"]
+        window.move_annotation_elbow(QPoint(80, 520))
+        after = window.annotation_style_values()
+        self.assertAlmostEqual(after["pdf_x"], box_x, delta=1)
+        self.assertAlmostEqual(after["pdf_y"], box_y, delta=1)
+        self.assertAlmostEqual(after["pointer_y"], pointer_y, delta=1)
+        self.assertAlmostEqual(after["pointer_x"], 80.0, delta=1)
+
+    def test_comment_appears_on_click_without_text(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.clear()
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window._annotation_placed = False
+        window.set_annotation_position_from_click(QPoint(200, 400))
+
+        self.assertTrue(window._annotation_placed)
+        self.assertTrue(window.annotation_preview_label.handles_enabled)
+        self.assertTrue(window.annotation_preview_label.elbow_enabled)
+        self.assertEqual(window.annotation_shape(), "comment")
+        window.move_annotation_elbow(QPoint(90, 420))
+        self.assertAlmostEqual(float(window.annotation_x_input.text()), 90.0, delta=1)
+
+    def test_annotation_fill_defaults_to_white_and_can_be_none(self):
+        window = VictorPdfToolsQt()
+        self.assertEqual(window.annotation_fill_combo.currentData(), "white")
+        self.assertEqual(window.annotation_style_values()["fill_rgb"], (1.0, 1.0, 1.0))
+        self.assertFalse(window.annotation_style_values()["fill_none"])
+        window.annotation_fill_combo.setCurrentIndex(window.annotation_fill_combo.findData("none"))
+        self.assertTrue(window.annotation_style_values()["fill_none"])
+        self.assertIsNone(window.annotation_style_values()["fill_rgb"])
+
+    def test_advanced_thumb_panel_is_resizable(self):
+        window = VictorPdfToolsQt()
+        self.assertTrue(hasattr(window, "advanced_splitter"))
+        self.assertGreaterEqual(window.advanced_thumb_panel.minimumWidth(), 160)
+        self.assertGreaterEqual(window.advanced_thumb_panel.maximumWidth(), 400)
+        window.advanced_splitter.setSizes([300, 900])
+        self.assertGreaterEqual(window.advanced_splitter.sizes()[0], 160)
 
     def test_organize_grid_manual_reorder_setup(self):
         from PySide6.QtWidgets import QListWidget
@@ -1217,6 +1641,7 @@ class QtAppTests(unittest.TestCase):
         _page_index, markup = window.markup_items[0]
         self.assertEqual(markup.kind, "note")
         self.assertEqual(markup.contents, "看這裡")
+        self.assertEqual(window.markup_note_input.text(), "")
 
     def test_markup_callout_uses_drag_from_pointer_to_box(self):
         window = VictorPdfToolsQt()
@@ -1251,6 +1676,52 @@ class QtAppTests(unittest.TestCase):
 
         window.clear_markups()
         self.assertEqual(window.markup_items, [])
+
+    def test_markup_comment_copy_paste_and_undo(self):
+        window = VictorPdfToolsQt()
+        window.set_markup_pdf(self.source)
+        window.markup_page_size = (300.0, 400.0)
+        window.markup_preview_image = _white_image(300, 400)
+        window.markup_tool_combo.setCurrentIndex(window.markup_tool_combo.findData("comment"))
+        window.markup_note_input.setText("附註框")
+        window.add_markup_from_point(QPoint(40, 80))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._markup_tab)
+
+        window.copy_selected_pages()
+        window.paste_pages()
+        self.assertEqual(len(window.markup_items), 2)
+        self.assertEqual(window.markup_items[1][1].kind, "comment")
+        self.assertEqual(window.markup_items[1][1].contents, "附註框")
+        self.assertAlmostEqual(window.markup_items[1][1].x0, window.markup_items[0][1].x0 + 16.0, delta=0.5)
+
+        window.undo_last_action()
+        self.assertEqual(len(window.markup_items), 1)
+
+    def test_annotation_comment_copy_paste_and_undo(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("附註內容")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(200, 400))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._annotation_tab)
+
+        window.copy_annotation_box()
+        window.paste_annotation_box()
+        self.assertEqual(len(window.annotation_items), 1)
+        self.assertEqual(window.annotation_items[0]["text"], "附註內容")
+        self.assertEqual(window.annotation_text_input.toPlainText(), "附註內容")
+        self.assertTrue(window._annotation_placed)
+        live = window.annotation_style_values()
+        queued = window.annotation_items[0]
+        self.assertGreater(abs(live["pdf_x"] - queued["pdf_x"]), 8)
+
+        window.undo_annotation_action()
+        self.assertEqual(window.annotation_items, [])
+        self.assertEqual(window.annotation_text_input.toPlainText(), "附註內容")
 
     def test_markup_save_applies_annotations(self):
         window = VictorPdfToolsQt()
@@ -1303,6 +1774,134 @@ class QtAppTests(unittest.TestCase):
             [40.0, 50.0, 220.0, 320.0],
         )
 
+    def test_erase_brush_and_rect_record_marks(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+
+        window.add_erase_stroke_point(QPoint(50, 40))
+        window.add_erase_stroke_point(QPoint(80, 70))
+        window.finish_erase_stroke()
+        self.assertEqual(len(window.erase_marks), 1)
+        self.assertEqual(window.erase_marks[0].kind, "stroke")
+        self.assertGreaterEqual(len(window.erase_marks[0].points), 1)
+
+        window.add_erase_rect(QPoint(20, 20), QPoint(120, 90))
+        self.assertEqual(len(window.erase_marks), 2)
+        self.assertEqual(window.erase_marks[1].kind, "rect")
+
+        window.undo_erase_mark()
+        self.assertEqual(len(window.erase_marks), 1)
+        window.clear_erase_marks_on_page()
+        self.assertEqual(window.erase_marks, [])
+
+    def test_erase_brush_cursor_tracks_slider_and_has_rect_tool(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+        window.erase_size_slider.setValue(40)
+        window.sync_erase_brush_cursor()
+
+        self.assertTrue(window.erase_preview_label.hasMouseTracking())
+        self.assertAlmostEqual(window.erase_preview_label.brush_radius_px, 20.0, delta=0.6)
+        self.assertTrue(window.erase_brush_button.isChecked())
+
+        window.set_erase_tool("rect")
+        self.assertEqual(window.erase_preview_label.tool, "rect")
+        self.assertTrue(window.erase_rect_button.isChecked())
+        self.assertFalse(window.erase_brush_button.isChecked())
+        self.assertFalse(window.erase_text_button.isChecked())
+
+        window.set_erase_tool("text")
+        self.assertEqual(window.erase_preview_label.tool, "text")
+        self.assertTrue(window.erase_text_button.isChecked())
+        self.assertFalse(window.erase_brush_button.isChecked())
+
+    def test_erase_text_box_is_queued_after_brush(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+        window.add_erase_rect(QPoint(20, 20), QPoint(120, 90))
+        self.assertEqual(len(window.erase_marks), 1)
+
+        window.set_erase_tool("text")
+        window.erase_text_input.setPlainText("新說明")
+        window.add_erase_text_at_point(QPoint(40, 50))
+
+        self.assertEqual(len(window.annotation_items), 1)
+        self.assertEqual(window.annotation_items[0]["text"], "新說明")
+        self.assertEqual(window.annotation_items[0]["page_index"], 0)
+        self.assertIn("文字方塊", window.erase_mark_list.item(window.erase_mark_list.count() - 1).text())
+
+    def test_erase_text_box_appears_on_click_without_text(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+        window.set_erase_tool("text")
+        window.erase_text_input.clear()
+        window.add_erase_text_at_point(QPoint(40, 50))
+
+        self.assertEqual(len(window.annotation_items), 1)
+        self.assertEqual(window.annotation_items[0]["text"], "")
+        self.assertTrue(window.erase_preview_label.handles_enabled)
+        self.assertEqual(window._erase_text_selected, 0)
+
+        window.on_erase_inline_text_edited("補上內容")
+        self.assertEqual(window.annotation_items[0]["text"], "補上內容")
+
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._erase_tab)
+        window.copy_selected_pages()
+        window._erase_last_click = QPoint(80, 90)
+        window.paste_pages()
+        self.assertEqual(len(window.annotation_items), 2)
+        self.assertEqual(window.annotation_items[1]["text"], "補上內容")
+
+        window.undo_last_action()
+        self.assertEqual(len(window.annotation_items), 1)
+
+    def test_erase_text_box_uses_typed_font_size(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+        window.set_erase_tool("text")
+        window.erase_text_size_combo.setEditText("48")
+        window.add_erase_text_at_point(QPoint(40, 50))
+        self.assertEqual(window.annotation_items[0]["font_size"], 48)
+
+    def test_erase_save_applies_marks_then_text_boxes(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+        window.add_erase_rect(QPoint(20, 20), QPoint(120, 90))
+        window.set_erase_tool("text")
+        window.erase_text_input.setPlainText("補上")
+        window.add_erase_text_at_point(QPoint(40, 50))
+        target = Path(self.temp_dir.name) / "erased-text.pdf"
+        captured = {}
+
+        def fake_apply(source, target_path, marks, overlays, password="", remove_content=True):
+            captured["marks"] = list(marks)
+            captured["overlays"] = list(overlays)
+            Path(target_path).write_bytes(Path(source).read_bytes())
+            return len(marks)
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch("qt_app.apply_erase_then_text_overlays", side_effect=fake_apply):
+                with patch.object(window, "open_pdf_as_new_tab"):
+                    window.save_erase_pdf()
+
+        self.assertEqual(len(captured["marks"]), 1)
+        self.assertEqual(len(captured["overlays"]), 1)
+        self.assertEqual(captured["overlays"][0]["text"], "補上")
+        self.assertEqual(window.erase_marks, [])
+        self.assertEqual(window.annotation_items, [])
 
     def test_tool_split_advanced_creates_zip(self):
         window = VictorPdfToolsQt()
@@ -1378,6 +1977,23 @@ class QtAppTests(unittest.TestCase):
                     window.save_text_edit_pdf()
 
         seamless.assert_called_once()
+
+    def test_text_edit_save_reloads_result_when_output_exists(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [TextBlock("Old", 72, 320, 30, 20, 12, "Helvetica")]
+        window.refresh_text_edit_blocks()
+        window.text_edit_block_list.setCurrentRow(0)
+        window.text_edit_replacement_input.setPlainText("New")
+        target = Path(self.temp_dir.name) / "reloaded-edited.pdf"
+        target.write_bytes(self.source.read_bytes())
+
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
+            with patch("qt_app.replace_text_block_seamless"):
+                with patch.object(window, "open_pdf_as_new_tab"):
+                    window.save_text_edit_pdf()
+
+        self.assertEqual(window.text_edit_pdf_path, target)
 
 
 def _white_image(width: int, height: int):

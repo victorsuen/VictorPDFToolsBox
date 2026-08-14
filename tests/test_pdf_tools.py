@@ -25,6 +25,9 @@ from pdf_core import (
     encrypt_pdf_with_permissions,
     extract_outline,
     extract_page_text_blocks,
+    extract_pdf_page_indexes,
+    apply_edits_and_extract_pages,
+    resolve_system_font_file,
     fill_form_fields,
     flatten_form_fields,
     images_to_pdf,
@@ -43,11 +46,18 @@ from pdf_core import (
     split_pdf_advanced,
     split_pdf_by_bookmarks,
     add_text_overlay_annotation,
+    add_text_overlay_annotations,
+    resolve_annotation_fill,
+    iter_markup_pdf_annotations,
     add_text_stamp,
     add_watermark,
     build_annotation_da,
+    overlay_needs_embedded_font,
+    text_contains_cjk,
     callout_layout,
     callout_box_from_pointer,
+    comment_box_from_pointer,
+    comment_polyline,
     clean_metadata,
     merge_pdf_files,
     merge_text_blocks,
@@ -63,6 +73,9 @@ from pdf_core import (
     remove_blank_pages,
     split_pdf_to_zip,
     text_matches_query,
+    EraseMark,
+    apply_erase_marks,
+    apply_erase_then_text_overlays,
     write_page_items_merged,
     write_page_items_separately,
 )
@@ -90,6 +103,60 @@ class PdfToolsTests(unittest.TestCase):
             copied.write(stream)
 
         self.assertEqual(len(PdfReader(str(target)).pages), 1)
+
+    def test_extract_pdf_page_indexes_keeps_selected_order(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=100, height=100)
+        writer.add_blank_page(width=120, height=120)
+        writer.add_blank_page(width=140, height=140)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        count = extract_pdf_page_indexes(source, target, [2, 0, 2, -1, 9])
+        self.assertEqual(count, 2)
+        pages = PdfReader(str(target)).pages
+        self.assertEqual(len(pages), 2)
+        self.assertAlmostEqual(float(pages[0].mediabox.width), 140)
+        self.assertAlmostEqual(float(pages[1].mediabox.width), 100)
+
+    def test_apply_edits_and_extract_pages_keeps_only_annotated_page(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        count = apply_edits_and_extract_pages(
+            source,
+            target,
+            [0],
+            overlays=[
+                {
+                    "page_index": 0,
+                    "text": "Note here",
+                    "font_size": 12,
+                    "cover": False,
+                    "font_key": "helvetica",
+                    "bold": False,
+                    "color_rgb": (0.0, 0.0, 0.0),
+                    "pdf_x": 72,
+                    "pdf_y": 300,
+                    "rect_width": 160,
+                    "rect_height": 32,
+                    "shape": "box",
+                }
+            ],
+        )
+        self.assertEqual(count, 1)
+        reader = PdfReader(str(target))
+        self.assertEqual(len(reader.pages), 1)
+        annots = reader.pages[0].get("/Annots")
+        self.assertTrue(annots)
 
     def test_build_annotation_da_supports_bold_and_color(self):
         self.assertEqual(
@@ -120,6 +187,40 @@ class PdfToolsTests(unittest.TestCase):
 
         annots = PdfReader(str(target)).pages[0].get("/Annots")
         self.assertEqual(len(annots), 2)
+
+    def test_add_text_overlay_annotations_applies_multiple_pages(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        overlay = {
+            "pdf_x": 72,
+            "pdf_y": 300,
+            "font_size": 12,
+            "cover": True,
+            "rect_width": 180,
+            "rect_height": 30,
+            "font_key": "helvetica",
+            "bold": False,
+            "color_rgb": (0.0, 0.0, 0.0),
+            "shape": "box",
+        }
+        add_text_overlay_annotations(
+            source,
+            target,
+            [
+                {**overlay, "page_index": 0, "text": "First"},
+                {**overlay, "page_index": 1, "text": "Second", "pdf_y": 280},
+            ],
+        )
+
+        reader = PdfReader(str(target))
+        self.assertEqual(len(reader.pages[0].get("/Annots")), 2)
+        self.assertEqual(len(reader.pages[1].get("/Annots")), 2)
 
     def test_add_text_overlay_speech_shape_writes_polygon(self):
         source = Path(self.temp_dir.name) / "source.pdf"
@@ -175,7 +276,44 @@ class PdfToolsTests(unittest.TestCase):
         annots = PdfReader(str(target)).pages[0].get("/Annots")
         subtypes = [str(item.get_object().get("/Subtype")) for item in annots]
         self.assertIn("/Square", subtypes)
-        self.assertIn("/FreeText", subtypes)
+
+    def test_text_contains_cjk(self):
+        self.assertTrue(text_contains_cjk("這個要修改"))
+        self.assertTrue(overlay_needs_embedded_font("Hello", "cjk"))
+        self.assertTrue(overlay_needs_embedded_font("這個要修改", "courier"))
+        self.assertFalse(text_contains_cjk("Reviewed FY2026"))
+        self.assertFalse(overlay_needs_embedded_font("Reviewed FY2026", "courier"))
+
+    def test_add_text_overlay_embeds_chinese_even_with_courier(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        add_text_overlay_annotation(
+            source=source,
+            target=target,
+            page_index=0,
+            x=72,
+            y=300,
+            text="這個要修改",
+            font_size=18,
+            cover_original=False,
+            cover_width=220,
+            cover_height=32,
+            font_key="courier",
+        )
+
+        document = fitz.open(str(target))
+        try:
+            self.assertIn("這個要修改", document[0].get_text())
+        finally:
+            document.close()
+        self.assertLess(target.stat().st_size, 200_000)
 
     def test_callout_layout_uses_explicit_box_size(self):
         layout = callout_layout(
@@ -200,6 +338,102 @@ class PdfToolsTests(unittest.TestCase):
         left, bottom = callout_box_from_pointer(100, 50, 180, 40, gap=18)
         self.assertAlmostEqual(left, 10)
         self.assertAlmostEqual(bottom, 68)
+
+    def test_comment_box_from_pointer_offsets_box_to_the_side(self):
+        left, bottom = comment_box_from_pointer(100, 50, 180, 40)
+        self.assertAlmostEqual(left, 90)
+        self.assertAlmostEqual(bottom, 78)
+        self.assertGreater(left + 90, 100)
+
+    def test_comment_polyline_has_stretchable_horizontal_arm(self):
+        path = comment_polyline(90, 78, 270, 118, 100, 50)
+        self.assertEqual(len(path), 4)
+        self.assertAlmostEqual(path[0][0], path[1][0])
+        self.assertAlmostEqual(path[1][1], path[2][1])
+        self.assertAlmostEqual(path[2][0], path[3][0])
+        self.assertEqual(path[3], (100, 50))
+        self.assertGreater(abs(path[2][0] - path[1][0]), 40)
+
+    def test_add_text_overlay_comment_writes_polyline(self):
+        source = Path(self.temp_dir.name) / "source.pdf"
+        target = Path(self.temp_dir.name) / "target.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        add_text_overlay_annotation(
+            source=source,
+            target=target,
+            page_index=0,
+            x=90,
+            y=220,
+            text="Note here",
+            font_size=12,
+            cover_original=False,
+            cover_width=160,
+            cover_height=36,
+            shape="comment",
+            pointer=(40, 180),
+        )
+
+        annots = PdfReader(str(target)).pages[0].get("/Annots")
+        subtypes = [str(item.get_object().get("/Subtype")) for item in annots]
+        self.assertIn("/Square", subtypes)
+        self.assertIn("/PolyLine", subtypes)
+        self.assertIn("/FreeText", subtypes)
+        polyline = next(item.get_object() for item in annots if str(item.get_object().get("/Subtype")) == "/PolyLine")
+        vertices = [float(value) for value in polyline.get("/Vertices")]
+        self.assertEqual(len(vertices), 8)
+
+    def test_resolve_annotation_fill_supports_none_and_custom(self):
+        self.assertIsNone(resolve_annotation_fill((0, 0, 0), fill_none=True))
+        self.assertEqual(resolve_annotation_fill((0, 0, 0), fill_rgb=(1.0, 0.96, 0.72)), (1.0, 0.96, 0.72))
+        auto = resolve_annotation_fill((0.0, 0.0, 0.0))
+        self.assertGreater(auto[0], 0.7)
+
+    def test_comment_square_uses_custom_fill_color(self):
+        markup = MarkupAnnotation(
+            "comment",
+            40,
+            50,
+            100,
+            200,
+            color_rgb=(0.0, 0.0, 0.0),
+            contents="Note",
+            box_width=160,
+            box_height=36,
+            fill_rgb=(1.0, 0.96, 0.72),
+        )
+        square = next(
+            annotation
+            for annotation in iter_markup_pdf_annotations(markup)
+            if str(annotation.get("/Subtype")) == "/Square"
+        )
+        fill = [float(value) for value in square.get("/IC")]
+        self.assertAlmostEqual(fill[0], 1.0)
+        self.assertAlmostEqual(fill[1], 0.96)
+        self.assertAlmostEqual(fill[2], 0.72)
+
+    def test_comment_square_omits_fill_when_none(self):
+        markup = MarkupAnnotation(
+            "comment",
+            40,
+            50,
+            100,
+            200,
+            color_rgb=(0.0, 0.0, 0.0),
+            contents="Note",
+            box_width=160,
+            box_height=36,
+            fill_none=True,
+        )
+        square = next(
+            annotation
+            for annotation in iter_markup_pdf_annotations(markup)
+            if str(annotation.get("/Subtype")) == "/Square"
+        )
+        self.assertIsNone(square.get("/IC"))
 
     def test_office_app_for_path_detects_word_excel_ppt(self):
         self.assertEqual(office_app_for_path(Path("memo.docx")), "word")
@@ -470,7 +704,72 @@ class PdfToolsTests(unittest.TestCase):
 
         add_watermark(source, target, "CONFIDENTIAL")
 
-        self.assertEqual(len(PdfReader(str(target)).pages[0].get("/Annots")), 1)
+        import fitz
+
+        document = fitz.open(str(target))
+        try:
+            self.assertIn("CONFIDENTIAL", document[0].get_text())
+        finally:
+            document.close()
+
+    def test_add_watermark_respects_position_and_custom_text(self):
+        source = Path(self.temp_dir.name) / "wm-source.pdf"
+        top_right = Path(self.temp_dir.name) / "wm-top-right.pdf"
+        bottom_left = Path(self.temp_dir.name) / "wm-bottom-left.pdf"
+        custom = Path(self.temp_dir.name) / "wm-custom.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        writer.add_blank_page(width=300, height=400)
+        with source.open("wb") as stream:
+            writer.write(stream)
+
+        add_watermark(source, top_right, "DRAFT", position="top-right", rotation=0, font_size=18, opacity=1.0)
+        add_watermark(source, bottom_left, "DRAFT", position="bottom-left", rotation=0, font_size=18, opacity=1.0)
+        add_watermark(
+            source,
+            custom,
+            "機密",
+            position="custom",
+            rotation=0,
+            font_size=16,
+            opacity=1.0,
+            x_percent=15,
+            y_percent=80,
+            pages_spec="1",
+        )
+
+        import fitz
+
+        def first_word_box(path: Path):
+            document = fitz.open(str(path))
+            try:
+                words = document[0].get_text("words")
+                self.assertTrue(words)
+                return words[0][:4], document[0].rect
+            finally:
+                document.close()
+
+        (x0, y0, x1, y1), rect = first_word_box(top_right)
+        self.assertGreater(x0, rect.width / 2)
+        self.assertLess(y1, rect.height / 2)
+
+        (x0, y0, x1, y1), rect = first_word_box(bottom_left)
+        self.assertLess(x1, rect.width / 2)
+        self.assertGreater(y0, rect.height / 2)
+
+        document = fitz.open(str(custom))
+        try:
+            self.assertIn("機密", document[0].get_text())
+            self.assertEqual(document[1].get_text().strip(), "")
+            words = document[0].get_text("words")
+            x0, y0, x1, y1, *_rest = words[0]
+            self.assertLess(x1, document[0].rect.width / 2)
+            self.assertGreater(y0, document[0].rect.height / 2)
+        finally:
+            document.close()
+
+        with self.assertRaises(ValueError):
+            add_watermark(source, Path(self.temp_dir.name) / "empty.pdf", "   ")
 
     def test_clean_metadata(self):
         source = Path(self.temp_dir.name) / "source.pdf"
@@ -918,6 +1217,113 @@ class PdfToolsTests(unittest.TestCase):
         self.assertGreater(blocks[0].font_size, 0)
         self.assertNotEqual(blocks[0].bbox, (0.0, 0.0, 0.0, 0.0))
 
+    def test_resolve_system_font_file_maps_noto_cjk_away_from_arial(self):
+        path = resolve_system_font_file("NotoSansCJKsc-Bold", 16)
+        if not path:
+            self.skipTest("Windows CJK fonts not installed")
+        name = Path(path).name.lower()
+        self.assertNotIn("arial", name)
+        self.assertTrue(any(token in name for token in ("msyh", "msjh", "mingliu", "simsun", "simhei")))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_extract_page_text_blocks_reads_chinese(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "cjk-source.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_textbox(fitz.Rect(40, 60, 260, 120), "這個要修改", fontname="china-t", fontsize=16)
+        doc.save(str(source))
+        doc.close()
+
+        blocks = extract_page_text_blocks(source, 0)
+        combined = "".join(block.text for block in blocks)
+        self.assertIn("這個要修改", combined.replace("\n", ""))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_apply_erase_marks_redacts_text(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "erase-source.pdf"
+        target = Path(self.temp_dir.name) / "erase-target.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((72, 100), "SECRET", fontname="helv", fontsize=16)
+        doc.save(str(source))
+        doc.close()
+
+        apply_erase_marks(
+            source,
+            target,
+            [
+                EraseMark(
+                    page_index=0,
+                    kind="rect",
+                    color_rgb=(1.0, 1.0, 1.0),
+                    points=((60.0, 80.0), (170.0, 130.0)),
+                    radius=12.0,
+                )
+            ],
+            remove_content=True,
+        )
+        remaining = fitz.open(str(target))[0].get_text()
+        self.assertNotIn("SECRET", remaining)
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_apply_erase_then_text_overlays_replaces_erased_text(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "erase-text-source.pdf"
+        target = Path(self.temp_dir.name) / "erase-text-target.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=300, height=200)
+        page.insert_text((72, 100), "SECRET", fontname="helv", fontsize=16)
+        doc.save(str(source))
+        doc.close()
+
+        apply_erase_then_text_overlays(
+            source,
+            target,
+            [
+                EraseMark(
+                    page_index=0,
+                    kind="rect",
+                    color_rgb=(1.0, 1.0, 1.0),
+                    points=((60.0, 80.0), (200.0, 130.0)),
+                    radius=12.0,
+                )
+            ],
+            [
+                {
+                    "page_index": 0,
+                    "pdf_x": 72,
+                    "pdf_y": 90,
+                    "text": "OPEN",
+                    "font_size": 12,
+                    "cover": False,
+                    "rect_width": 80,
+                    "rect_height": 24,
+                    "font_key": "helvetica",
+                    "bold": False,
+                    "color_rgb": (0.0, 0.0, 0.0),
+                    "shape": "box",
+                }
+            ],
+            remove_content=True,
+        )
+        extracted = fitz.open(str(target))[0].get_text()
+        self.assertNotIn("SECRET", extracted)
+        self.assertIn("OPEN", extracted)
+
     @unittest.skipUnless(
         __import__("pdf_core").PYMUPDF_AVAILABLE,
         "PyMuPDF not installed",
@@ -937,7 +1343,7 @@ class PdfToolsTests(unittest.TestCase):
         block = next(item for item in extract_page_text_blocks(source, 0) if item.text == "Old Label")
         replace_text_block_seamless(source, target, 0, block, "New Label")
 
-        text = fitz.open(str(target))[0].get_text()
+        text = fitz.open(str(target))[0].get_text().replace("\xa0", " ")
         self.assertIn("New Label", text)
         self.assertNotIn("Old Label", text)
         self.assertIn("Keep", text)

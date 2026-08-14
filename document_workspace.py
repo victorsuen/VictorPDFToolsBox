@@ -4,6 +4,7 @@ import math
 import shutil
 import tempfile
 from copy import deepcopy
+from dataclasses import replace
 from pathlib import Path
 
 from PIL import Image, ImageDraw
@@ -39,6 +40,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QSizePolicy,
     QStackedWidget,
+    QSplitter,
     QTabWidget,
     QTextEdit,
     QTreeWidget,
@@ -51,6 +53,7 @@ from audit_log import append_audit_event
 from flow_layout import FlowLayout, prevent_button_clip
 from stamp_library import add_library_stamp, delete_library_stamp, list_library_stamps
 from pdf_core import (
+    ANNOTATION_FILL_PRESETS,
     MARKUP_COLOR_PRESETS,
     PDF_RENDER_AVAILABLE,
     PDF_SUFFIXES,
@@ -89,10 +92,10 @@ from pdf_core import (
 
 PREVIEW_MAX_WIDTH = 760
 PREVIEW_MAX_HEIGHT = 760
-THUMB_MAX_SIZE = (148, 190)
-THUMB_ICON_SIZE = QSize(148, 190)
-THUMB_PANEL_MIN_WIDTH = 240
-THUMB_PANEL_MAX_WIDTH = 300
+THUMB_MAX_SIZE = (180, 232)
+THUMB_ICON_SIZE = QSize(180, 232)
+THUMB_PANEL_MIN_WIDTH = 180
+THUMB_PANEL_MAX_WIDTH = 480
 THUMB_BATCH_SIZE = 6
 THUMB_BATCH_DELAY_MS = 40
 ZOOM_MIN = 0.5
@@ -150,9 +153,13 @@ class PreviewImageLabel(QLabel):
 class WorkspacePreviewLabel(PreviewImageLabel):
     rectDrawn = Signal(QPoint, QPoint)
     pointClicked = Signal(QPoint)
+    copyRequested = Signal()
+    pasteRequested = Signal()
+    undoRequested = Signal()
 
     def __init__(self, page_index: int = 0) -> None:
         super().__init__()
+        self.setFocusPolicy(Qt.StrongFocus)
         self.page_index = page_index
         self.band_color = QColor(18, 133, 118)
         self._start: QPoint | None = None
@@ -182,6 +189,21 @@ class WorkspacePreviewLabel(PreviewImageLabel):
             else:
                 self.rectDrawn.emit(start, end)
         super().mouseReleaseEvent(event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Copy):
+            self.copyRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Paste):
+            self.pasteRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Undo):
+            self.undoRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -239,7 +261,8 @@ MARKUP_TOOL_OPTIONS = [
     ("ellipse", "橢圓框"),
     ("line", "直線"),
     ("arrow", "箭頭"),
-    ("callout", "標註框（帶指引線）"),
+        ("comment", "附註框（折線箭咀）"),
+        ("callout", "標註框（帶指引線）"),
     ("speech", "對話框"),
     ("cloud", "雲朵標註"),
     ("note", "便利貼"),
@@ -276,7 +299,11 @@ class DocumentWorkspace(QWidget):
         self.preview_zoom = 1.0
         self.interaction: str | None = None
         self.markup_items: list[tuple[int, MarkupAnnotation]] = []
+        self._markup_clipboard: MarkupAnnotation | None = None
+        self._markup_paste_lock = False
         self.markup_color_rgb = MARKUP_COLOR_PRESETS["yellow"]
+        self.markup_fill_rgb = (1.0, 1.0, 1.0)
+        self.markup_fill_none = False
         self.text_blocks: list[TextBlock] = []
         self.form_fields: list[FormField] = []
         self.undo_stack: list[dict] = []
@@ -295,6 +322,9 @@ class DocumentWorkspace(QWidget):
         self._thumb_timer = QTimer(self)
         self._thumb_timer.setSingleShot(True)
         self._thumb_timer.timeout.connect(self._render_next_thumb_batch)
+        self._thumb_resize_timer = QTimer(self)
+        self._thumb_resize_timer.setSingleShot(True)
+        self._thumb_resize_timer.timeout.connect(self._refresh_thumbs_for_width)
         self._pdfium_doc = None
         self._pdfium_doc_path: Path | None = None
         self._thumb_placeholder_icon = QIcon(
@@ -307,9 +337,40 @@ class DocumentWorkspace(QWidget):
         super().showEvent(event)
         self._relayout_thumbnails()
 
+    def _thumb_target_size(self) -> tuple[int, int]:
+        panel_width = THUMB_PANEL_MIN_WIDTH
+        if hasattr(self, "left_tabs"):
+            panel_width = max(self.left_tabs.width(), THUMB_PANEL_MIN_WIDTH)
+        icon_width = max(panel_width - 48, 140)
+        icon_height = int(icon_width * 1.28)
+        return icon_width, icon_height
+
+    def _apply_thumb_metrics(self) -> None:
+        if not hasattr(self, "thumb_list"):
+            return
+        icon_width, icon_height = self._thumb_target_size()
+        self.thumb_list.setIconSize(QSize(icon_width, icon_height))
+        for row in range(self.thumb_list.count()):
+            item = self.thumb_list.item(row)
+            if item is not None:
+                item.setSizeHint(QSize(icon_width + 12, icon_height + 18))
+
+    def _on_body_splitter_moved(self, *_args) -> None:
+        self._apply_thumb_metrics()
+        self._thumb_resize_timer.start(180)
+
+    def _refresh_thumbs_for_width(self) -> None:
+        self._apply_thumb_metrics()
+        if self.page_count <= 0:
+            return
+        self._thumb_pending = list(range(self.page_count))
+        self._thumb_pending_rest = []
+        self._schedule_thumb_batch()
+
     def _relayout_thumbnails(self) -> None:
         if self.thumb_list.count() <= 0:
             return
+        self._apply_thumb_metrics()
         self.thumb_list.doItemsLayout()
         current = self.thumb_list.item(self.current_page)
         if current is not None:
@@ -357,13 +418,10 @@ class DocumentWorkspace(QWidget):
         top.addWidget(self.path_label)
         root.addWidget(toolbar)
 
-        body = QHBoxLayout()
-        body.setSpacing(10)
-
         left_tabs = QTabWidget()
         left_tabs.setMinimumWidth(THUMB_PANEL_MIN_WIDTH)
         left_tabs.setMaximumWidth(THUMB_PANEL_MAX_WIDTH)
-        left_tabs.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Expanding)
+        left_tabs.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         self.left_tabs = left_tabs
 
         self.thumb_list = QListWidget()
@@ -442,7 +500,6 @@ class DocumentWorkspace(QWidget):
         bookmark_layout.addLayout(bm_row2)
         self.add_button(bookmark_layout, "套用書籤並另存 PDF", self._save_bookmark_outline, "primary")
         left_tabs.addTab(bookmark_tab, "書籤")
-        body.addWidget(left_tabs)
 
         center = QVBoxLayout()
         nav = QHBoxLayout()
@@ -480,9 +537,13 @@ class DocumentWorkspace(QWidget):
         self.preview_widget = WorkspacePreviewLabel(0)
         self.preview_widget.rectDrawn.connect(self._on_preview_rect_drawn)
         self.preview_widget.pointClicked.connect(self._on_preview_point_clicked)
+        self.preview_widget.copyRequested.connect(self.copy_markup_item)
+        self.preview_widget.pasteRequested.connect(self.paste_markup_item)
+        self.preview_widget.undoRequested.connect(self.undo)
         self.preview_scroll.setWidget(self.preview_widget)
         center.addWidget(self.preview_scroll, 1)
-        body.addLayout(center, 1)
+        center_host = QWidget()
+        center_host.setLayout(center)
 
         self.right_stack = QStackedWidget()
         self.right_stack.addWidget(self._build_read_panel())
@@ -491,8 +552,17 @@ class DocumentWorkspace(QWidget):
         self.right_stack.addWidget(self._build_organize_panel())
         self.right_stack.addWidget(self._build_crop_panel())
         self.right_stack.addWidget(self._build_tools_panel())
-        body.addWidget(_wrap_side_panel(self.right_stack, 300))
-        root.addLayout(body, 1)
+        self.body_splitter = QSplitter(Qt.Horizontal)
+        self.body_splitter.setChildrenCollapsible(False)
+        self.body_splitter.addWidget(left_tabs)
+        self.body_splitter.addWidget(center_host)
+        self.body_splitter.addWidget(_wrap_side_panel(self.right_stack, 300))
+        self.body_splitter.setStretchFactor(0, 0)
+        self.body_splitter.setStretchFactor(1, 1)
+        self.body_splitter.setStretchFactor(2, 0)
+        self.body_splitter.setSizes([280, 760, 320])
+        self.body_splitter.splitterMoved.connect(self._on_body_splitter_moved)
+        root.addWidget(self.body_splitter, 1)
         self.interaction = MODE_DEFAULT_INTERACTION["read"]
         self._refresh_stamp_library_list()
 
@@ -505,6 +575,8 @@ class DocumentWorkspace(QWidget):
     ) -> None:
         if not (0 <= page_index < self.page_count):
             return
+        if page_index != self.current_page and hasattr(self, "markup_note_input"):
+            self.markup_note_input.clear()
         self.current_page = page_index
         self.preview_widget.page_index = page_index
         self.page_input.setText(str(page_index + 1))
@@ -637,11 +709,31 @@ class DocumentWorkspace(QWidget):
         self.markup_color_button.clicked.connect(self._choose_markup_color)
         color_row.addWidget(self.markup_color_button)
         layout.addLayout(color_row)
+        fill_row = QHBoxLayout()
+        fill_row.addWidget(QLabel("底色"))
+        self.markup_fill_combo = QComboBox()
+        self.markup_fill_combo.addItem("白色", "white")
+        self.markup_fill_combo.addItem("無底色", "none")
+        self.markup_fill_combo.addItem("淡黃", "yellow")
+        self.markup_fill_combo.addItem("淺藍", "blue")
+        self.markup_fill_combo.addItem("淺綠", "green")
+        self.markup_fill_combo.addItem("跟隨外框", "follow")
+        self.markup_fill_combo.addItem("自訂...", "custom")
+        self.markup_fill_combo.currentIndexChanged.connect(self._on_markup_fill_changed)
+        fill_row.addWidget(self.markup_fill_combo, 1)
+        self.markup_fill_button = QPushButton("選色")
+        self.markup_fill_button.setFixedWidth(56)
+        self.markup_fill_button.clicked.connect(self._choose_markup_fill_color)
+        fill_row.addWidget(self.markup_fill_button)
+        layout.addLayout(fill_row)
         layout.addWidget(QLabel("註解文字（標註框 / 對話框 / 便利貼）"))
         self.markup_note_input = QLineEdit()
         self.markup_note_input.setPlaceholderText("例如：請核對此數字")
         layout.addWidget(self.markup_note_input)
-        hint = QLabel("標註框／對話框／雲朵：從要指出的位置拖到文字框；便利貼則單擊放置。")
+        hint = QLabel(
+            "標註框／對話框／雲朵／附註：從要指出的位置拉到文字框；便利貼則單擊放置。"
+            "Ctrl+C 複製、Ctrl+V 貼到其他位置，Ctrl+Z 還原。"
+        )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
         layout.addWidget(hint)
@@ -650,6 +742,7 @@ class DocumentWorkspace(QWidget):
         self.markup_pending_list.setMaximumHeight(140)
         layout.addWidget(self.markup_pending_list)
         row = QHBoxLayout()
+        self.add_button(row, "復原", self.undo)
         self.add_button(row, "刪除", self._delete_pending_markup, "danger")
         self.add_button(row, "清空", self._clear_pending_markups)
         layout.addLayout(row)
@@ -816,6 +909,18 @@ class DocumentWorkspace(QWidget):
         undo_action.setShortcutContext(context)
         undo_action.triggered.connect(self.undo)
         self.addAction(undo_action)
+
+        copy_action = QAction("複製標註", self)
+        copy_action.setShortcut(QKeySequence("Ctrl+C"))
+        copy_action.setShortcutContext(context)
+        copy_action.triggered.connect(self.copy_markup_item)
+        self.addAction(copy_action)
+
+        paste_action = QAction("貼上標註", self)
+        paste_action.setShortcut(QKeySequence("Ctrl+V"))
+        paste_action.setShortcutContext(context)
+        paste_action.triggered.connect(self.paste_markup_item)
+        self.addAction(paste_action)
 
         save_action = QAction("儲存", self)
         save_action.setShortcut(QKeySequence("Ctrl+S"))
@@ -1044,8 +1149,10 @@ class DocumentWorkspace(QWidget):
             return
         for index in range(self.page_count):
             item = QListWidgetItem(self._thumb_placeholder_icon, f"第 {index + 1} 頁")
-            item.setSizeHint(QSize(THUMB_PANEL_MIN_WIDTH - 40, THUMB_ICON_SIZE.height() + 18))
+            icon_width, icon_height = self._thumb_target_size()
+            item.setSizeHint(QSize(icon_width + 12, icon_height + 18))
             self.thumb_list.addItem(item)
+        self._apply_thumb_metrics()
         if self.page_count:
             self.thumb_list.setCurrentRow(self.current_page)
         QApplication.processEvents()
@@ -1119,18 +1226,19 @@ class DocumentWorkspace(QWidget):
             item = self.thumb_list.item(index)
             if item is None:
                 continue
+            max_size = self._thumb_target_size()
             image, _ = _render_page_image(
                 self.pdf_path,
                 index,
                 password,
-                THUMB_MAX_SIZE,
-                scale_cap=0.35,
+                max_size,
+                scale_cap=0.4,
                 document=document,
             )
             if image is None:
-                image = _placeholder_image(THUMB_MAX_SIZE[0], THUMB_MAX_SIZE[1], f"P{index + 1}")
+                image = _placeholder_image(max_size[0], max_size[1], f"P{index + 1}")
             else:
-                image.thumbnail(THUMB_MAX_SIZE, Image.Resampling.BILINEAR)
+                image.thumbnail(max_size, Image.Resampling.BILINEAR)
             item.setIcon(QIcon(QPixmap.fromImage(ImageQt(image))))
         QApplication.processEvents()
         if (self._thumb_pending or self._thumb_pending_rest) and generation == self._thumb_generation:
@@ -1305,15 +1413,7 @@ class DocumentWorkspace(QWidget):
 
     def _make_undo_snapshot(self) -> dict:
         markup_copy = [
-            (page_index, MarkupAnnotation(
-                kind=markup.kind,
-                x0=markup.x0,
-                y0=markup.y0,
-                x1=markup.x1,
-                y1=markup.y1,
-                color_rgb=markup.color_rgb,
-                contents=markup.contents,
-            ))
+            (page_index, replace(markup))
             for page_index, markup in self.markup_items
         ]
         return {
@@ -1551,6 +1651,37 @@ class DocumentWorkspace(QWidget):
         if custom_index >= 0:
             self.markup_color_combo.setCurrentIndex(custom_index)
 
+    def _on_markup_fill_changed(self) -> None:
+        preset = self.markup_fill_combo.currentData()
+        if preset == "custom":
+            self._choose_markup_fill_color()
+            return
+        if preset == "none":
+            self.markup_fill_none = True
+            self.markup_fill_rgb = (1.0, 1.0, 1.0)
+        elif preset == "follow":
+            self.markup_fill_none = False
+            self.markup_fill_rgb = None
+        elif preset in ANNOTATION_FILL_PRESETS:
+            self.markup_fill_none = False
+            self.markup_fill_rgb = ANNOTATION_FILL_PRESETS[preset]
+
+    def _choose_markup_fill_color(self) -> None:
+        current = QColor.fromRgbF(*(self.markup_fill_rgb or (1.0, 1.0, 1.0)))
+        chosen = QColorDialog.getColor(current, self, "選擇底色")
+        if not chosen.isValid():
+            return
+        self.markup_fill_none = False
+        self.markup_fill_rgb = (chosen.redF(), chosen.greenF(), chosen.blueF())
+        custom_index = self.markup_fill_combo.findData("custom")
+        if custom_index >= 0:
+            self.markup_fill_combo.setCurrentIndex(custom_index)
+
+    def _markup_fill_values(self) -> tuple[tuple[float, float, float] | None, bool]:
+        if self.markup_fill_none:
+            return None, True
+        return self.markup_fill_rgb, False
+
     def _add_markup_from_rect(self, start: QPoint, end: QPoint) -> None:
         if self.preview_image is None:
             return
@@ -1564,6 +1695,7 @@ class DocumentWorkspace(QWidget):
         contents = self.markup_note_input.text().strip()
         if kind in CALLOUT_KINDS:
             contents = contents or "註解"
+        fill_rgb, fill_none = self._markup_fill_values()
         markup = MarkupAnnotation(
             kind=kind,
             x0=x0,
@@ -1572,8 +1704,12 @@ class DocumentWorkspace(QWidget):
             y1=y1,
             color_rgb=self._markup_color(),
             contents=contents,
+            fill_rgb=fill_rgb,
+            fill_none=fill_none,
         )
         self.markup_items.append((self.current_page, markup))
+        if kind in {"note"} | CALLOUT_KINDS:
+            self.markup_note_input.clear()
         self._refresh_markup_list()
         self._update_preview_display()
 
@@ -1586,6 +1722,7 @@ class DocumentWorkspace(QWidget):
             return
         self._push_undo_snapshot()
         x0, y0 = self._image_point_to_pdf(point)
+        fill_rgb, fill_none = self._markup_fill_values()
         if kind in CALLOUT_KINDS:
             markup = MarkupAnnotation(
                 kind=kind,
@@ -1595,6 +1732,8 @@ class DocumentWorkspace(QWidget):
                 y1=y0 + 50.0,
                 color_rgb=self._markup_color(),
                 contents=self.markup_note_input.text().strip() or "註解",
+                fill_rgb=fill_rgb,
+                fill_none=fill_none,
             )
         else:
             markup = MarkupAnnotation(
@@ -1605,8 +1744,11 @@ class DocumentWorkspace(QWidget):
                 y1=y0,
                 color_rgb=self._markup_color(),
                 contents=self.markup_note_input.text().strip() or "備註",
+                fill_rgb=fill_rgb,
+                fill_none=fill_none,
             )
         self.markup_items.append((self.current_page, markup))
+        self.markup_note_input.clear()
         self._refresh_markup_list()
         self._update_preview_display()
 
@@ -1636,6 +1778,43 @@ class DocumentWorkspace(QWidget):
         self.markup_items = []
         self._refresh_markup_list()
         self._update_preview_display()
+
+    def copy_markup_item(self) -> None:
+        row = self.markup_pending_list.currentRow()
+        if 0 <= row < len(self.markup_items):
+            _page, markup = self.markup_items[row]
+        elif self.markup_items:
+            on_page = [item for item in self.markup_items if item[0] == self.current_page]
+            _page, markup = on_page[-1] if on_page else self.markup_items[-1]
+        else:
+            self._emit_status("請先加入標註後再複製。")
+            return
+        self._markup_clipboard = replace(markup)
+        QApplication.clipboard().setText(markup.contents or "")
+        self._emit_status("已複製標註。到其他位置按 Ctrl+V 貼上。")
+
+    def paste_markup_item(self) -> None:
+        if self._markup_paste_lock:
+            return
+        self._markup_paste_lock = True
+        QTimer.singleShot(0, lambda: setattr(self, "_markup_paste_lock", False))
+        if self._markup_clipboard is None:
+            self._emit_status("請先點選標註後按 Ctrl+C。")
+            return
+        self._push_undo_snapshot()
+        source = self._markup_clipboard
+        pasted = replace(
+            source,
+            x0=source.x0 + 16.0,
+            y0=source.y0 - 16.0,
+            x1=source.x1 + 16.0,
+            y1=source.y1 - 16.0,
+        )
+        self.markup_items.append((self.current_page, pasted))
+        self._refresh_markup_list()
+        self.markup_pending_list.setCurrentRow(len(self.markup_items) - 1)
+        self._update_preview_display()
+        self._emit_status("已貼上標註。")
 
     def apply_pending_markups(self) -> None:
         if self.pdf_path is None or not self.markup_items:

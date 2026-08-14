@@ -357,10 +357,97 @@ def split_pdf_to_zip(source: Path, target_zip: Path, password: str = "") -> int:
 def extract_pdf_pages(source: Path, target: Path, pages_spec: str, password: str = "") -> None:
     reader = open_reader(source, password)
     pages = parse_pages(pages_spec, len(reader.pages))
+    extract_pdf_page_indexes(source, target, pages, password)
+
+
+def extract_pdf_page_indexes(
+    source: Path,
+    target: Path,
+    page_indexes: list[int],
+    password: str = "",
+) -> int:
+    reader = open_reader(source, password)
+    page_count = len(reader.pages)
+    indexes: list[int] = []
+    seen: set[int] = set()
+    for raw in page_indexes:
+        index = int(raw)
+        if index < 0 or index >= page_count or index in seen:
+            continue
+        seen.add(index)
+        indexes.append(index)
+    if not indexes:
+        raise ValueError("沒有可擷取的頁面。")
     writer = PdfWriter()
-    for index in pages:
+    for index in indexes:
         writer.add_page(reader.pages[index])
     write_pdf(writer, target)
+    return len(indexes)
+
+
+def apply_edits_and_extract_pages(
+    source: Path,
+    target: Path,
+    page_indexes: list[int],
+    *,
+    overlays: list[dict] | None = None,
+    erase_marks: list[EraseMark] | None = None,
+    markups: list[tuple[int, MarkupAnnotation]] | None = None,
+    password: str = "",
+    remove_content: bool = True,
+) -> int:
+    """Apply pending overlays/markups, then write only the edited pages."""
+
+    overlays = list(overlays or [])
+    erase_marks = list(erase_marks or [])
+    markups = list(markups or [])
+    wanted: list[int] = []
+    seen: set[int] = set()
+    for raw in page_indexes:
+        index = int(raw)
+        if index in seen:
+            continue
+        seen.add(index)
+        wanted.append(index)
+    if not wanted:
+        raise ValueError("沒有可擷取的修改頁。")
+    if not overlays and not erase_marks and not markups:
+        return extract_pdf_page_indexes(source, target, wanted, password)
+
+    temps: list[Path] = []
+    current = Path(source)
+    current_password = password
+    try:
+        if erase_marks or overlays:
+            handle = tempfile.NamedTemporaryFile(suffix=".pdf", prefix="edit_pages_", delete=False)
+            handle.close()
+            temp = Path(handle.name)
+            temps.append(temp)
+            apply_erase_then_text_overlays(
+                current,
+                temp,
+                erase_marks,
+                overlays,
+                current_password,
+                remove_content,
+            )
+            current = temp
+            current_password = ""
+        if markups:
+            handle = tempfile.NamedTemporaryFile(suffix=".pdf", prefix="markup_pages_", delete=False)
+            handle.close()
+            temp = Path(handle.name)
+            temps.append(temp)
+            apply_markup_annotations(current, temp, markups, current_password)
+            current = temp
+            current_password = ""
+        return extract_pdf_page_indexes(current, target, wanted, current_password)
+    finally:
+        for path in temps:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def delete_pdf_pages(source: Path, target: Path, pages_spec: str, password: str = "") -> None:
@@ -499,8 +586,26 @@ def resolve_system_font_file(font_name: str, font_flags: int = 0) -> str:
             candidates = files
             break
     if candidates is None:
-        if any(token in key for token in ("song", "ming", "kai", "hei", "yahei", "gothic", "mincho")):
-            candidates = ("msyh.ttc", "mingliu.ttc", "simsun.ttc")
+        if any(
+            token in key
+            for token in (
+                "cjk",
+                "noto",
+                "sourcehan",
+                "sourcehansans",
+                "song",
+                "ming",
+                "kai",
+                "hei",
+                "yahei",
+                "jhenghei",
+                "gothic",
+                "mincho",
+                "pingfang",
+                "simsun",
+            )
+        ):
+            candidates = ("msjh.ttc", "msyh.ttc", "msjhbd.ttc", "msyhbd.ttc", "mingliu.ttc", "simsun.ttc")
         else:
             candidates = WINDOWS_FONT_CANDIDATES["arial"]
     bold = bool(font_flags & 16)
@@ -539,8 +644,25 @@ def match_page_font_name(span_font: str, page_fonts: list[tuple]) -> str:
     return best_name
 
 
+def _pymupdf_text_flags() -> int:
+    flags = int(getattr(fitz, "TEXTFLAGS_DICT", 0) or 0)
+    clip = int(getattr(fitz, "TEXT_MEDIABOX_CLIP", 0) or 0)
+    if flags and clip:
+        return flags & ~clip
+    return 0
+
+
+def _span_text(span: dict) -> str:
+    text = (span.get("text") or "").replace("\u00a0", " ")
+    if text.strip():
+        return text.strip()
+    chars = span.get("chars") or []
+    assembled = "".join(str(item.get("c") or "") for item in chars)
+    return assembled.replace("\u00a0", " ").strip()
+
+
 def span_to_text_block(span: dict, page_fonts: list[tuple]) -> TextBlock:
-    text = (span.get("text") or "").replace("\u00a0", " ").strip()
+    text = _span_text(span)
     bbox = tuple(float(value) for value in span.get("bbox", (0, 0, 0, 0)))
     origin = span.get("origin") or (bbox[0], bbox[3])
     font_name = str(span.get("font") or "")
@@ -566,6 +688,19 @@ def span_to_text_block(span: dict, page_fonts: list[tuple]) -> TextBlock:
     )
 
 
+def _text_blocks_from_pymupdf_dict(page_data: dict, page_fonts: list[tuple]) -> list[TextBlock]:
+    blocks: list[TextBlock] = []
+    for block in page_data.get("blocks", []):
+        if block.get("type") != 0:
+            continue
+        for line in block.get("lines", []):
+            for span in line.get("spans", []):
+                item = span_to_text_block(span, page_fonts)
+                if item.text:
+                    blocks.append(item)
+    return blocks
+
+
 def extract_page_text_blocks_pymupdf(source: Path, page_index: int, password: str = "") -> list[TextBlock]:
     ensure_pymupdf_available()
     document = fitz.open(str(source))
@@ -577,15 +712,44 @@ def extract_page_text_blocks_pymupdf(source: Path, page_index: int, password: st
             raise ValueError("頁碼超出範圍。")
         page = document[page_index]
         page_fonts = page.get_fonts()
-        blocks: list[TextBlock] = []
-        for block in page.get_text("dict").get("blocks", []):
-            if block.get("type") != 0:
-                continue
-            for line in block.get("lines", []):
-                for span in line.get("spans", []):
-                    item = span_to_text_block(span, page_fonts)
-                    if item.text:
-                        blocks.append(item)
+        flags = _pymupdf_text_flags()
+        blocks = _text_blocks_from_pymupdf_dict(page.get_text("dict", flags=flags), page_fonts)
+        if not blocks:
+            blocks = _text_blocks_from_pymupdf_dict(page.get_text("rawdict", flags=flags), page_fonts)
+        if not blocks:
+            for item in page.get_text("words", flags=flags):
+                x0, y0, x1, y1, word, *_rest = item
+                text = (word or "").strip()
+                if not text:
+                    continue
+                height = max(float(y1) - float(y0), 8.0)
+                width = max(float(x1) - float(x0), 8.0)
+                blocks.append(
+                    TextBlock(
+                        text,
+                        float(x0),
+                        float(y1),
+                        width,
+                        height,
+                        height,
+                        bbox=(float(x0), float(y0), float(x1), float(y1)),
+                    )
+                )
+        if not blocks:
+            plain = (page.get_text("text") or "").strip()
+            if plain:
+                rect = page.rect
+                blocks.append(
+                    TextBlock(
+                        plain,
+                        float(rect.x0),
+                        float(rect.y1),
+                        float(rect.width),
+                        float(rect.height),
+                        12.0,
+                        bbox=(float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)),
+                    )
+                )
         return merge_text_blocks(blocks)
     finally:
         document.close()
@@ -619,7 +783,11 @@ def extract_page_text_blocks_pypdf(source: Path, page_index: int, password: str 
 def extract_page_text_blocks(source: Path, page_index: int, password: str = "") -> list[TextBlock]:
     if PYMUPDF_AVAILABLE:
         try:
-            return extract_page_text_blocks_pymupdf(source, page_index, password)
+            blocks = extract_page_text_blocks_pymupdf(source, page_index, password)
+            if blocks:
+                return blocks
+        except ValueError:
+            raise
         except Exception:
             pass
     return extract_page_text_blocks_pypdf(source, page_index, password)
@@ -645,30 +813,58 @@ def text_block_redaction_rect(block: TextBlock, replacement: str = "") -> "fitz.
     return rect
 
 
+def _is_pdf_internal_font_id(font_name: str) -> bool:
+    key = (font_name or "").strip()
+    if not key:
+        return True
+    if "+" in key:
+        return True
+    if len(key) <= 4 and key[:1].isalpha() and key[1:].isdigit():
+        return True
+    return False
+
+
+def _font_file_looks_cjk(font_file: str) -> bool:
+    name = Path(font_file).name.lower()
+    return any(token in name for token in ("msyh", "msjh", "mingliu", "simsun", "simhei", "noto", "cjk", "sourcehan"))
+
+
 def _insert_text_with_block_style(page, block: TextBlock, replacement: str, rect: "fitz.Rect") -> None:
     fontsize = max(block.font_size, 6.0)
     color = block.color_rgb
     kwargs: dict = {"fontsize": fontsize, "color": color, "align": fitz.TEXT_ALIGN_LEFT}
-    if block.page_font_name:
-        kwargs["fontname"] = block.page_font_name
+    bold = bool(block.font_flags & 16) or "bold" in (block.font_name or "").lower()
+    need_cjk = overlay_needs_embedded_font(replacement) or overlay_needs_embedded_font(block.text)
+    fontfile = ""
+    if need_cjk:
+        if block.font_file and _font_file_looks_cjk(block.font_file):
+            fontfile = block.font_file
+        else:
+            fontfile = resolve_cjk_font_file(bold) or ""
+        if fontfile:
+            kwargs["fontfile"] = fontfile
+            kwargs["fontname"] = "edit-cjk"
+        else:
+            kwargs["fontname"] = "china-s"
     elif block.font_file:
         kwargs["fontfile"] = block.font_file
+        kwargs["fontname"] = "edit-latin"
+    elif block.page_font_name and not _is_pdf_internal_font_id(block.page_font_name):
+        kwargs["fontname"] = block.page_font_name
     else:
         kwargs["fontname"] = "helv"
 
-    overflow = page.insert_textbox(rect, replacement, **kwargs)
-    if overflow >= 0:
+    insert_kwargs = {key: value for key, value in kwargs.items() if key != "align"}
+    if "\n" in replacement:
+        overflow = page.insert_textbox(rect, replacement, **kwargs)
+        if overflow < 0:
+            page.insert_text(
+                fitz.Point(rect.x0, min(rect.y1 - 2, rect.y0 + fontsize)),
+                replacement,
+                **insert_kwargs,
+            )
         return
-
-    point = fitz.Point(block.x, block.y)
-    insert_kwargs = {"fontsize": fontsize, "color": color}
-    if block.page_font_name:
-        insert_kwargs["fontname"] = block.page_font_name
-    elif block.font_file:
-        insert_kwargs["fontfile"] = block.font_file
-    else:
-        insert_kwargs["fontname"] = "helv"
-    page.insert_text(point, replacement, **insert_kwargs)
+    page.insert_text(fitz.Point(rect.x0 + 0.5, rect.y0 + fontsize * 0.85), replacement, **insert_kwargs)
 
 
 def replace_text_block_seamless(
@@ -710,6 +906,8 @@ def replace_text_block_seamless(
         page.apply_redactions()
 
         _insert_text_with_block_style(page, block, replacement_text, rect)
+        if hasattr(document, "subset_fonts"):
+            document.subset_fonts()
         document.save(str(target), garbage=4, deflate=True)
     finally:
         document.close()
@@ -760,6 +958,136 @@ def redact_text_block_overlay(
     page = writer.pages[page_index]
     add_annotation_to_page(writer, page, redaction_annotation_for_block(block))
     write_pdf(writer, target)
+
+
+@dataclass(frozen=True)
+class EraseMark:
+    page_index: int
+    kind: str
+    color_rgb: tuple[float, float, float]
+    points: tuple[tuple[float, float], ...]
+    radius: float = 16.0
+
+
+def apply_erase_marks(
+    source: Path,
+    target: Path,
+    marks: list[EraseMark],
+    password: str = "",
+    remove_content: bool = True,
+) -> int:
+    if not marks:
+        raise ValueError("請先用橡皮刷或範圍遮擋標記要處理的位置。")
+    ensure_pymupdf_available()
+    document = None
+    try:
+        document = fitz.open(str(source))
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        grouped: dict[int, list[EraseMark]] = {}
+        for mark in marks:
+            if mark.page_index < 0 or mark.page_index >= document.page_count:
+                raise ValueError("頁碼超出範圍。")
+            grouped.setdefault(mark.page_index, []).append(mark)
+        applied = 0
+        for page_index, page_marks in grouped.items():
+            page = document[page_index]
+            height = float(page.rect.height)
+
+            def to_fitz_rect(x0: float, y0: float, x1: float, y1: float) -> "fitz.Rect":
+                return fitz.Rect(
+                    min(x0, x1),
+                    height - max(y0, y1),
+                    max(x0, x1),
+                    height - min(y0, y1),
+                )
+
+            if remove_content:
+                for mark in page_marks:
+                    fill = mark.color_rgb
+                    if mark.kind == "rect" and len(mark.points) >= 2:
+                        (x0, y0), (x1, y1) = mark.points[0], mark.points[1]
+                        page.add_redact_annot(to_fitz_rect(x0, y0, x1, y1), fill=fill)
+                        applied += 1
+                    else:
+                        radius = max(float(mark.radius), 2.0)
+                        for pdf_x, pdf_y in mark.points:
+                            center_x, center_y = pdf_x, height - pdf_y
+                            page.add_redact_annot(
+                                fitz.Rect(
+                                    center_x - radius,
+                                    center_y - radius,
+                                    center_x + radius,
+                                    center_y + radius,
+                                ),
+                                fill=fill,
+                            )
+                            applied += 1
+                page.apply_redactions()
+            for mark in page_marks:
+                fill = mark.color_rgb
+                if mark.kind == "rect" and len(mark.points) >= 2:
+                    (x0, y0), (x1, y1) = mark.points[0], mark.points[1]
+                    page.draw_rect(to_fitz_rect(x0, y0, x1, y1), color=fill, fill=fill, width=0)
+                    if not remove_content:
+                        applied += 1
+                else:
+                    radius = max(float(mark.radius), 2.0)
+                    for pdf_x, pdf_y in mark.points:
+                        page.draw_circle(
+                            fitz.Point(pdf_x, height - pdf_y),
+                            radius,
+                            color=fill,
+                            fill=fill,
+                            width=0,
+                        )
+                        if not remove_content:
+                            applied += 1
+        temp_target = target.with_name(f"{target.stem}.erase-tmp{target.suffix}")
+        if hasattr(document, "subset_fonts"):
+            document.subset_fonts()
+        document.save(str(temp_target), garbage=4, deflate=True)
+        document.close()
+        document = None
+        temp_target.replace(target)
+        return applied
+    finally:
+        if document is not None:
+            document.close()
+
+
+def apply_erase_then_text_overlays(
+    source: Path,
+    target: Path,
+    marks: list[EraseMark],
+    overlays: list[dict],
+    password: str = "",
+    remove_content: bool = True,
+) -> int:
+    """Erase first, then place text boxes, writing once to target."""
+
+    if not marks and not overlays:
+        raise ValueError("請先用橡皮刷遮擋，或加入文字方塊。")
+    source = Path(source)
+    target = Path(target)
+    if marks and overlays:
+        handle = tempfile.NamedTemporaryFile(suffix=".pdf", prefix="erase_text_", delete=False)
+        handle.close()
+        temp = Path(handle.name)
+        try:
+            applied = apply_erase_marks(source, temp, marks, password, remove_content)
+            add_text_overlay_annotations(temp, target, overlays, password="")
+            return applied
+        finally:
+            try:
+                temp.unlink(missing_ok=True)
+            except OSError:
+                pass
+    if marks:
+        return apply_erase_marks(source, target, marks, password, remove_content)
+    add_text_overlay_annotations(source, target, overlays, password)
+    return 0
 
 
 def redaction_annotation_for_block(block: TextBlock) -> DictionaryObject:
@@ -1615,6 +1943,7 @@ def office_files_to_pdf(
 
 
 ANNOTATION_FONT_OPTIONS = {
+    "cjk": ("Helv", "Helv-Bold"),
     "helvetica": ("Helv", "Helv-Bold"),
     "times": ("Times-Roman", "Times-Bold"),
     "courier": ("Courier", "Courier-Bold"),
@@ -1627,6 +1956,26 @@ ANNOTATION_COLOR_PRESETS: dict[str, tuple[float, float, float]] = {
     "gray": (0.4, 0.4, 0.4),
 }
 
+ANNOTATION_FILL_PRESETS: dict[str, tuple[float, float, float] | None] = {
+    "white": (1.0, 1.0, 1.0),
+    "none": None,
+    "yellow": (1.0, 0.96, 0.72),
+    "blue": (0.86, 0.93, 1.0),
+    "green": (0.86, 0.96, 0.86),
+}
+
+
+def resolve_annotation_fill(
+    color_rgb: tuple[float, float, float],
+    fill_rgb: tuple[float, float, float] | None = None,
+    fill_none: bool = False,
+) -> tuple[float, float, float] | None:
+    if fill_none:
+        return None
+    if fill_rgb is not None:
+        return fill_rgb
+    return tuple(channel * 0.22 + 0.78 for channel in color_rgb)
+
 
 def build_annotation_da(
     font_key: str,
@@ -1638,6 +1987,88 @@ def build_annotation_da(
     font_name = bold_name if bold else regular
     red, green, blue = color_rgb
     return f"/{font_name} {font_size} Tf {red} {green} {blue} rg"
+
+
+def text_contains_cjk(text: str) -> bool:
+    return any(
+        "\u3400" <= char <= "\u9fff" or "\uf900" <= char <= "\ufaff" or "\u3000" <= char <= "\u303f"
+        for char in text or ""
+    )
+
+
+def overlay_needs_embedded_font(text: str, font_key: str = "") -> bool:
+    key = (font_key or "").strip().lower()
+    return key in {"cjk", "yahei", "mingliu"} or text_contains_cjk(text)
+
+
+def resolve_cjk_font_file(bold: bool = False) -> str | None:
+    fonts_dir = Path("C:/Windows/Fonts")
+    names: list[str] = []
+    if bold:
+        names.extend(["msjhbd.ttc", "msyhbd.ttc"])
+    names.extend(["msjh.ttc", "msyh.ttc", "mingliu.ttc", "simsun.ttc"])
+    for name in names:
+        path = fonts_dir / name
+        if path.is_file():
+            return str(path)
+    return None
+
+
+def _embed_overlay_text(
+    target: Path,
+    page_index: int,
+    x: float,
+    y: float,
+    width: float,
+    height: float,
+    text: str,
+    font_size: int,
+    bold: bool,
+    color_rgb: tuple[float, float, float],
+    password: str = "",
+) -> None:
+    ensure_pymupdf_available()
+    document = None
+    try:
+        document = fitz.open(str(target))
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{target.name} 已加密，請輸入密碼。")
+        page = document[page_index]
+        page_height = float(page.rect.height)
+        rect = fitz.Rect(x + 2, page_height - (y + height) + 1, x + width - 2, page_height - y - 1)
+        kwargs: dict = {
+            "color": color_rgb,
+            "align": fitz.TEXT_ALIGN_LEFT,
+        }
+        fontfile = resolve_cjk_font_file(bold)
+        if fontfile:
+            kwargs["fontfile"] = fontfile
+            kwargs["fontname"] = "overlay-cjk"
+        else:
+            kwargs["fontname"] = "china-t"
+        fontsize = float(max(font_size, 8))
+        unused = page.insert_textbox(rect, text, fontsize=fontsize, **kwargs)
+        if unused < 0:
+            for size in range(int(fontsize) - 1, 7, -1):
+                unused = page.insert_textbox(rect, text, fontsize=float(size), **kwargs)
+                if unused >= 0:
+                    fontsize = float(size)
+                    break
+        if unused < 0:
+            point = fitz.Point(rect.x0, min(rect.y1 - 1, rect.y0 + fontsize))
+            insert_kwargs = {key: value for key, value in kwargs.items() if key != "align"}
+            page.insert_text(point, text, fontsize=max(fontsize * 0.75, 8), **insert_kwargs)
+        if hasattr(document, "subset_fonts"):
+            document.subset_fonts()
+        temp_target = target.with_name(f"{target.stem}.overlay-tmp{target.suffix}")
+        document.save(str(temp_target), garbage=4, deflate=True)
+        document.close()
+        document = None
+        temp_target.replace(target)
+    finally:
+        if document is not None:
+            document.close()
 
 
 def rgb_to_hex(color_rgb: tuple[float, float, float]) -> str:
@@ -1673,6 +2104,8 @@ def add_text_overlay_annotation(
     color_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0),
     shape: str = "box",
     pointer: tuple[float, float] | None = None,
+    fill_rgb: tuple[float, float, float] | None = None,
+    fill_none: bool = False,
 ) -> None:
     reader = open_reader(source, password)
     if page_index < 0 or page_index >= len(reader.pages):
@@ -1688,6 +2121,7 @@ def add_text_overlay_annotation(
     rect_height = max(float(cover_height), text_height)
 
     shape = (shape or "box").strip().lower()
+    embed_text = overlay_needs_embedded_font(text, font_key)
     if shape in CALLOUT_KINDS:
         pointer_x, pointer_y = pointer if pointer is not None else (x + rect_width / 2.0, y - 16.0)
         markup = MarkupAnnotation(
@@ -1697,20 +2131,38 @@ def add_text_overlay_annotation(
             x1=x,
             y1=y,
             color_rgb=color_rgb,
-            contents=text,
+            contents="" if embed_text else text,
             box_width=rect_width,
             box_height=rect_height,
+            fill_rgb=fill_rgb,
+            fill_none=fill_none,
         )
         da = build_annotation_da(font_key, font_size, bold, color_rgb)
         for annotation in iter_markup_pdf_annotations(markup):
             if annotation.get("/Subtype") == "/FreeText":
+                if embed_text:
+                    annotation[NameObject("/Contents")] = TextStringObject("")
                 annotation[NameObject("/DA")] = TextStringObject(da)
             add_annotation_to_page(writer, page, annotation)
         write_pdf(writer, target)
+        if embed_text:
+            _embed_overlay_text(
+                target,
+                page_index,
+                x,
+                y,
+                rect_width,
+                rect_height,
+                text,
+                font_size,
+                bold,
+                color_rgb,
+                password,
+            )
         return
 
     if shape == "rect":
-        fill = tuple(channel * 0.18 + 0.82 for channel in color_rgb)
+        fill = resolve_annotation_fill(color_rgb, fill_rgb, fill_none)
         frame = DictionaryObject(
             {
                 NameObject("/Type"): NameObject("/Annot"),
@@ -1724,11 +2176,12 @@ def add_text_overlay_annotation(
                     ]
                 ),
                 NameObject("/C"): _color_array(color_rgb),
-                NameObject("/IC"): _color_array(fill),
                 NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), FloatObject(1.5)]),
                 NameObject("/F"): NumberObject(4),
             }
         )
+        if fill is not None:
+            frame[NameObject("/IC")] = _color_array(fill)
         add_annotation_to_page(writer, page, frame)
         cover_original = False
 
@@ -1753,26 +2206,96 @@ def add_text_overlay_annotation(
         )
         add_annotation_to_page(writer, page, cover)
 
-    free_text = DictionaryObject(
-        {
-            NameObject("/Type"): NameObject("/Annot"),
-            NameObject("/Subtype"): NameObject("/FreeText"),
-            NameObject("/Rect"): ArrayObject(
-                [
-                    FloatObject(x),
-                    FloatObject(y),
-                    FloatObject(x + rect_width),
-                    FloatObject(y + rect_height),
-                ]
-            ),
-            NameObject("/Contents"): TextStringObject(text),
-            NameObject("/DA"): TextStringObject(build_annotation_da(font_key, font_size, bold, color_rgb)),
-            NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
-            NameObject("/F"): NumberObject(4),
-        }
-    )
-    add_annotation_to_page(writer, page, free_text)
+    if not embed_text:
+        free_text = DictionaryObject(
+            {
+                NameObject("/Type"): NameObject("/Annot"),
+                NameObject("/Subtype"): NameObject("/FreeText"),
+                NameObject("/Rect"): ArrayObject(
+                    [
+                        FloatObject(x),
+                        FloatObject(y),
+                        FloatObject(x + rect_width),
+                        FloatObject(y + rect_height),
+                    ]
+                ),
+                NameObject("/Contents"): TextStringObject(text),
+                NameObject("/DA"): TextStringObject(build_annotation_da(font_key, font_size, bold, color_rgb)),
+                NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
+                NameObject("/F"): NumberObject(4),
+            }
+        )
+        add_annotation_to_page(writer, page, free_text)
     write_pdf(writer, target)
+    if embed_text:
+        _embed_overlay_text(
+            target,
+            page_index,
+            x,
+            y,
+            rect_width,
+            rect_height,
+            text,
+            font_size,
+            bold,
+            color_rgb,
+            password,
+        )
+
+
+def add_text_overlay_annotations(
+    source: Path,
+    target: Path,
+    overlays: list[dict],
+    password: str = "",
+) -> None:
+    if not overlays:
+        raise ValueError("請先加入至少一筆文字標註。")
+    source = Path(source)
+    target = Path(target)
+    current = source
+    temps: list[Path] = []
+    try:
+        for index, overlay in enumerate(overlays):
+            is_last = index == len(overlays) - 1
+            if is_last:
+                out = target
+            else:
+                handle = tempfile.NamedTemporaryFile(suffix=".pdf", prefix=f"ann{index}_", delete=False)
+                handle.close()
+                out = Path(handle.name)
+                temps.append(out)
+            shape = str(overlay.get("shape") or "box")
+            pointer = None
+            if shape in CALLOUT_KINDS:
+                pointer = (float(overlay["pointer_x"]), float(overlay["pointer_y"]))
+            add_text_overlay_annotation(
+                source=current,
+                target=out,
+                page_index=int(overlay["page_index"]),
+                x=float(overlay["pdf_x"]),
+                y=float(overlay["pdf_y"]),
+                text=str(overlay["text"]),
+                font_size=int(overlay["font_size"]),
+                cover_original=bool(overlay.get("cover")),
+                cover_width=float(overlay["rect_width"]),
+                cover_height=float(overlay["rect_height"]),
+                password=password if current == source else "",
+                font_key=str(overlay.get("font_key") or "helvetica"),
+                bold=bool(overlay.get("bold")),
+                color_rgb=tuple(overlay.get("color_rgb") or (0.0, 0.0, 0.0)),
+                shape=shape,
+                pointer=pointer,
+                fill_rgb=tuple(overlay["fill_rgb"]) if overlay.get("fill_rgb") is not None else None,
+                fill_none=bool(overlay.get("fill_none")),
+            )
+            current = out
+    finally:
+        for path in temps:
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def add_page_numbers(source: Path, target: Path, template: str = "Page {page} of {total}", password: str = "") -> None:
@@ -1802,34 +2325,201 @@ def add_page_numbers(source: Path, target: Path, template: str = "Page {page} of
     write_pdf(writer, target)
 
 
-def add_watermark(source: Path, target: Path, text: str, password: str = "") -> None:
-    if not text.strip():
+WATERMARK_POSITIONS = {
+    "center": "正中",
+    "top-left": "左上",
+    "top-center": "上中",
+    "top-right": "右上",
+    "middle-left": "左中",
+    "middle-right": "右中",
+    "bottom-left": "左下",
+    "bottom-center": "下中",
+    "bottom-right": "右下",
+    "custom": "自訂座標（左 % / 上 %）",
+}
+
+WATERMARK_ROTATIONS = (
+    (45, "斜向 45°（Word 預設）"),
+    (0, "水平"),
+    (30, "斜向 30°"),
+    (60, "斜向 60°"),
+    (-45, "反向斜向 -45°"),
+    (90, "直向 90°"),
+)
+
+WATERMARK_COLORS = {
+    "gray": ((0.55, 0.55, 0.55), "灰色"),
+    "light-gray": ((0.75, 0.75, 0.75), "淺灰"),
+    "red": ((0.72, 0.16, 0.16), "紅色"),
+    "blue": ((0.16, 0.28, 0.68), "藍色"),
+    "black": ((0.18, 0.18, 0.18), "黑色"),
+}
+
+_WATERMARK_ANCHORS = {
+    "center": ("center", "middle"),
+    "top-left": ("left", "top"),
+    "top-center": ("center", "top"),
+    "top-right": ("right", "top"),
+    "middle-left": ("left", "middle"),
+    "middle-right": ("right", "middle"),
+    "bottom-left": ("left", "bottom"),
+    "bottom-center": ("center", "bottom"),
+    "bottom-right": ("right", "bottom"),
+}
+
+
+def _watermark_insert_kwargs(text: str) -> tuple[dict, Callable[[float], float]]:
+    kwargs: dict = {}
+    if overlay_needs_embedded_font(text):
+        fontfile = resolve_cjk_font_file(False)
+        if fontfile:
+            kwargs["fontfile"] = fontfile
+            kwargs["fontname"] = "wm-cjk"
+            font = fitz.Font(fontfile=fontfile)
+
+            def width_at(size: float, _font=font) -> float:
+                return float(_font.text_length(text, fontsize=size))
+
+            return kwargs, width_at
+        kwargs["fontname"] = "china-t"
+
+        def width_at(size: float) -> float:
+            return float(fitz.get_text_length(text, fontname="china-t", fontsize=size))
+
+        return kwargs, width_at
+    kwargs["fontname"] = "helv"
+
+    def width_at(size: float) -> float:
+        return float(fitz.get_text_length(text, fontname="helv", fontsize=size))
+
+    return kwargs, width_at
+
+
+def _watermark_pivot(
+    page_rect,
+    position: str,
+    text_width: float,
+    font_size: float,
+    rotation: float,
+    x_percent: float | None = None,
+    y_percent: float | None = None,
+):
+    width = float(page_rect.width)
+    height = float(page_rect.height)
+    if position == "custom":
+        xp = 50.0 if x_percent is None else float(x_percent)
+        yp = 50.0 if y_percent is None else float(y_percent)
+        xp = min(max(xp, 0.0), 100.0)
+        yp = min(max(yp, 0.0), 100.0)
+        return fitz.Point(width * xp / 100.0, height * yp / 100.0)
+
+    if position not in _WATERMARK_ANCHORS:
+        raise ValueError("不支援的浮水印位置。")
+
+    rad = math.radians(rotation)
+    box_w = abs(text_width * math.cos(rad)) + abs(font_size * math.sin(rad))
+    box_h = abs(text_width * math.sin(rad)) + abs(font_size * math.cos(rad))
+    half_w = box_w / 2.0
+    half_h = box_h / 2.0
+    margin = 48.0
+    horiz, vert = _WATERMARK_ANCHORS[position]
+    if horiz == "left":
+        x = margin + half_w
+    elif horiz == "right":
+        x = width - margin - half_w
+    else:
+        x = width / 2.0
+    if vert == "top":
+        y = margin + half_h
+    elif vert == "bottom":
+        y = height - margin - half_h
+    else:
+        y = height / 2.0
+    return fitz.Point(min(max(x, margin), width - margin), min(max(y, margin), height - margin))
+
+
+def add_watermark(
+    source: Path,
+    target: Path,
+    text: str,
+    password: str = "",
+    position: str = "center",
+    rotation: int = 45,
+    font_size: int = 48,
+    opacity: float = 0.25,
+    color_rgb: tuple[float, float, float] = (0.55, 0.55, 0.55),
+    pages_spec: str = "",
+    x_percent: float | None = None,
+    y_percent: float | None = None,
+) -> int:
+    """Draw a Word-style text watermark on selected pages."""
+
+    stamp = (text or "").strip()
+    if not stamp:
         raise ValueError("請輸入水印 / 印章文字。")
-    reader = open_reader(source, password)
-    writer = PdfWriter()
-    writer.append_pages_from_reader(reader)
-    for page in writer.pages:
-        width = float(page.mediabox.width)
-        height = float(page.mediabox.height)
-        rect_width = min(max(len(text) * 18.0, 240.0), max(width - 72.0, 180.0))
-        rect_height = 70.0
-        x = max((width - rect_width) / 2, 24.0)
-        y = max((height - rect_height) / 2, 24.0)
-        annotation = DictionaryObject(
-            {
-                NameObject("/Type"): NameObject("/Annot"),
-                NameObject("/Subtype"): NameObject("/FreeText"),
-                NameObject("/Rect"): ArrayObject(
-                    [FloatObject(x), FloatObject(y), FloatObject(x + rect_width), FloatObject(y + rect_height)]
-                ),
-                NameObject("/Contents"): TextStringObject(text),
-                NameObject("/DA"): TextStringObject("/Helv 34 Tf 0.75 0.75 0.75 rg"),
-                NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), NumberObject(0)]),
-                NameObject("/F"): NumberObject(4),
-            }
+    if position not in WATERMARK_POSITIONS:
+        raise ValueError("不支援的浮水印位置。")
+    ensure_pymupdf_available()
+    fontsize = float(min(max(int(font_size), 6), 144))
+    alpha = min(max(float(opacity), 0.05), 1.0)
+    angle = float(rotation)
+    red, green, blue = color_rgb
+    color = (
+        min(max(float(red), 0.0), 1.0),
+        min(max(float(green), 0.0), 1.0),
+        min(max(float(blue), 0.0), 1.0),
+    )
+    font_kwargs, width_at = _watermark_insert_kwargs(stamp)
+    text_width = max(width_at(fontsize), 8.0)
+
+    document = fitz.open(str(source))
+    try:
+        if document.is_encrypted:
+            if not password or document.authenticate(password) == 0:
+                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+        page_indexes = (
+            parse_pages(pages_spec, document.page_count)
+            if (pages_spec or "").strip()
+            else list(range(document.page_count))
         )
-        add_annotation_to_page(writer, page, annotation)
-    write_pdf(writer, target)
+        if not page_indexes:
+            raise ValueError("沒有可加入浮水印的頁面。")
+        rotate = abs(angle) % 360.0 > 0.01
+        matrix = fitz.Matrix(1, 1).prerotate(angle) if rotate else None
+        for page_index in page_indexes:
+            page = document[page_index]
+            page_size = fontsize
+            page_width = text_width
+            max_width = min(float(page.rect.width), float(page.rect.height)) * 0.85
+            if page_width > max_width:
+                page_size = max(6.0, fontsize * (max_width / page_width))
+                page_width = max(width_at(page_size), 8.0)
+            pivot = _watermark_pivot(
+                page.rect,
+                position,
+                page_width,
+                page_size,
+                angle,
+                x_percent=x_percent,
+                y_percent=y_percent,
+            )
+            start = fitz.Point(pivot.x - page_width / 2.0, pivot.y + page_size * 0.35)
+            insert_kwargs = {
+                "fontsize": page_size,
+                "color": color,
+                "fill_opacity": alpha,
+                "overlay": True,
+                **font_kwargs,
+            }
+            if matrix is not None:
+                insert_kwargs["morph"] = (pivot, matrix)
+            page.insert_text(start, stamp, **insert_kwargs)
+        if overlay_needs_embedded_font(stamp) and hasattr(document, "subset_fonts"):
+            document.subset_fonts()
+        document.save(str(target), garbage=4, deflate=True)
+        return len(page_indexes)
+    finally:
+        document.close()
 
 
 def rendered_page_is_blank(page, threshold: int) -> bool:
@@ -1970,7 +2660,7 @@ MARKUP_SUBTYPES = {
     "cloud": "/Polygon",
 }
 
-CALLOUT_KINDS = frozenset({"callout", "speech", "cloud"})
+CALLOUT_KINDS = frozenset({"callout", "speech", "cloud", "comment"})
 
 MARKUP_COLOR_PRESETS: dict[str, tuple[float, float, float]] = {
     "yellow": (1.0, 0.92, 0.23),
@@ -2000,6 +2690,8 @@ class MarkupAnnotation:
     contents: str = ""
     box_width: float = 0.0
     box_height: float = 0.0
+    fill_rgb: tuple[float, float, float] | None = None
+    fill_none: bool = False
 
 
 @dataclass(frozen=True)
@@ -2012,6 +2704,7 @@ class CalloutLayout:
     attach: tuple[float, float]
     vertices: tuple[tuple[float, float], ...]
     text: str
+    path: tuple[tuple[float, float], ...] = ()
 
 
 def _normalized_rect(x0: float, y0: float, x1: float, y1: float) -> tuple[float, float, float, float]:
@@ -2129,10 +2822,14 @@ def callout_layout(markup: MarkupAnnotation) -> CalloutLayout:
         if markup.kind == "cloud"
         else _speech_vertices(left, bottom, right, top, px, py)
     )
-    return CalloutLayout((px, py), left, bottom, right, top, attach, vertices, text)
+    path = comment_polyline(left, bottom, right, top, px, py) if markup.kind == "comment" else ()
+    return CalloutLayout((px, py), left, bottom, right, top, attach, vertices, text, path)
 
 
 CALLOUT_POINTER_GAP = 18.0
+COMMENT_STUB = 16.0
+COMMENT_ARM = 80.0
+COMMENT_TIP = 12.0
 
 
 def callout_box_from_pointer(
@@ -2147,6 +2844,64 @@ def callout_box_from_pointer(
     return (pointer_x - max(float(rect_width), 1.0) / 2.0, pointer_y + gap)
 
 
+def comment_box_from_pointer(
+    pointer_x: float,
+    pointer_y: float,
+    rect_width: float,
+    rect_height: float,
+    arm: float = COMMENT_ARM,
+    stub: float = COMMENT_STUB,
+    tip: float = COMMENT_TIP,
+) -> tuple[float, float]:
+    """Place the note box above-right of the arrow so the cranked arm is visible."""
+
+    width = max(float(rect_width), 1.0)
+    box_bottom = pointer_y + stub + tip
+    center_x = pointer_x + arm
+    return (center_x - width / 2.0, box_bottom)
+
+
+def comment_polyline(
+    left: float,
+    bottom: float,
+    right: float,
+    top: float,
+    pointer_x: float,
+    pointer_y: float,
+    stub: float = COMMENT_STUB,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float], tuple[float, float]]:
+    """Box-bottom → drop → horizontal arm → arrow tip."""
+
+    center_x = (left + right) / 2.0
+    if pointer_y <= bottom - 4:
+        knee_y = min(bottom - stub, (bottom + pointer_y) / 2.0)
+        knee_y = max(pointer_y + 8.0, knee_y)
+        attach = (center_x, bottom)
+        return (attach, (center_x, knee_y), (pointer_x, knee_y), (pointer_x, pointer_y))
+    if pointer_y >= top + 4:
+        knee_y = max(top + stub, (top + pointer_y) / 2.0)
+        knee_y = min(pointer_y - 8.0, knee_y)
+        attach = (center_x, top)
+        return (attach, (center_x, knee_y), (pointer_x, knee_y), (pointer_x, pointer_y))
+    knee_y = bottom - stub
+    return ((center_x, bottom), (center_x, knee_y), (pointer_x, knee_y), (pointer_x, pointer_y))
+
+
+def _polyline_arrowhead(
+    tip: tuple[float, float],
+    previous: tuple[float, float],
+    size: float = 8.0,
+) -> tuple[tuple[float, float], tuple[float, float], tuple[float, float]]:
+    dx = tip[0] - previous[0]
+    dy = tip[1] - previous[1]
+    length = math.hypot(dx, dy) or 1.0
+    ux, uy = dx / length, dy / length
+    base_x = tip[0] - ux * size
+    base_y = tip[1] - uy * size
+    px, py = -uy * size * 0.55, ux * size * 0.55
+    return (tip, (base_x + px, base_y + py), (base_x - px, base_y - py))
+
+
 def paint_callout_markup(draw, markup: MarkupAnnotation, to_image, draw_text: bool = True) -> None:
     """Draw a callout / speech / cloud shape onto a PIL overlay."""
 
@@ -2154,12 +2909,15 @@ def paint_callout_markup(draw, markup: MarkupAnnotation, to_image, draw_text: bo
 
     layout = callout_layout(markup)
     red, green, blue = (int(max(0.0, min(channel, 1.0)) * 255) for channel in markup.color_rgb)
-    fill = (
-        int(red * 0.22 + 255 * 0.78),
-        int(green * 0.22 + 255 * 0.78),
-        int(blue * 0.22 + 255 * 0.78),
-        230,
-    )
+    fill_rgb = resolve_annotation_fill(markup.color_rgb, markup.fill_rgb, markup.fill_none)
+    fill = None
+    if fill_rgb is not None:
+        fill = (
+            int(fill_rgb[0] * 255),
+            int(fill_rgb[1] * 255),
+            int(fill_rgb[2] * 255),
+            230,
+        )
     outline = (red, green, blue, 255)
 
     def image_point(x: float, y: float) -> tuple[float, float]:
@@ -2168,8 +2926,21 @@ def paint_callout_markup(draw, markup: MarkupAnnotation, to_image, draw_text: bo
     p1 = image_point(layout.left, layout.top)
     p2 = image_point(layout.right, layout.bottom)
     box = (min(p1[0], p2[0]), min(p1[1], p2[1]), max(p1[0], p2[0]), max(p1[1], p2[1]))
-    if markup.kind == "callout":
-        draw.rectangle(box, fill=fill, outline=outline, width=2)
+    if markup.kind == "comment":
+        if fill is None:
+            draw.rectangle(box, outline=outline, width=2)
+        else:
+            draw.rectangle(box, fill=fill, outline=outline, width=2)
+        path = [image_point(x, y) for x, y in layout.path]
+        if len(path) >= 2:
+            draw.line(path, fill=outline, width=2)
+            head = _polyline_arrowhead(layout.path[-1], layout.path[-2])
+            draw.polygon([image_point(x, y) for x, y in head], fill=outline)
+    elif markup.kind == "callout":
+        if fill is None:
+            draw.rectangle(box, outline=outline, width=2)
+        else:
+            draw.rectangle(box, fill=fill, outline=outline, width=2)
         pointer = image_point(*layout.pointer)
         attach = image_point(*layout.attach)
         draw.line([attach, pointer], fill=outline, width=2)
@@ -2183,7 +2954,10 @@ def paint_callout_markup(draw, markup: MarkupAnnotation, to_image, draw_text: bo
             fill=outline,
         )
     else:
-        draw.polygon([image_point(x, y) for x, y in layout.vertices], fill=fill, outline=outline)
+        if fill is None:
+            draw.polygon([image_point(x, y) for x, y in layout.vertices], outline=outline)
+        else:
+            draw.polygon([image_point(x, y) for x, y in layout.vertices], fill=fill, outline=outline)
     if not draw_text:
         return
     try:
@@ -2196,7 +2970,8 @@ def paint_callout_markup(draw, markup: MarkupAnnotation, to_image, draw_text: bo
 def _build_freetext_callout(markup: MarkupAnnotation) -> DictionaryObject:
     layout = callout_layout(markup)
     color = _color_array(markup.color_rgb)
-    return DictionaryObject(
+    fill = resolve_annotation_fill(markup.color_rgb, markup.fill_rgb, markup.fill_none)
+    annotation = DictionaryObject(
         {
             NameObject("/Type"): NameObject("/Annot"),
             NameObject("/Subtype"): NameObject("/FreeText"),
@@ -2227,6 +3002,9 @@ def _build_freetext_callout(markup: MarkupAnnotation) -> DictionaryObject:
             NameObject("/F"): NumberObject(4),
         }
     )
+    if fill is not None:
+        annotation[NameObject("/IC")] = _color_array(fill)
+    return annotation
 
 
 def _build_shape_polygon(markup: MarkupAnnotation) -> DictionaryObject:
@@ -2237,7 +3015,7 @@ def _build_shape_polygon(markup: MarkupAnnotation) -> DictionaryObject:
         vertices.append(FloatObject(y))
     xs = [point[0] for point in layout.vertices]
     ys = [point[1] for point in layout.vertices]
-    fill = tuple(channel * 0.22 + 1.0 * 0.78 for channel in markup.color_rgb)
+    fill = resolve_annotation_fill(markup.color_rgb, markup.fill_rgb, markup.fill_none)
     annotation = DictionaryObject(
         {
             NameObject("/Type"): NameObject("/Annot"),
@@ -2252,12 +3030,13 @@ def _build_shape_polygon(markup: MarkupAnnotation) -> DictionaryObject:
             ),
             NameObject("/Vertices"): vertices,
             NameObject("/C"): _color_array(markup.color_rgb),
-            NameObject("/IC"): _color_array(fill),
             NameObject("/BS"): DictionaryObject({NameObject("/W"): NumberObject(1)}),
             NameObject("/Contents"): TextStringObject(layout.text),
             NameObject("/F"): NumberObject(4),
         }
     )
+    if fill is not None:
+        annotation[NameObject("/IC")] = _color_array(fill)
     if markup.kind == "cloud":
         annotation[NameObject("/BE")] = DictionaryObject(
             {NameObject("/S"): NameObject("/C"), NameObject("/I"): NumberObject(1)}
@@ -2267,7 +3046,8 @@ def _build_shape_polygon(markup: MarkupAnnotation) -> DictionaryObject:
 
 def _build_box_freetext(markup: MarkupAnnotation) -> DictionaryObject:
     layout = callout_layout(markup)
-    return DictionaryObject(
+    fill = resolve_annotation_fill(markup.color_rgb, markup.fill_rgb, markup.fill_none)
+    annotation = DictionaryObject(
         {
             NameObject("/Type"): NameObject("/Annot"),
             NameObject("/Subtype"): NameObject("/FreeText"),
@@ -2281,14 +3061,79 @@ def _build_box_freetext(markup: MarkupAnnotation) -> DictionaryObject:
             ),
             NameObject("/Contents"): TextStringObject(layout.text),
             NameObject("/DA"): TextStringObject("/Helv 10 Tf 0 0 0 rg"),
-            NameObject("/C"): _color_array((1.0, 1.0, 1.0)),
             NameObject("/BS"): DictionaryObject({NameObject("/W"): NumberObject(0)}),
+            NameObject("/F"): NumberObject(4),
+        }
+    )
+    if fill is not None:
+        annotation[NameObject("/C")] = _color_array(fill)
+    return annotation
+
+
+def _build_comment_square(markup: MarkupAnnotation) -> DictionaryObject:
+    layout = callout_layout(markup)
+    fill = resolve_annotation_fill(markup.color_rgb, markup.fill_rgb, markup.fill_none)
+    annotation = DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/Square"),
+            NameObject("/Rect"): ArrayObject(
+                [
+                    FloatObject(layout.left),
+                    FloatObject(layout.bottom),
+                    FloatObject(layout.right),
+                    FloatObject(layout.top),
+                ]
+            ),
+            NameObject("/C"): _color_array(markup.color_rgb),
+            NameObject("/Border"): ArrayObject([NumberObject(0), NumberObject(0), FloatObject(1.5)]),
+            NameObject("/F"): NumberObject(4),
+        }
+    )
+    if fill is not None:
+        annotation[NameObject("/IC")] = _color_array(fill)
+    return annotation
+
+
+def _build_comment_polyline(markup: MarkupAnnotation) -> DictionaryObject:
+    layout = callout_layout(markup)
+    points = layout.path or (layout.attach, layout.pointer)
+    vertices = ArrayObject()
+    xs: list[float] = []
+    ys: list[float] = []
+    for x, y in points:
+        vertices.append(FloatObject(x))
+        vertices.append(FloatObject(y))
+        xs.append(x)
+        ys.append(y)
+    pad = 12.0
+    return DictionaryObject(
+        {
+            NameObject("/Type"): NameObject("/Annot"),
+            NameObject("/Subtype"): NameObject("/PolyLine"),
+            NameObject("/Rect"): ArrayObject(
+                [
+                    FloatObject(min(xs) - pad),
+                    FloatObject(min(ys) - pad),
+                    FloatObject(max(xs) + pad),
+                    FloatObject(max(ys) + pad),
+                ]
+            ),
+            NameObject("/Vertices"): vertices,
+            NameObject("/LE"): ArrayObject([NameObject("/None"), NameObject("/ClosedArrow")]),
+            NameObject("/C"): _color_array(markup.color_rgb),
+            NameObject("/IC"): _color_array(markup.color_rgb),
+            NameObject("/BS"): DictionaryObject(
+                {NameObject("/W"): FloatObject(1.5), NameObject("/S"): NameObject("/S")}
+            ),
             NameObject("/F"): NumberObject(4),
         }
     )
 
 
 def iter_markup_pdf_annotations(markup: MarkupAnnotation) -> list[DictionaryObject]:
+    if markup.kind == "comment":
+        return [_build_comment_square(markup), _build_comment_polyline(markup), _build_box_freetext(markup)]
     if markup.kind in {"speech", "cloud"}:
         return [_build_shape_polygon(markup), _build_box_freetext(markup)]
     return [build_markup_annotation(markup)]
