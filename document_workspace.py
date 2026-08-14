@@ -69,6 +69,7 @@ from pdf_core import (
     apply_text_markups_for_query,
     CALLOUT_KINDS,
     paint_callout_markup,
+    callout_layout,
     compress_pdf_advanced,
     compare_pdf_text,
     compare_pdf_visual,
@@ -156,12 +157,14 @@ class WorkspacePreviewLabel(PreviewImageLabel):
     copyRequested = Signal()
     pasteRequested = Signal()
     undoRequested = Signal()
+    deleteRequested = Signal()
 
     def __init__(self, page_index: int = 0) -> None:
         super().__init__()
         self.setFocusPolicy(Qt.StrongFocus)
         self.page_index = page_index
         self.band_color = QColor(18, 133, 118)
+        self.pending_box_delete = False
         self._start: QPoint | None = None
         self._current: QPoint | None = None
 
@@ -201,6 +204,10 @@ class WorkspacePreviewLabel(PreviewImageLabel):
             return
         if event.matches(QKeySequence.Undo):
             self.undoRequested.emit()
+            event.accept()
+            return
+        if event.key() in (Qt.Key_Delete, Qt.Key_Backspace) and not (event.modifiers() & ~Qt.KeypadModifier):
+            self.deleteRequested.emit()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -540,6 +547,7 @@ class DocumentWorkspace(QWidget):
         self.preview_widget.copyRequested.connect(self.copy_markup_item)
         self.preview_widget.pasteRequested.connect(self.paste_markup_item)
         self.preview_widget.undoRequested.connect(self.undo)
+        self.preview_widget.deleteRequested.connect(self.delete_selected_item)
         self.preview_scroll.setWidget(self.preview_widget)
         center.addWidget(self.preview_scroll, 1)
         center_host = QWidget()
@@ -729,6 +737,7 @@ class DocumentWorkspace(QWidget):
         layout.addWidget(QLabel("註解文字（標註框 / 對話框 / 便利貼）"))
         self.markup_note_input = QLineEdit()
         self.markup_note_input.setPlaceholderText("例如：請核對此數字")
+        self.markup_note_input.installEventFilter(self)
         layout.addWidget(self.markup_note_input)
         hint = QLabel(
             "標註框／對話框／雲朵／附註：從要指出的位置拉到文字框；便利貼則單擊放置。"
@@ -943,6 +952,15 @@ class DocumentWorkspace(QWidget):
         self.preview_scroll.installEventFilter(self)
 
     def eventFilter(self, obj, event) -> bool:
+        if obj is self.markup_note_input:
+            if event.type() == event.Type.MouseButtonPress:
+                self.preview_widget.pending_box_delete = False
+            elif event.type() in (event.Type.KeyPress, event.Type.ShortcutOverride) and event.matches(QKeySequence.Undo):
+                if event.type() == event.Type.ShortcutOverride:
+                    event.accept()
+                    return True
+                self.undo()
+                return True
         if obj is self.preview_scroll and event.type() == event.Type.Wheel:
             if event.modifiers() & Qt.ControlModifier:
                 delta = event.angleDelta().y()
@@ -1495,6 +1513,13 @@ class DocumentWorkspace(QWidget):
     def _on_preview_point_clicked(self, point: QPoint) -> None:
         interaction = self.interaction
         if interaction == "annotate":
+            hit = self._markup_text_item_at_point(point)
+            if hit is not None:
+                self.markup_pending_list.setCurrentRow(hit)
+                self.preview_widget.pending_box_delete = True
+                self.preview_widget.setFocus(Qt.MouseFocusReason)
+                self._emit_status("已選取標註，按 Delete 刪除。")
+                return
             self._add_markup_from_point(point)
         elif interaction == "edit":
             self._select_text_block_at_point(point)
@@ -1626,6 +1651,42 @@ class DocumentWorkspace(QWidget):
         pdf_x = ix / image_width * page_width
         pdf_y = page_height - (iy / image_height * page_height)
         return (pdf_x, pdf_y)
+
+    def _markup_item_image_rect(self, markup: MarkupAnnotation) -> QRect:
+        page_width, page_height = self.page_size
+        image = self.preview_image
+        if image is None or page_width <= 0 or page_height <= 0:
+            return QRect()
+        image_width, image_height = image.size
+
+        def to_img(x: float, y: float) -> QPoint:
+            return QPoint(
+                int(round(x / page_width * image_width)),
+                int(round((page_height - y) / page_height * image_height)),
+            )
+
+        if markup.kind in CALLOUT_KINDS:
+            layout = callout_layout(markup)
+            return QRect(to_img(layout.left, layout.top), to_img(layout.right, layout.bottom)).normalized()
+        if markup.kind == "note":
+            origin = to_img(markup.x0, markup.y0)
+            return QRect(origin.x(), origin.y() - 16, 16, 16)
+        return QRect(to_img(markup.x0, markup.y0), to_img(markup.x1, markup.y1)).normalized()
+
+    def _markup_text_item_at_point(self, point: QPoint) -> int | None:
+        for index in range(len(self.markup_items) - 1, -1, -1):
+            page_index, markup = self.markup_items[index]
+            if page_index != self.current_page:
+                continue
+            if markup.kind not in CALLOUT_KINDS | {"note"}:
+                continue
+            rect = self._markup_item_image_rect(markup)
+            outer = rect.adjusted(-3, -3, 3, 3)
+            inner = rect.adjusted(10, 10, -10, -10)
+            on_chrome = outer.contains(point) and (inner.width() < 6 or not inner.contains(point))
+            if on_chrome or rect.contains(point):
+                return index
+        return None
 
     def _markup_color(self) -> tuple[float, float, float]:
         preset = self.markup_color_combo.currentData()
@@ -1765,11 +1826,27 @@ class DocumentWorkspace(QWidget):
 
     def _delete_pending_markup(self) -> None:
         row = self.markup_pending_list.currentRow()
-        if 0 <= row < len(self.markup_items):
-            self._push_undo_snapshot()
-            self.markup_items.pop(row)
-            self._refresh_markup_list()
-            self._update_preview_display()
+        if not (0 <= row < len(self.markup_items)):
+            row = next(
+                (
+                    index
+                    for index in range(len(self.markup_items) - 1, -1, -1)
+                    if self.markup_items[index][0] == self.current_page
+                ),
+                -1,
+            )
+        if not (0 <= row < len(self.markup_items)):
+            self._emit_status("請先選取要刪除的標註。")
+            return
+        self._push_undo_snapshot()
+        self.markup_items.pop(row)
+        self._refresh_markup_list()
+        self._update_preview_display()
+        self.preview_widget.pending_box_delete = False
+        self._emit_status("已刪除標註。")
+
+    def delete_selected_item(self) -> None:
+        self._delete_pending_markup()
 
     def _clear_pending_markups(self) -> None:
         if not self.markup_items:

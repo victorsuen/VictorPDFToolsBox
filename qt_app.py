@@ -80,6 +80,7 @@ from pdf_core import (
     BATES_POSITIONS,
     CALLOUT_KINDS,
     callout_box_from_pointer,
+    callout_layout,
     comment_box_from_pointer,
     comment_polyline,
     crop_pdf_pages,
@@ -387,6 +388,27 @@ def configure_font_size_combo(combo: QComboBox, default: str, on_change) -> None
         line.editingFinished.connect(on_change)
 
 
+def is_delete_key(event) -> bool:
+    if event.modifiers() & ~Qt.KeypadModifier:
+        return False
+    return event.key() in (Qt.Key_Delete, Qt.Key_Backspace)
+
+
+def rect_chrome_contains(rect: QRect, point: QPoint, thickness: int = 10) -> bool:
+    if rect.width() < 2 or rect.height() < 2:
+        return False
+    outer = rect.adjusted(-3, -3, 3, 3)
+    inner = rect.adjusted(thickness, thickness, -thickness, -thickness)
+    if inner.width() < 6 or inner.height() < 6:
+        return outer.contains(point)
+    return outer.contains(point) and not inner.contains(point)
+
+
+def arm_box_delete(preview) -> None:
+    preview.pending_box_delete = True
+    preview.setFocus(Qt.MouseFocusReason)
+
+
 def annotation_text_pixel_width(font, text: str) -> float:
     if not text:
         return 0.0
@@ -531,6 +553,7 @@ class AnnotationPreviewLabel(PreviewImageLabel):
     copyRequested = Signal()
     pasteRequested = Signal()
     undoRequested = Signal()
+    deleteRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -544,6 +567,7 @@ class AnnotationPreviewLabel(PreviewImageLabel):
         self.handles_enabled = False
         self.pointer_enabled = False
         self.elbow_enabled = False
+        self.pending_box_delete = False
         self._start: QPoint | None = None
         self._current: QPoint | None = None
         self._mode: str | None = None
@@ -598,18 +622,21 @@ class AnnotationPreviewLabel(PreviewImageLabel):
         handle = self._handle_at(point)
         self._start = point
         self._current = point
+        self.pending_box_delete = False
         if handle:
             self._mode = "resize"
             self._handle = handle
+            arm_box_delete(self)
         elif self._hit_pointer(point):
             self._mode = "pointer"
             self._handle = None
         elif self._hit_elbow(point):
             self._mode = "elbow"
             self._handle = None
-        elif self._box_contains(point):
+        elif rect_chrome_contains(self.box_rect, point) or self._box_contains(point):
             self._mode = "move"
             self._handle = None
+            arm_box_delete(self)
         elif self.pointer_enabled:
             self._mode = "pointer"
             self._handle = None
@@ -677,6 +704,10 @@ class AnnotationPreviewLabel(PreviewImageLabel):
             self.undoRequested.emit()
             event.accept()
             return
+        if is_delete_key(event):
+            self.deleteRequested.emit()
+            event.accept()
+            return
         super().keyPressEvent(event)
 
     def leaveEvent(self, event) -> None:
@@ -728,6 +759,7 @@ class ErasePreviewLabel(PreviewImageLabel):
     copyRequested = Signal()
     pasteRequested = Signal()
     undoRequested = Signal()
+    deleteRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -738,6 +770,7 @@ class ErasePreviewLabel(PreviewImageLabel):
         self.cover_color = QColor(255, 255, 255)
         self.box_rect = QRect()
         self.handles_enabled = False
+        self.pending_box_delete = False
         self._start: QPoint | None = None
         self._current: QPoint | None = None
         self._hover: QPoint | None = None
@@ -755,17 +788,52 @@ class ErasePreviewLabel(PreviewImageLabel):
         self.inline_edit.installEventFilter(self)
 
     def eventFilter(self, obj, event) -> bool:
-        if obj is self.inline_edit and event.type() == QEvent.KeyPress:
-            if event.matches(QKeySequence.Copy):
-                self.copyRequested.emit()
-                return True
-            if event.matches(QKeySequence.Paste):
-                self.pasteRequested.emit()
-                return True
-            if event.matches(QKeySequence.Undo):
+        if obj is self.inline_edit:
+            if event.type() == QEvent.MouseButtonPress:
+                parent_pt = obj.mapToParent(event.position().toPoint())
+                if self._handle_at(parent_pt) or rect_chrome_contains(self.box_rect, parent_pt):
+                    self.hide_inline_editor()
+                    arm_box_delete(self)
+                    return True
+                self.pending_box_delete = False
+            elif event.type() in (QEvent.KeyPress, QEvent.ShortcutOverride) and event.matches(QKeySequence.Undo):
+                if event.type() == QEvent.ShortcutOverride:
+                    event.accept()
+                    return True
                 self.undoRequested.emit()
                 return True
+            elif event.type() == QEvent.KeyPress:
+                if event.matches(QKeySequence.Copy):
+                    self.copyRequested.emit()
+                    return True
+                if event.matches(QKeySequence.Paste):
+                    self.pasteRequested.emit()
+                    return True
+                if self.pending_box_delete and is_delete_key(event):
+                    self.deleteRequested.emit()
+                    return True
+                if event.text():
+                    self.pending_box_delete = False
         return super().eventFilter(obj, event)
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Copy):
+            self.copyRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Paste):
+            self.pasteRequested.emit()
+            event.accept()
+            return
+        if event.matches(QKeySequence.Undo):
+            self.undoRequested.emit()
+            event.accept()
+            return
+        if is_delete_key(event):
+            self.deleteRequested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
     def _handle_at(self, point: QPoint) -> str | None:
         if not self.handles_enabled:
@@ -790,8 +858,8 @@ class ErasePreviewLabel(PreviewImageLabel):
         bold: bool = False,
         color_rgb: tuple[float, float, float] = (0.0, 0.0, 0.0),
     ) -> None:
-        pad = 6
-        self.inline_edit.setGeometry(rect.adjusted(pad, 2, -pad, -2))
+        pad = 10
+        self.inline_edit.setGeometry(rect.adjusted(pad, pad, -pad, -pad))
         font = self.inline_edit.font()
         font.setPointSize(max(int(font_size * 0.75), 8))
         font.setBold(bold)
@@ -821,10 +889,16 @@ class ErasePreviewLabel(PreviewImageLabel):
         self._mode = None
         if self.tool == "text":
             handle = self._handle_at(point)
+            self.pending_box_delete = False
             if handle:
                 self._mode = "resize"
                 self._handle = handle
                 self.hide_inline_editor()
+                arm_box_delete(self)
+            elif rect_chrome_contains(self.box_rect, point):
+                self._mode = "select"
+                self.hide_inline_editor()
+                arm_box_delete(self)
             elif self._box_contains(point):
                 self._mode = "move"
                 self.hide_inline_editor()
@@ -870,6 +944,8 @@ class ErasePreviewLabel(PreviewImageLabel):
                 if (start - end).manhattanLength() > 4:
                     self.boxMoved.emit(start, end)
                 self.boxInteractionFinished.emit()
+            elif mode == "select":
+                arm_box_delete(self)
             elif (start - end).manhattanLength() > 4:
                 self.rectDrawn.emit(start, end)
             elif self.tool == "text":
@@ -928,11 +1004,13 @@ class MarkupPreviewLabel(PreviewImageLabel):
     copyRequested = Signal()
     pasteRequested = Signal()
     undoRequested = Signal()
+    deleteRequested = Signal()
 
     def __init__(self) -> None:
         super().__init__()
         self.setFocusPolicy(Qt.StrongFocus)
         self.band_color = QColor(18, 133, 118)
+        self.pending_box_delete = False
         self._start: QPoint | None = None
         self._current: QPoint | None = None
 
@@ -972,6 +1050,10 @@ class MarkupPreviewLabel(PreviewImageLabel):
             return
         if event.matches(QKeySequence.Undo):
             self.undoRequested.emit()
+            event.accept()
+            return
+        if is_delete_key(event):
+            self.deleteRequested.emit()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -1630,6 +1712,7 @@ class VictorPdfToolsQt(QMainWindow):
 
         self.build_ui()
         self.install_shortcuts()
+        self._install_editor_box_delete_disarm()
         self.setStatusBar(QStatusBar())
         self.create_document_tab("未命名")
         self.apply_startup_geometry()
@@ -1905,6 +1988,26 @@ class VictorPdfToolsQt(QMainWindow):
             action.setShortcut(key)
             action.triggered.connect(callback)
             self.addAction(action)
+
+    def _install_editor_box_delete_disarm(self) -> None:
+        for name in ("annotation_text_input", "markup_note_input", "erase_text_input"):
+            editor = getattr(self, name, None)
+            if editor is not None:
+                editor.installEventFilter(self)
+
+    def eventFilter(self, obj, event) -> bool:
+        if isinstance(obj, (QLineEdit, QTextEdit)):
+            if event.type() == QEvent.MouseButtonPress:
+                inline = getattr(getattr(self, "erase_preview_label", None), "inline_edit", None)
+                if obj is not inline:
+                    self._clear_box_delete_arm()
+            elif event.type() in (QEvent.KeyPress, QEvent.ShortcutOverride) and event.matches(QKeySequence.Undo) and self._box_undo_tab_active():
+                if event.type() == QEvent.ShortcutOverride:
+                    event.accept()
+                    return True
+                self.undo_last_action()
+                return True
+        return super().eventFilter(obj, event)
 
     def build_organize_tab(self) -> QWidget:
         tab = QWidget()
@@ -2333,6 +2436,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.annotation_preview_label.copyRequested.connect(self.copy_annotation_box)
         self.annotation_preview_label.pasteRequested.connect(self.paste_annotation_box)
         self.annotation_preview_label.undoRequested.connect(self.undo_annotation_action)
+        self.annotation_preview_label.deleteRequested.connect(self.delete_current_annotation_box)
         scroll.setWidget(self.annotation_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -2449,7 +2553,7 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addWidget(self.annotation_item_list)
         annotation_list_buttons = QHBoxLayout()
         self.add_button(annotation_list_buttons, "復原", self.undo_annotation_action)
-        self.add_button(annotation_list_buttons, "刪除選取", self.delete_selected_annotation_item, "danger")
+        self.add_button(annotation_list_buttons, "刪除選取", self.delete_current_annotation_box, "danger")
         self.add_button(annotation_list_buttons, "清空", self.clear_annotation_items)
         side_layout.addLayout(annotation_list_buttons)
 
@@ -2463,7 +2567,7 @@ class VictorPdfToolsQt(QMainWindow):
         changed_button = self.add_button(side_layout, "另存有修改的頁", self.save_changed_pages_pdf)
         changed_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        self.annotation_guide = QLabel("提示：左邊縮圖可換頁；點預覽放置文字框或附註。點選後 Ctrl+C 複製、Ctrl+V 貼到其他位置，Ctrl+Z 或「復原」可還原。加入後換頁會把上一頁標註留在清單。全部改完再另存，或用「另存有修改的頁」只抽出有註解的頁。")
+        self.annotation_guide = QLabel("提示：左邊縮圖可換頁；點預覽放置文字框或附註。點選方塊後 Delete 刪除，Ctrl+C 複製、Ctrl+V 貼到其他位置，Ctrl+Z 或「復原」可還原。加入後換頁會把上一頁標註留在清單。全部改完再另存，或用「另存有修改的頁」只抽出有註解的頁。")
         self.annotation_guide.setObjectName("muted")
         self.annotation_guide.setWordWrap(True)
         side_layout.addWidget(self.annotation_guide)
@@ -3034,6 +3138,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.markup_preview_label.copyRequested.connect(self.copy_markup_item)
         self.markup_preview_label.pasteRequested.connect(self.paste_markup_item)
         self.markup_preview_label.undoRequested.connect(self.undo_markup_action)
+        self.markup_preview_label.deleteRequested.connect(self.delete_selected_markup)
         scroll.setWidget(self.markup_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -3241,6 +3346,40 @@ class VictorPdfToolsQt(QMainWindow):
             hy = y1 + length * math.sin(angle + offset)
             draw.line((x1, y1, hx, hy), fill=color, width=2)
 
+    def _markup_item_image_rect(self, markup: MarkupAnnotation) -> QRect:
+        page_width, page_height = self.markup_page_size
+        image = self.markup_preview_image
+        if image is None or page_width <= 0 or page_height <= 0:
+            return QRect()
+        image_width, image_height = image.size
+
+        def to_img(x: float, y: float) -> QPoint:
+            return QPoint(
+                int(round(x / page_width * image_width)),
+                int(round((page_height - y) / page_height * image_height)),
+            )
+
+        if markup.kind in CALLOUT_KINDS:
+            layout = callout_layout(markup)
+            return QRect(to_img(layout.left, layout.top), to_img(layout.right, layout.bottom)).normalized()
+        if markup.kind == "note":
+            origin = to_img(markup.x0, markup.y0)
+            return QRect(origin.x(), origin.y() - 16, 16, 16)
+        return QRect(to_img(markup.x0, markup.y0), to_img(markup.x1, markup.y1)).normalized()
+
+    def _markup_text_item_at_point(self, point: QPoint) -> int | None:
+        page = self.current_markup_page_index()
+        for index in range(len(self.markup_items) - 1, -1, -1):
+            page_index, markup = self.markup_items[index]
+            if page_index != page:
+                continue
+            if markup.kind not in CALLOUT_KINDS | {"note"}:
+                continue
+            rect = self._markup_item_image_rect(markup)
+            if rect_chrome_contains(rect, point) or rect.adjusted(-3, -3, 3, 3).contains(point):
+                return index
+        return None
+
     def markup_image_point_to_pdf(self, point: QPoint) -> tuple[float, float]:
         page_width, page_height = self.markup_page_size
         image = self.markup_preview_image
@@ -3345,6 +3484,12 @@ class VictorPdfToolsQt(QMainWindow):
         if self.markup_preview_image is None:
             self.set_status("請先載入 PDF 並更新預覽。")
             return
+        hit = self._markup_text_item_at_point(point)
+        if hit is not None:
+            self.markup_list.setCurrentRow(hit)
+            arm_box_delete(self.markup_preview_label)
+            self.set_status("已選取標註，按 Delete 刪除。")
+            return
         kind = self.markup_tool_combo.currentData() or "highlight"
         if kind not in {"note"} | CALLOUT_KINDS:
             self.set_status("此工具需要拖曳：從要指出的位置拉到文字框。")
@@ -3396,13 +3541,24 @@ class VictorPdfToolsQt(QMainWindow):
 
     def delete_selected_markup(self) -> None:
         row = self.markup_list.currentRow()
-        if row < 0 or row >= len(self.markup_items):
+        if not (0 <= row < len(self.markup_items)):
+            page = self.current_markup_page_index()
+            row = next(
+                (
+                    index
+                    for index in range(len(self.markup_items) - 1, -1, -1)
+                    if self.markup_items[index][0] == page
+                ),
+                -1,
+            )
+        if not (0 <= row < len(self.markup_items)):
             self.set_status("請先選取要刪除的標註。")
             return
         self._push_markup_undo()
         self.markup_items.pop(row)
         self.refresh_markup_list()
         self.update_markup_preview_display()
+        self._clear_box_delete_arm()
         self.set_status("已刪除標註。")
 
     def clear_markups(self) -> None:
@@ -3813,6 +3969,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.erase_preview_label.copyRequested.connect(self.copy_erase_text_box)
         self.erase_preview_label.pasteRequested.connect(self.paste_erase_text_box)
         self.erase_preview_label.undoRequested.connect(self.undo_erase_mark)
+        self.erase_preview_label.deleteRequested.connect(self.delete_current_erase_item)
         scroll.setWidget(self.erase_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -4183,7 +4340,7 @@ class VictorPdfToolsQt(QMainWindow):
                 return index
         return None
 
-    def select_erase_text_item(self, index: int) -> None:
+    def select_erase_text_item(self, index: int, *, edit: bool = True) -> None:
         if index < 0 or index >= len(self.annotation_items):
             self.clear_erase_text_selection()
             return
@@ -4201,7 +4358,11 @@ class VictorPdfToolsQt(QMainWindow):
         finally:
             self._erase_syncing_text = False
         self.update_erase_preview_display()
-        self.erase_preview_label.inline_edit.setFocus()
+        if edit:
+            self.erase_preview_label.pending_box_delete = False
+            self.erase_preview_label.inline_edit.setFocus()
+        else:
+            arm_box_delete(self.erase_preview_label)
 
     def _erase_tab_active(self) -> bool:
         return (
@@ -4229,7 +4390,8 @@ class VictorPdfToolsQt(QMainWindow):
         self._erase_last_click = QPoint(point)
         hit = self._erase_text_hit_index(point)
         if hit is not None:
-            self.select_erase_text_item(hit)
+            box = self.erase_item_image_rect(self.annotation_items[hit])
+            self.select_erase_text_item(hit, edit=not rect_chrome_contains(box, point))
             return
         self._begin_new_erase_text_box()
         font_size = combo_font_size(self.erase_text_size_combo, 18)
@@ -4451,6 +4613,12 @@ class VictorPdfToolsQt(QMainWindow):
                 if restored_index is not None:
                     self._erase_text_selected = restored_index
                 self.set_status("已還原文字方塊調整。")
+            elif kind == "text_restore":
+                item = dict(action[2])
+                index = min(int(action[3]), len(self.annotation_items))
+                self.annotation_items.insert(index, item)
+                self._erase_text_selected = index
+                self.set_status("已還原文字方塊。")
             self.refresh_erase_list()
             self.refresh_annotation_item_list()
             self.update_erase_preview_display()
@@ -4470,6 +4638,29 @@ class VictorPdfToolsQt(QMainWindow):
         self.update_erase_preview_display()
         removed = (before_marks - len(self.erase_marks)) + (before_text - len(self.annotation_items))
         self.set_status(f"已清除本頁 {removed} 筆標記。")
+
+    def delete_current_erase_item(self) -> None:
+        if self._erase_text_selected is not None and 0 <= self._erase_text_selected < len(self.annotation_items):
+            item = self.annotation_items[self._erase_text_selected]
+            self._erase_undo_stack.append(("text_restore", item.get("page_index", 0), dict(item), self._erase_text_selected))
+            self.annotation_items.pop(self._erase_text_selected)
+            self.clear_erase_text_selection()
+            self.refresh_erase_list()
+            self.refresh_annotation_item_list()
+            self.update_erase_preview_display()
+            self._clear_box_delete_arm()
+            self.set_status("已刪除文字方塊。")
+            return
+        page_index = self.current_erase_page_index()
+        for index in range(len(self.erase_marks) - 1, -1, -1):
+            if self.erase_marks[index].page_index == page_index:
+                self._erase_undo_stack.append(("mark", page_index))
+                self.erase_marks.pop(index)
+                self.refresh_erase_list()
+                self.update_erase_preview_display()
+                self.set_status("已刪除標記。")
+                return
+        self.set_status("目前沒有可刪除的橡皮擦標記或文字方塊。")
 
     def refresh_erase_list(self) -> None:
         self.erase_mark_list.clear()
@@ -6341,11 +6532,66 @@ class VictorPdfToolsQt(QMainWindow):
     def _workspace_tab_active(self) -> bool:
         return hasattr(self, "_workspace_tab") and self.main_tabs.currentWidget() is self._workspace_tab
 
+    def _box_undo_tab_active(self) -> bool:
+        return (
+            self._annotation_tab_active()
+            or self._markup_tab_active()
+            or self._erase_tab_active()
+            or self._workspace_tab_active()
+        )
+
+    def _box_delete_armed(self) -> bool:
+        for name in ("annotation_preview_label", "erase_preview_label", "markup_preview_label"):
+            preview = getattr(self, name, None)
+            if preview is not None and getattr(preview, "pending_box_delete", False):
+                return True
+        workspace = getattr(self, "document_workspace", None)
+        if workspace is not None and getattr(getattr(workspace, "preview_widget", None), "pending_box_delete", False):
+            return True
+        return False
+
+    def _clear_box_delete_arm(self) -> None:
+        for name in ("annotation_preview_label", "erase_preview_label", "markup_preview_label"):
+            preview = getattr(self, name, None)
+            if preview is not None:
+                preview.pending_box_delete = False
+        workspace = getattr(self, "document_workspace", None)
+        if workspace is not None and hasattr(workspace, "preview_widget"):
+            workspace.preview_widget.pending_box_delete = False
+
     def _focused_text_editor(self):
         widget = QApplication.focusWidget()
         if isinstance(widget, (QLineEdit, QTextEdit)):
             return widget
         return None
+
+    def _delete_in_focused_editor(self) -> bool:
+        editor = self._focused_text_editor()
+        if editor is None:
+            return False
+        if isinstance(editor, QTextEdit):
+            cursor = editor.textCursor()
+            if cursor.hasSelection():
+                cursor.removeSelectedText()
+            else:
+                cursor.deleteChar()
+            editor.setTextCursor(cursor)
+            return True
+        if isinstance(editor, QLineEdit):
+            if editor.hasSelectedText():
+                start = editor.selectionStart()
+                selected = editor.selectedText()
+                text = editor.text()
+                editor.setText(text[:start] + text[start + len(selected) :])
+                editor.setCursorPosition(start)
+            else:
+                pos = editor.cursorPosition()
+                text = editor.text()
+                if pos < len(text):
+                    editor.setText(text[:pos] + text[pos + 1 :])
+                    editor.setCursorPosition(pos)
+            return True
+        return False
 
     def _copy_text_selection_or_run(self, copy_box) -> None:
         editor = self._focused_text_editor()
@@ -6520,9 +6766,29 @@ class VictorPdfToolsQt(QMainWindow):
         self._apply_annotation_item(self._annotation_clipboard, offset=True)
         self.set_status("已貼上標註。可再調整位置或文字。")
 
+    def _annotation_queued_item_at_point(self, point: QPoint) -> int | None:
+        try:
+            page = int(self.annotation_page_input.text() or "1") - 1
+        except ValueError:
+            page = 0
+        for index in range(len(self.annotation_items) - 1, -1, -1):
+            item = self.annotation_items[index]
+            if int(item.get("page_index", 0)) != page:
+                continue
+            rect = self.annotation_image_box_rect(item)
+            if rect_chrome_contains(rect, point) or rect.adjusted(-2, -2, 2, 2).contains(point):
+                return index
+        return None
+
     def set_annotation_position_from_click(self, point: QPoint) -> None:
         page_width, page_height = self.annotation_page_size
         if self.annotation_preview_image is None or page_width <= 0 or page_height <= 0:
+            return
+        hit = self._annotation_queued_item_at_point(point)
+        if hit is not None:
+            self.annotation_item_list.setCurrentRow(hit)
+            arm_box_delete(self.annotation_preview_label)
+            self.set_status("已選取標註，按 Delete 刪除。")
             return
         self._push_annotation_undo()
         image_width, image_height = self.annotation_preview_image.size
@@ -6767,14 +7033,42 @@ class VictorPdfToolsQt(QMainWindow):
             self.annotation_item_list.addItem(f"第 {int(item.get('page_index', 0)) + 1} 頁 · {preview}")
 
     def delete_selected_annotation_item(self) -> None:
-        row = self.annotation_item_list.currentRow()
-        if row < 0 or row >= len(self.annotation_items):
-            self.set_status("請先選取要刪除的標註。")
+        self.delete_current_annotation_box()
+
+    def delete_current_annotation_box(self) -> None:
+        if self._annotation_placed:
+            self._push_annotation_undo()
+            self._reset_live_annotation_placement()
+            if hasattr(self, "annotation_text_input"):
+                self.annotation_text_input.blockSignals(True)
+                self.annotation_text_input.clear()
+                self.annotation_text_input.blockSignals(False)
+            self.update_annotation_preview_display()
+            self._clear_box_delete_arm()
+            self.set_status("已刪除標註方塊。")
+            return
+        row = self.annotation_item_list.currentRow() if hasattr(self, "annotation_item_list") else -1
+        if not (0 <= row < len(self.annotation_items)):
+            try:
+                page = int(self.annotation_page_input.text() or "1") - 1
+            except ValueError:
+                page = 0
+            row = next(
+                (
+                    index
+                    for index in range(len(self.annotation_items) - 1, -1, -1)
+                    if int(self.annotation_items[index].get("page_index", 0)) == page
+                ),
+                -1,
+            )
+        if not (0 <= row < len(self.annotation_items)):
+            self.set_status("目前沒有可刪除的標註方塊。")
             return
         self._push_annotation_undo()
         self.annotation_items.pop(row)
         self.refresh_annotation_item_list()
         self.update_annotation_preview_display()
+        self._clear_box_delete_arm()
         self.set_status("已刪除標註。")
 
     def clear_annotation_items(self) -> None:
@@ -7350,6 +7644,9 @@ class VictorPdfToolsQt(QMainWindow):
         if self._markup_tab_active():
             self.undo_markup_action()
             return
+        if self._workspace_tab_active():
+            self.document_workspace.undo()
+            return
         grid = self.current_grid()
         if grid is None:
             self.set_status("沒有可復原的動作。")
@@ -7591,6 +7888,44 @@ class VictorPdfToolsQt(QMainWindow):
         self.set_status(f"已旋轉 {len(indexes)} 頁，按「儲存目前 Tab PDF」輸出新檔。")
 
     def remove_selected_pages(self) -> None:
+        armed = self._box_delete_armed()
+        if self._annotation_tab_active():
+            if armed or self.annotation_preview_label.hasFocus():
+                self.delete_current_annotation_box()
+                return
+            if self._focused_text_editor() is not None:
+                self._delete_in_focused_editor()
+                return
+            self.delete_current_annotation_box()
+            return
+        if self._markup_tab_active():
+            if armed or self.markup_preview_label.hasFocus():
+                self.delete_selected_markup()
+                return
+            if self._focused_text_editor() is not None:
+                self._delete_in_focused_editor()
+                return
+            self.delete_selected_markup()
+            return
+        if self._erase_tab_active():
+            if armed or self.erase_preview_label.hasFocus():
+                self.delete_current_erase_item()
+                return
+            if self._focused_text_editor() is not None:
+                self._delete_in_focused_editor()
+                return
+            self.delete_current_erase_item()
+            return
+        if self._workspace_tab_active():
+            if armed or self.document_workspace.preview_widget.hasFocus():
+                self.document_workspace.delete_selected_item()
+                self._clear_box_delete_arm()
+                return
+            if self._focused_text_editor() is not None:
+                self._delete_in_focused_editor()
+                return
+            self.document_workspace.delete_selected_item()
+            return
         indexes = self.selected_indexes()
         if not indexes:
             self.set_status("請先選取要移除的頁面。")

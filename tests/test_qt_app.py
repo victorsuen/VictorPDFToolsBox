@@ -8,7 +8,8 @@ from pypdf import PdfReader, PdfWriter
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QPoint, Qt
+from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
+from PySide6.QtGui import QKeyEvent
 from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QTabWidget
 
 from pdf_core import MarkupAnnotation, TextBlock
@@ -26,6 +27,7 @@ from qt_app import (
     combo_font_size,
     document_tab_title,
     preferred_window_geometry,
+    rect_chrome_contains,
     reveal_output,
     wrap_annotation_text,
 )
@@ -1722,6 +1724,274 @@ class QtAppTests(unittest.TestCase):
         window.undo_annotation_action()
         self.assertEqual(window.annotation_items, [])
         self.assertEqual(window.annotation_text_input.toPlainText(), "附註內容")
+
+    def test_delete_key_removes_live_annotation_box(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("註解")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(200, 400))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._annotation_tab)
+        self.assertTrue(window._annotation_placed)
+
+        window.remove_selected_pages()
+
+        self.assertFalse(window._annotation_placed)
+        self.assertEqual(window.annotation_text_input.toPlainText(), "")
+        self.assertIn("刪除", window.statusBar().currentMessage())
+
+    def test_delete_key_in_annotation_text_field_keeps_box(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("AB")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(200, 400))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._annotation_tab)
+        cursor = window.annotation_text_input.textCursor()
+        cursor.setPosition(0)
+        window.annotation_text_input.setTextCursor(cursor)
+
+        with patch.object(window, "_focused_text_editor", return_value=window.annotation_text_input):
+            window.remove_selected_pages()
+
+        self.assertTrue(window._annotation_placed)
+        self.assertEqual(window.annotation_text_input.toPlainText(), "B")
+
+    def test_rect_chrome_contains_only_the_border(self):
+        rect = QRect(10, 20, 80, 60)
+        self.assertTrue(rect_chrome_contains(rect, QPoint(10, 20)))
+        self.assertTrue(rect_chrome_contains(rect, QPoint(50, 20)))
+        self.assertFalse(rect_chrome_contains(rect, QPoint(50, 50)))
+
+    def test_delete_key_after_annotation_chrome_arm_removes_box_even_if_text_focused(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("註解")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(200, 400))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._annotation_tab)
+        window.annotation_preview_label.pending_box_delete = True
+
+        with patch.object(window, "_focused_text_editor", return_value=window.annotation_text_input):
+            window.remove_selected_pages()
+
+        self.assertFalse(window._annotation_placed)
+        self.assertEqual(window.annotation_text_input.toPlainText(), "")
+
+    def test_clicking_queued_annotation_chrome_selects_box_for_delete(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("附註內容")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(200, 400))
+        window.copy_annotation_box()
+        window.paste_annotation_box()
+        queued = window.annotation_items[0]
+        rect = window.annotation_image_box_rect(queued)
+        chrome = QPoint(rect.left() + 1, rect.top() + 1)
+
+        window.set_annotation_position_from_click(chrome)
+
+        self.assertEqual(len(window.annotation_items), 1)
+        self.assertTrue(window.annotation_preview_label.pending_box_delete)
+        self.assertEqual(window.annotation_item_list.currentRow(), 0)
+
+    def test_erase_chrome_click_then_delete_removes_text_box(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+        window.set_erase_tool("text")
+        window.erase_text_input.clear()
+        window.add_erase_text_at_point(QPoint(40, 50))
+        box = window.erase_item_image_rect(window.annotation_items[0])
+        chrome = QPoint(box.left() + 1, box.top() + 1)
+
+        window.add_erase_text_at_point(chrome)
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._erase_tab)
+
+        self.assertEqual(len(window.annotation_items), 1)
+        self.assertTrue(window.erase_preview_label.pending_box_delete)
+        with patch.object(window, "_focused_text_editor", return_value=window.erase_preview_label.inline_edit):
+            window.remove_selected_pages()
+        self.assertEqual(len(window.annotation_items), 0)
+
+    def test_erase_inline_chrome_mouse_press_arms_box_delete(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+        window.set_erase_tool("text")
+        window.add_erase_text_at_point(QPoint(40, 50))
+        preview = window.erase_preview_label
+        editor = preview.inline_edit
+        box = window.erase_item_image_rect(window.annotation_items[0])
+        preview.box_rect = box
+        preview.show_inline_editor(box, "文字", 18)
+        chrome = QPoint(box.left() + 1, box.top() + 1)
+        local = editor.mapFromParent(chrome)
+
+        class _Press:
+            def type(self):
+                return QEvent.MouseButtonPress
+
+            def position(self):
+                return QPointF(local)
+
+        consumed = preview.eventFilter(editor, _Press())
+
+        self.assertTrue(consumed)
+        self.assertTrue(preview.pending_box_delete)
+        self.assertFalse(editor.hasFocus() and editor.isVisible())
+
+    def test_markup_click_existing_comment_then_delete(self):
+        window = VictorPdfToolsQt()
+        window.set_markup_pdf(self.source)
+        window.markup_page_size = (300.0, 400.0)
+        window.markup_preview_image = _white_image(300, 400)
+        window.markup_tool_combo.setCurrentIndex(window.markup_tool_combo.findData("comment"))
+        window.markup_note_input.setText("附註框")
+        window.add_markup_from_point(QPoint(40, 80))
+        rect = window._markup_item_image_rect(window.markup_items[0][1])
+        chrome = QPoint(rect.left() + 1, rect.top() + 1)
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._markup_tab)
+
+        window.add_markup_from_point(chrome)
+
+        self.assertEqual(len(window.markup_items), 1)
+        self.assertTrue(window.markup_preview_label.pending_box_delete)
+        window.remove_selected_pages()
+        self.assertEqual(len(window.markup_items), 0)
+
+    def test_workspace_click_comment_chrome_then_delete(self):
+        workspace = DocumentWorkspace()
+        workspace.preview_image = _white_image(300, 400)
+        workspace.page_size = (300.0, 400.0)
+        workspace.page_sizes = [(300.0, 400.0)]
+        workspace.page_images = {0: workspace.preview_image}
+        workspace.interaction = "annotate"
+        comment_index = workspace.markup_tool_combo.findData("comment")
+        workspace.markup_tool_combo.setCurrentIndex(comment_index)
+        workspace._add_markup_from_point(QPoint(50, 60))
+        rect = workspace._markup_item_image_rect(workspace.markup_items[0][1])
+        chrome = QPoint(rect.left() + 1, rect.top() + 1)
+
+        workspace._on_preview_point_clicked(chrome)
+
+        self.assertEqual(len(workspace.markup_items), 1)
+        self.assertTrue(workspace.preview_widget.pending_box_delete)
+        workspace.delete_selected_item()
+        self.assertEqual(len(workspace.markup_items), 0)
+
+    def test_undo_restores_deleted_annotation_box(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("註解")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(200, 400))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._annotation_tab)
+        self.assertTrue(window._annotation_placed)
+
+        window.remove_selected_pages()
+        self.assertFalse(window._annotation_placed)
+
+        window.undo_last_action()
+
+        self.assertTrue(window._annotation_placed)
+        self.assertEqual(window.annotation_text_input.toPlainText(), "註解")
+
+    def test_ctrl_z_in_annotation_text_field_restores_deleted_box(self):
+        window = VictorPdfToolsQt()
+        window.set_annotation_pdf(self.source)
+        window.set_annotation_shape("comment")
+        window.annotation_text_input.setPlainText("註解")
+        window.annotation_page_size = (600.0, 800.0)
+        window.annotation_preview_image = _white_image(600, 800)
+        window.set_annotation_position_from_click(QPoint(200, 400))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._annotation_tab)
+        window.remove_selected_pages()
+        window.annotation_text_input.setFocus()
+
+        press = QKeyEvent(QEvent.KeyPress, Qt.Key_Z, Qt.ControlModifier)
+        consumed = window.eventFilter(window.annotation_text_input, press)
+
+        self.assertTrue(consumed)
+        self.assertTrue(window._annotation_placed)
+        self.assertEqual(window.annotation_text_input.toPlainText(), "註解")
+
+    def test_undo_restores_deleted_erase_text_box(self):
+        window = VictorPdfToolsQt()
+        window.set_erase_pdf(self.source)
+        window.erase_page_size = (300.0, 400.0)
+        window.erase_preview_image = _white_image(300, 400)
+        window.set_erase_tool("text")
+        window.erase_text_input.setPlainText("補上")
+        window.add_erase_text_at_point(QPoint(40, 50))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._erase_tab)
+        self.assertEqual(len(window.annotation_items), 1)
+
+        window.delete_current_erase_item()
+        self.assertEqual(len(window.annotation_items), 0)
+
+        window.undo_last_action()
+        self.assertEqual(len(window.annotation_items), 1)
+        self.assertEqual(window.annotation_items[0]["text"], "補上")
+
+    def test_undo_restores_deleted_markup_comment(self):
+        window = VictorPdfToolsQt()
+        window.set_markup_pdf(self.source)
+        window.markup_page_size = (300.0, 400.0)
+        window.markup_preview_image = _white_image(300, 400)
+        window.markup_tool_combo.setCurrentIndex(window.markup_tool_combo.findData("comment"))
+        window.markup_note_input.setText("附註框")
+        window.add_markup_from_point(QPoint(40, 80))
+        window.main_tabs.setCurrentWidget(window._advanced_tab)
+        window.advanced_tabs.setCurrentWidget(window._markup_tab)
+        self.assertEqual(len(window.markup_items), 1)
+
+        window.delete_selected_markup()
+        self.assertEqual(len(window.markup_items), 0)
+
+        window.undo_last_action()
+        self.assertEqual(len(window.markup_items), 1)
+        self.assertEqual(window.markup_items[0][1].contents, "附註框")
+
+    def test_undo_restores_deleted_workspace_comment(self):
+        window = VictorPdfToolsQt()
+        workspace = window.document_workspace
+        workspace.preview_image = _white_image(300, 400)
+        workspace.page_size = (300.0, 400.0)
+        workspace.page_sizes = [(300.0, 400.0)]
+        workspace.page_images = {0: workspace.preview_image}
+        workspace.interaction = "annotate"
+        workspace.markup_tool_combo.setCurrentIndex(workspace.markup_tool_combo.findData("comment"))
+        workspace._add_markup_from_point(QPoint(50, 60))
+        window.main_tabs.setCurrentWidget(window._workspace_tab)
+        self.assertEqual(len(workspace.markup_items), 1)
+
+        workspace.delete_selected_item()
+        self.assertEqual(len(workspace.markup_items), 0)
+
+        window.undo_last_action()
+        self.assertEqual(len(workspace.markup_items), 1)
 
     def test_markup_save_applies_annotations(self):
         window = VictorPdfToolsQt()
