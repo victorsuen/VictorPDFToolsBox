@@ -273,7 +273,7 @@ def handle_ocr_text() -> tuple[Path, str]:
         pdf,
         target,
         request.form.get("password") or "",
-        language=request.form.get("ocr_language") or "eng+chi_tra",
+        language=request.form.get("ocr_language") or "auto",
         pages_spec=request.form.get("pages", ""),
     )
     return target, "ocr-text.txt"
@@ -286,7 +286,7 @@ def handle_ocr_searchable_pdf() -> tuple[Path, str]:
         pdf,
         target,
         request.form.get("password") or "",
-        language=request.form.get("ocr_language") or "eng+chi_tra",
+        language=request.form.get("ocr_language") or "auto",
         pages_spec=request.form.get("pages", ""),
     )
     return target, "searchable.pdf"

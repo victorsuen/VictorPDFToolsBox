@@ -4,7 +4,7 @@
 
 現在的 `start_desktop_app.bat` 會啟動 PySide6 / Qt 版介面：
 
-- 主視窗分為 **「組織」**（預設）、**「文件工作台」**、**「常用工具」**、**「Office 轉 PDF」**、**「進階」** 五個頂層分頁；也可從選單 **視窗** 快速切換
+- 主視窗分為 **「組織」**（預設）、**「文件工作台」**、**「常用工具」**、**「Office 轉 PDF」**、**「PDF 轉 Office」**、**「進階」** 頂層分頁；也可從選單 **視窗** 快速切換
 - **「組織」分頁**（預設）：全頁縮圖格線、拖曳重排、雙擊大圖預覽；右鍵或「在工作台開啟」可把目前 PDF 送到工作台；拖入 PDF 預設加入此分頁
 - **「文件工作台」分頁**：類 Acrobat 的單檔工作站——頂部模式列（閱讀｜註解｜編輯｜整理｜裁切｜工具）、左側縮圖 / 書籤、**中央單頁預覽**、右側依模式切換工具；支援 **儲存 / 另存副本**（`Ctrl+S` 會套用待定標註並覆寫目前檔）
 - 點擊左側縮圖或使用上一頁 / 下一頁 / 頁碼輸入切換目前頁
@@ -12,6 +12,7 @@
 - 註解 / 裁切 / 簽名框選在目前頁預覽上操作
 - **「常用工具」分頁**：合併、拆分、旋轉、加密等批次 PDF 工具
 - **「Office 轉 PDF」分頁**：Word / Excel / PowerPoint 轉 PDF（可合併成一份或每個檔各存一份）
+- **「PDF 轉 Office」分頁**：PDF 轉 Word / Excel（本機轉換；掃描件需 OCR）
 - **「進階」分頁**：文字標註、螢光註解、裁切、橡皮擦／遮擋、文字編輯 Beta、書籤等子分頁
 - 縮圖可按住滑鼠左鍵直接拖到目標位置插入重排，拖動時會顯示縮小頁面預覽
 - 每張縮圖下方顯示目前 `Page N`、原始頁碼及檔名，方便核對位置
@@ -42,6 +43,14 @@
 - 「文字編輯 Beta」分頁：PyMuPDF 偵測文字層（字型/大小/顏色），預設「無痕替換」移除原字後以相同樣式寫回（接近 Adobe Pro）；亦支援覆蓋替換、遮蔽、批量遮蔽、實驗性內容流替換
 - 「書籤 / 目錄」分頁可讀取現有 PDF 書籤、新增 / 編輯 / 刪除 / 上下排序書籤，並用主層 / 子層 / 次子層建立巢狀目錄，套用後重建書籤並另存新檔（類似 Acrobat 的書籤面板）
 - 「裁切頁面」分頁：在預覽上拖曳框選要保留的範圍（或直接輸入裁切框數值），可套用到目前頁 / 全部頁 / 自訂頁碼，另存後自動開成新 Tab（類似 Acrobat 的裁切頁面）
+
+### v0.9.0 重點
+
+- **PDF 轉 Office**：獨立頂層分頁，本機把 PDF 轉成 Word／Excel；掃描件需 Tesseract OCR
+- **中文保真**：已有文字層的中文 PDF 直接抽漢字，避免 Word 開啟部分字型時整段丟字
+- **Excel 表格**：先跟框線抽表，並丟掉把單字切碎的假表格；沒框線則依欄位對齊
+- **掃描件 OCR**：預設自動偵測繁／簡／英；逐頁辨識並顯示「第 x / y 頁」；雙欄中英對照會左右分開
+- **轉檔不卡死**：PDF 轉 Office 在背景執行，進度條顯示頁碼而不是亂碼百分比
 
 ### v0.8.1 重點
 
@@ -91,7 +100,7 @@
 - 電子簽名等高階功能（需先評估授權）
 - 自動清理暫存 workspace 排程
 
-`feature/pdf-to-office` 分枝已加入本機 **PDF 轉 Word**、**PDF 轉 Excel**（常用工具；不取代 v0.8.1 桌面 EXE）。有 Microsoft Word 時優先用 Word 開 PDF 另存；否則抽取文字層／表格。掃描件需本機 Tesseract OCR。轉換結果是可再編輯草稿，版面不會與 Adobe 完全一致。
+`v0.9.0` 起，獨立頂層分頁 **「PDF 轉 Office」** 可在本機把 PDF 轉成 Word／Excel。中文 PDF 若已有文字層會優先抽取漢字；掃描件需本機 Tesseract OCR。轉換結果是可再編輯草稿，版面不會與 Adobe 完全一致。
 
 公司內部本機 PDF 工具箱，目標是提供接近常見 PDF 軟件的日常功能，同時避免把上市公司財務資料、審計文件或個人資料上傳到外部服務。
 
@@ -108,7 +117,7 @@
 - 抽取 PDF 文字
 - 圖片轉 PDF
 - Word / Excel / PowerPoint 轉 PDF（需本機 Microsoft Office 或 LibreOffice）
-- PDF 轉 Word / Excel（`feature/pdf-to-office` 分枝：本機轉換，掃描件需 OCR）
+- PDF 轉 Word / Excel（**PDF 轉 Office** 分頁，本機轉換，掃描件需 OCR）
 - PDF 轉圖片（PNG / JPG / WEBP，可指定頁碼與 DPI）
 - OCR 抽文字（掃描 PDF → TXT）
 - 掃描 PDF 轉可搜尋 PDF（加入 OCR 文字層）
@@ -143,13 +152,16 @@
 
 ## OCR 功能注意
 
-OCR 使用本機 Tesseract OCR，不會上傳文件到外部服務。使用前需在 Windows 安裝 Tesseract，並把 `tesseract.exe`
-加入 PATH；如要辨識繁中 / 簡中，亦需安裝 `chi_tra` / `chi_sim` 語言包。Qt 版可在常用工具分頁選擇
-`英文 + 繁中`、`英文 + 簡中`、純英文、純繁中或純簡中。
+OCR 使用本機 Tesseract OCR，不會上傳文件到外部服務。Windows 請安裝 [UB Mannheim Tesseract](https://github.com/UB-Mannheim/tesseract/wiki)，並安裝 `chi_tra` / `chi_sim` 語言包。程式會自動尋找 `C:\Program Files\Tesseract-OCR\tesseract.exe`，不必手動加入 PATH。Qt 版可在常用工具或「PDF 轉 Office」分頁選擇
+`自動偵測`（預設，依第一頁判斷繁中／簡中／英文）、`英文 + 繁中`、`英文 + 簡中`、純英文、純繁中或純簡中。中文掃描件會以中文為主語言、300 DPI、並把 OCR 常見的部首相容字還原成正字。
 
 ## Office 轉 PDF
 
 獨立頂層分頁 **「Office 轉 PDF」** 在本機轉換 Word / Excel / PowerPoint，不會上傳檔案。請先安裝 **Microsoft Office** 或 **LibreOffice**。Word / Excel 走 Office 匯出（列印品質、嵌入字型）；PowerPoint 依投影片畫面以 300 DPI 匯出，以免立體字與細線圖形失真。另存檔名會沿用原檔名，轉換時顯示進度，完成後可自動開啟 PDF。可一次加入多個檔並合併成一份，或每個檔各存一份到資料夾。
+
+## PDF 轉 Office
+
+獨立頂層分頁 **「PDF 轉 Office」** 在本機把 PDF 轉成 Word（.docx）或 Excel（.xlsx），不會上傳檔案。中文 PDF 若已有文字層，會優先抽取漢字，避免 Microsoft Word 開啟部分中文字型時整段丟字。轉 Excel 會偵測有框線的表，沒有框線則依文字對齊重建欄位；掃描件用 OCR 座標重建，而不是整頁倒成一欄。掃描件需本機 Tesseract OCR（程式會自動尋找 `C:\Program Files\Tesseract-OCR\tesseract.exe`，不必加入 PATH）。轉換結果是可再編輯草稿，版面不會與 Adobe 完全一致。多個 PDF 會各存一份到指定資料夾。
 
 ## 文字編輯 Beta 注意
 
@@ -162,7 +174,9 @@ PDF 的文字層（含字型名稱、大小、顏色、位置），將同一行�
 
 ## 桌面 EXE 版
 
-如想用獨立視窗介面，可先直接啟動桌面版：
+打包後的 EXE 放在桌面 **`Cursor Tools`** 資料夾（`%USERPROFILE%\Desktop\Cursor Tools`），不要再直接丟在桌面根目錄。
+
+如想用原始碼直接開獨立視窗介面：
 
 ```powershell
 start_desktop_app.bat

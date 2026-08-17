@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import os
+import queue
 import subprocess
 import sys
+import threading
 from dataclasses import replace
 from pathlib import Path
 
@@ -115,6 +117,8 @@ from pdf_core import (
     images_to_pdf,
     office_files_to_pdf,
     merge_pdf_files,
+    last_ocr_language,
+    ocr_language_short_label,
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
     pdf_to_docx,
@@ -160,8 +164,6 @@ TOOL_OPERATIONS = [
     ("extract_text", "抽取文字"),
     ("ocr_text", "OCR 抽文字"),
     ("ocr_searchable_pdf", "掃描 PDF 轉可搜尋 PDF"),
-    ("pdf_to_word", "PDF 轉 Word"),
-    ("pdf_to_excel", "PDF 轉 Excel"),
     ("images_to_pdf", "圖片轉 PDF"),
     ("pdf_to_images", "PDF 轉圖片"),
     ("info", "PDF 資訊"),
@@ -219,8 +221,6 @@ FOLDER_REVEAL_OPERATIONS = frozenset(
         "ocr_text",
         "info",
         "pdf_to_images",
-        "pdf_to_word",
-        "pdf_to_excel",
         "compare_text",
         "split_bookmarks",
     }
@@ -249,8 +249,6 @@ BATCHABLE_OPERATIONS = frozenset(
         "extract",
         "ocr_text",
         "ocr_searchable_pdf",
-        "pdf_to_word",
-        "pdf_to_excel",
     }
 )
 
@@ -281,6 +279,15 @@ def document_tab_title(name: str, max_chars: int = DOCUMENT_TAB_TITLE_MAX) -> st
     suffix = Path(filename).suffix or ".pdf"
     keep = max(4, max_chars - len(suffix) - 1)
     return f"{stem[:keep]}…{suffix}"
+
+
+def configure_count_progress_bar(bar: QProgressBar) -> None:
+    bar.setAlignment(Qt.AlignCenter)
+    bar.setTextVisible(True)
+    bar.setFormat("%v / %m")
+    font = QFont("Segoe UI")
+    font.setStyleHint(QFont.SansSerif)
+    bar.setFont(font)
 
 
 def reveal_output(path: Path) -> None:
@@ -1654,6 +1661,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.page_clipboard: list[PageItem] = []
         self.tool_file_items: list[Path] = []
         self.office_file_items: list[Path] = []
+        self.pdf_office_file_items: list[Path] = []
         self._last_tool_status_message = ""
         self._tool_aux_path: Path | None = None
         self.annotation_pdf_path: Path | None = None
@@ -1891,6 +1899,9 @@ class VictorPdfToolsQt(QMainWindow):
         self._office_tab = self.build_office_convert_tab()
         tabs.addTab(self._office_tab, "Office 轉 PDF")
 
+        self._pdf_office_tab = self.build_pdf_to_office_tab()
+        tabs.addTab(self._pdf_office_tab, "PDF 轉 Office")
+
         advanced_root = PdfDropPanel()
         advanced_root.filesDropped.connect(self.drop_advanced_pdf)
         advanced_layout = QVBoxLayout(advanced_root)
@@ -1991,6 +2002,9 @@ class VictorPdfToolsQt(QMainWindow):
         show_office = QAction("Office 轉 PDF", self)
         show_office.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self._office_tab))
         window_menu.addAction(show_office)
+        show_pdf_office = QAction("PDF 轉 Office", self)
+        show_pdf_office.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self._pdf_office_tab))
+        window_menu.addAction(show_pdf_office)
         show_advanced = QAction("進階工具", self)
         show_advanced.triggered.connect(lambda: self.main_tabs.setCurrentWidget(self._advanced_tab))
         window_menu.addAction(show_advanced)
@@ -2194,7 +2208,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.tool_ocr_language_combo = QComboBox()
         for code, label in OCR_LANGUAGE_OPTIONS.items():
             self.tool_ocr_language_combo.addItem(label, code)
-        self.tool_ocr_language_combo.setCurrentIndex(self.tool_ocr_language_combo.findData("eng+chi_tra"))
+        self.tool_ocr_language_combo.setCurrentIndex(self.tool_ocr_language_combo.findData("auto"))
         form_layout.addWidget(self.tool_ocr_language_combo)
 
         form_layout.addWidget(QLabel("文字 / 模板"))
@@ -2321,8 +2335,7 @@ class VictorPdfToolsQt(QMainWindow):
         hint = QLabel(
             "提示：可把 PDF / 圖片直接拖入左側清單。合併 / 圖片轉 PDF 本身支援多檔；"
             "其餘工具預設用第一個 PDF。勾選「批次處理」後，旋轉／壓縮／浮水印／頁碼／加密等會對清單每個 PDF 各輸出一份到資料夾。"
-            "「PDF 轉 Word / Excel」會在本機轉換（有 Microsoft Word 時優先用 Word；否則抽取文字與表格）。掃描件需本機 OCR。"
-            "Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁。"
+            "Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁；PDF 轉 Word / Excel 請到「PDF 轉 Office」分頁。"
         )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
@@ -2378,7 +2391,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.office_progress = QProgressBar()
         self.office_progress.setRange(0, 100)
         self.office_progress.setValue(0)
-        self.office_progress.setTextVisible(True)
+        configure_count_progress_bar(self.office_progress)
         form_layout.addWidget(self.office_progress)
 
         self.office_open_pdf_checkbox = QCheckBox("完成後開啟 PDF")
@@ -2401,6 +2414,107 @@ class VictorPdfToolsQt(QMainWindow):
             "拖入左側清單。另存檔名會沿用原檔名。PowerPoint 在背景轉換，並依投影片畫面以 300 DPI 匯出，"
             "以免「另存 PDF」把立體字變成黑塊；PDF 內文字無法選取。"
             "轉換需已安裝 Microsoft Office 或 LibreOffice。"
+        )
+        hint.setObjectName("muted")
+        hint.setWordWrap(True)
+        form_layout.addWidget(hint)
+        form_layout.addStretch(1)
+        body.addWidget(wrap_side_panel(form, 310))
+        layout.addLayout(body, 1)
+        return tab
+
+    def build_pdf_to_office_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_pdf_office_files)
+        layout = QVBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(10)
+
+        toolbar = QWidget()
+        controls = FlowLayout(toolbar, margin=0, hspacing=6, vspacing=6)
+        self.add_button(controls, "加入 PDF", self.add_pdf_office_files)
+        self.add_button(controls, "移除選取", self.remove_pdf_office_files, "danger")
+        self.add_button(controls, "上移", lambda: self.move_pdf_office_file(-1))
+        self.add_button(controls, "下移", lambda: self.move_pdf_office_file(1))
+        self.add_button(controls, "清空", self.clear_pdf_office_files, "danger")
+        layout.addWidget(toolbar)
+
+        body = QHBoxLayout()
+        body.setSpacing(14)
+
+        self.pdf_office_file_list = ToolFileList()
+        self.pdf_office_file_list.setSelectionMode(QListWidget.ExtendedSelection)
+        self.pdf_office_file_list.filesDropped.connect(self.drop_pdf_office_files)
+        body.addWidget(self.pdf_office_file_list, 1)
+
+        form = QFrame()
+        form.setObjectName("panel")
+        form_layout = QVBoxLayout(form)
+        form_layout.setContentsMargins(14, 14, 14, 14)
+        form_layout.setSpacing(8)
+
+        form_layout.addWidget(QLabel("輸出格式"))
+        self.pdf_office_format_combo = QComboBox()
+        self.pdf_office_format_combo.addItem("轉 Word（.docx）", "word")
+        self.pdf_office_format_combo.addItem("轉 Excel（.xlsx）", "excel")
+        form_layout.addWidget(self.pdf_office_format_combo)
+
+        form_layout.addWidget(QLabel("頁碼 / 範圍"))
+        self.pdf_office_pages_input = QLineEdit()
+        self.pdf_office_pages_input.setPlaceholderText("例如 1,3,5-8；留空代表全部")
+        form_layout.addWidget(self.pdf_office_pages_input)
+
+        form_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.pdf_office_password_input = QLineEdit()
+        self.pdf_office_password_input.setEchoMode(QLineEdit.Password)
+        form_layout.addWidget(self.pdf_office_password_input)
+
+        form_layout.addWidget(QLabel("OCR 語言（掃描件）"))
+        self.pdf_office_ocr_combo = QComboBox()
+        for code, label in OCR_LANGUAGE_OPTIONS.items():
+            self.pdf_office_ocr_combo.addItem(label, code)
+        self.pdf_office_ocr_combo.setCurrentIndex(self.pdf_office_ocr_combo.findData("auto"))
+        form_layout.addWidget(self.pdf_office_ocr_combo)
+
+        form_layout.addWidget(QLabel("掃描件解析度 DPI"))
+        self.pdf_office_dpi_combo = QComboBox()
+        for dpi in ("150", "200", "300"):
+            self.pdf_office_dpi_combo.addItem(dpi)
+        self.pdf_office_dpi_combo.setCurrentText("300")
+        form_layout.addWidget(self.pdf_office_dpi_combo)
+
+        convert_button = self.add_button(form_layout, "轉換並另存", self.run_pdf_to_office, "primary")
+        convert_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        self.pdf_office_progress_label = QLabel("尚未開始轉換")
+        self.pdf_office_progress_label.setObjectName("muted")
+        self.pdf_office_progress_label.setWordWrap(True)
+        form_layout.addWidget(self.pdf_office_progress_label)
+        self.pdf_office_progress = QProgressBar()
+        self.pdf_office_progress.setRange(0, 100)
+        self.pdf_office_progress.setValue(0)
+        configure_count_progress_bar(self.pdf_office_progress)
+        form_layout.addWidget(self.pdf_office_progress)
+
+        self.pdf_office_open_file_checkbox = QCheckBox("完成後開啟檔案")
+        self.pdf_office_open_file_checkbox.setChecked(True)
+        self.pdf_office_open_file_checkbox.toggled.connect(self.save_output_preferences)
+        form_layout.addWidget(self.pdf_office_open_file_checkbox)
+        self.pdf_office_open_output_folder_checkbox = QCheckBox("多檔輸出時開啟資料夾")
+        self.pdf_office_open_output_folder_checkbox.setChecked(True)
+        self.pdf_office_open_output_folder_checkbox.toggled.connect(self.save_output_preferences)
+        form_layout.addWidget(self.pdf_office_open_output_folder_checkbox)
+
+        self.add_button(form_layout, "開啟處理紀錄", self.open_audit_log)
+
+        hint = QLabel(
+            "提示：把 PDF 拖入左側清單。有文字層的 PDF 轉 Word 會依座標重建雙欄、表格與標題，"
+            "不是只抽出純文字（Microsoft Word 開啟部分中文字型會整段丟字，程式會改自行組版）。"
+            "轉 Excel 會先找有框線的表，沒有框線則依欄位對齊抽出；掃描件用 OCR 座標重建欄位。"
+            "左右中英對照會排成左右兩欄（英文／中文）。"
+            "掃描件會逐頁 OCR，進度會顯示頁碼；雙欄頁可能稍慢，請勿強制結束。"
+            "轉換結果是可再編輯草稿，版面不會與 Adobe 完全一致。"
+            "Word / Excel / PowerPoint 轉 PDF 請到「Office 轉 PDF」分頁。"
         )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
@@ -5802,6 +5916,12 @@ class VictorPdfToolsQt(QMainWindow):
         self.office_open_output_folder_checkbox.setChecked(
             settings.value("office_open_output_folder", True, type=bool)
         )
+        self.pdf_office_open_file_checkbox.setChecked(
+            settings.value("pdf_office_open_file", True, type=bool)
+        )
+        self.pdf_office_open_output_folder_checkbox.setChecked(
+            settings.value("pdf_office_open_output_folder", True, type=bool)
+        )
 
     def save_output_preferences(self) -> None:
         settings = self.output_settings()
@@ -5812,6 +5932,8 @@ class VictorPdfToolsQt(QMainWindow):
         settings.setValue("office_open_pdf", self.office_open_pdf_checkbox.isChecked())
         settings.setValue("office_open_pdf_tab", self.office_open_pdf_tab_checkbox.isChecked())
         settings.setValue("office_open_output_folder", self.office_open_output_folder_checkbox.isChecked())
+        settings.setValue("pdf_office_open_file", self.pdf_office_open_file_checkbox.isChecked())
+        settings.setValue("pdf_office_open_output_folder", self.pdf_office_open_output_folder_checkbox.isChecked())
 
     def refresh_tool_file_list(self) -> None:
         self.tool_file_list.clear()
@@ -5947,6 +6069,9 @@ class VictorPdfToolsQt(QMainWindow):
         dialog.setCancelButton(None)
         dialog.setMinimumWidth(420)
         dialog.show()
+        bar = dialog.findChild(QProgressBar)
+        if bar is not None:
+            configure_count_progress_bar(bar)
         return dialog
 
     def _update_office_progress(self, dialog: QProgressDialog, state: dict) -> None:
@@ -5957,8 +6082,11 @@ class VictorPdfToolsQt(QMainWindow):
         dialog.setLabelText(text)
         if total <= 0:
             self.office_progress.setRange(0, 0)
+            self.office_progress.setTextVisible(False)
             dialog.setRange(0, 0)
         else:
+            self.office_progress.setTextVisible(True)
+            self.office_progress.setFormat("%v / %m")
             self.office_progress.setRange(0, total)
             self.office_progress.setValue(min(current, total))
             dialog.setRange(0, total)
@@ -5968,6 +6096,8 @@ class VictorPdfToolsQt(QMainWindow):
     def _finish_office_progress(self, dialog: QProgressDialog, text: str) -> None:
         self.office_progress.setRange(0, 100)
         self.office_progress.setValue(100)
+        self.office_progress.setTextVisible(True)
+        self.office_progress.setFormat("完成")
         self.office_progress_label.setText(text)
         dialog.setRange(0, 100)
         dialog.setValue(100)
@@ -6088,6 +6218,348 @@ class VictorPdfToolsQt(QMainWindow):
         finally:
             if dialog.isVisible():
                 self._finish_office_progress(dialog, self.office_progress_label.text())
+
+    def refresh_pdf_office_file_list(self) -> None:
+        self.pdf_office_file_list.clear()
+        for path in self.pdf_office_file_items:
+            self.pdf_office_file_list.addItem(str(path))
+
+    def add_pdf_office_files_from_paths(self, paths: list[Path]) -> None:
+        added = 0
+        skipped = 0
+        for path in paths:
+            if path.is_file() and path.suffix.lower() in PDF_SUFFIXES:
+                self.pdf_office_file_items.append(path)
+                added += 1
+            else:
+                skipped += 1
+        self.refresh_pdf_office_file_list()
+        if skipped:
+            self.set_status(f"已加入 {added} 個 PDF，略過 {skipped} 個不支援項目。")
+        elif added:
+            self.set_status(f"已加入 {added} 個 PDF。")
+
+    def add_pdf_office_files(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(self, "加入 PDF", "", "PDF files (*.pdf)")
+        self.add_pdf_office_files_from_paths([Path(path) for path in files])
+
+    def drop_pdf_office_files(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到「PDF 轉 Office」分頁。")
+            return
+        self.add_pdf_office_files_from_paths(pdf_paths)
+
+    def remove_pdf_office_files(self) -> None:
+        for index in sorted(
+            (self.pdf_office_file_list.row(item) for item in self.pdf_office_file_list.selectedItems()),
+            reverse=True,
+        ):
+            self.pdf_office_file_items.pop(index)
+        self.refresh_pdf_office_file_list()
+
+    def move_pdf_office_file(self, direction: int) -> None:
+        selected = sorted(self.pdf_office_file_list.row(item) for item in self.pdf_office_file_list.selectedItems())
+        if len(selected) != 1:
+            self.set_status("請選取一個檔案來上移或下移。")
+            return
+        source = selected[0]
+        target = source + direction
+        if target < 0 or target >= len(self.pdf_office_file_items):
+            return
+        item = self.pdf_office_file_items.pop(source)
+        self.pdf_office_file_items.insert(target, item)
+        self.refresh_pdf_office_file_list()
+        self.pdf_office_file_list.item(target).setSelected(True)
+
+    def clear_pdf_office_files(self) -> None:
+        self.pdf_office_file_items.clear()
+        self.refresh_pdf_office_file_list()
+
+    def _run_callable_in_background(self, fn, on_progress=None):
+        events: queue.Queue = queue.Queue()
+        box = {"value": None}
+
+        def work() -> None:
+            def progress_emit(current: int, total: int, text: str) -> None:
+                events.put(("progress", current, total, text))
+
+            try:
+                box["value"] = fn(progress_emit)
+            except Exception as exc:
+                events.put(("error", exc, None, None))
+                return
+            events.put(("done", None, None, None))
+
+        thread = threading.Thread(target=work, daemon=True)
+        thread.start()
+        error = None
+        while True:
+            QApplication.processEvents()
+            try:
+                kind, current, total, text = events.get(timeout=0.05)
+            except queue.Empty:
+                if not thread.is_alive() and events.empty():
+                    error = RuntimeError("背景轉換已結束，但沒有回傳結果。")
+                    break
+                continue
+            if kind == "progress":
+                if on_progress is not None:
+                    on_progress(current, total, text)
+            elif kind == "done":
+                break
+            elif kind == "error":
+                error = current
+                break
+        thread.join(timeout=2)
+        if error is not None:
+            raise error
+        return box["value"]
+
+    def _pdf_office_progress_dialog(self, title: str) -> QProgressDialog:
+        dialog = QProgressDialog(title, None, 0, 0, self)
+        dialog.setWindowTitle("PDF 轉 Office")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setCancelButton(None)
+        dialog.setMinimumWidth(420)
+        dialog.show()
+        bar = dialog.findChild(QProgressBar)
+        if bar is not None:
+            configure_count_progress_bar(bar)
+        return dialog
+
+    def _update_pdf_office_progress(self, dialog: QProgressDialog, current: int, total: int, text: str) -> None:
+        self.pdf_office_progress_label.setText(text)
+        dialog.setLabelText(text)
+        if total <= 0:
+            self.pdf_office_progress.setRange(0, 0)
+            self.pdf_office_progress.setTextVisible(False)
+            dialog.setRange(0, 0)
+        else:
+            self.pdf_office_progress.setTextVisible(True)
+            self.pdf_office_progress.setFormat("%v / %m")
+            self.pdf_office_progress.setRange(0, total)
+            self.pdf_office_progress.setValue(min(current, total))
+            dialog.setRange(0, total)
+            dialog.setValue(min(current, total))
+        QApplication.processEvents()
+
+    def _finish_pdf_office_progress(self, dialog: QProgressDialog, text: str) -> None:
+        self.pdf_office_progress.setRange(0, 100)
+        self.pdf_office_progress.setValue(100)
+        self.pdf_office_progress.setTextVisible(True)
+        self.pdf_office_progress.setFormat("完成")
+        self.pdf_office_progress_label.setText(text)
+        dialog.setRange(0, 100)
+        dialog.setValue(100)
+        dialog.setLabelText(text)
+        dialog.hide()
+        dialog.deleteLater()
+
+    def _pdf_office_options(self) -> tuple[str, str, str, str, str, int]:
+        fmt = self.pdf_office_format_combo.currentData() or "word"
+        extension = ".docx" if fmt == "word" else ".xlsx"
+        password = self.pdf_office_password_input.text()
+        pages = self.pdf_office_pages_input.text()
+        language = self.pdf_office_ocr_combo.currentData() or "auto"
+        try:
+            dpi = int(self.pdf_office_dpi_combo.currentText() or "200")
+        except ValueError:
+            dpi = 200
+        return fmt, extension, password, pages, language, dpi
+
+    def _ocr_language_status(self) -> str:
+        resolved = last_ocr_language()
+        if not resolved:
+            return ""
+        return f"（{ocr_language_short_label(resolved)}）"
+
+    def _pdf_office_method_label(self, fmt: str, method: str) -> str:
+        ocr_label = "OCR" + self._ocr_language_status() if method == "ocr" else "OCR"
+        if fmt == "word":
+            return {
+                "word": "Microsoft Word",
+                "libreoffice": "LibreOffice",
+                "pdf2docx": "版面重建",
+                "text": "版面重建（文字層）",
+                "ocr": ocr_label,
+            }.get(method, method)
+        return {
+            "tables": "偵測表格",
+            "columns": "對齊欄位",
+            "text": "文字層",
+            "ocr": ocr_label,
+        }.get(method, method)
+
+    def _convert_pdf_to_office_file(
+        self,
+        source: Path,
+        target: Path,
+        fmt: str,
+        password: str,
+        pages: str,
+        language: str,
+        dpi: int,
+        progress=None,
+    ) -> tuple[int, str]:
+        if fmt == "word":
+            return pdf_to_docx(
+                source,
+                target,
+                password,
+                pages_spec=pages,
+                language=language,
+                dpi=dpi,
+                progress=progress,
+            )
+        return pdf_to_xlsx(
+            source,
+            target,
+            password,
+            pages_spec=pages,
+            language=language,
+            dpi=dpi,
+            progress=progress,
+        )
+
+    def _suggested_pdf_office_path(self, source: Path, extension: str) -> Path:
+        stem = source.stem.strip(" .") or "output"
+        return source.with_name(f"{stem}{extension}")
+
+    def _open_converted_office_files(self, paths: list[Path], folder: Path | None = None) -> None:
+        if self.pdf_office_open_file_checkbox.isChecked():
+            for path in paths:
+                open_output_file(path)
+        if folder is not None and self.pdf_office_open_output_folder_checkbox.isChecked():
+            reveal_output(folder)
+
+    def run_pdf_to_office(self) -> None:
+        if not self.pdf_office_file_items:
+            self.set_status("請先加入 PDF 檔案。")
+            return
+        fmt, extension, password, pages, language, dpi = self._pdf_office_options()
+        kind_label = "Word" if fmt == "word" else "Excel"
+        dialog_filter = "Word files (*.docx)" if fmt == "word" else "Excel files (*.xlsx)"
+        separate = len(self.pdf_office_file_items) > 1
+        if separate:
+            folder = QFileDialog.getExistingDirectory(
+                self, "選擇輸出資料夾", str(self.pdf_office_file_items[0].parent)
+            )
+            if not folder:
+                return
+            folder_path = Path(folder)
+            outputs: list[Path] = []
+            dialog = self._pdf_office_progress_dialog("正在轉換 PDF…")
+            self._update_pdf_office_progress(dialog, 0, len(self.pdf_office_file_items), "正在轉換…")
+
+            def job() -> None:
+                file_count = len(self.pdf_office_file_items)
+                items = list(self.pdf_office_file_items)
+
+                def work(progress_emit):
+                    local_outputs: list[Path] = []
+                    last_method = ""
+                    for index, item in enumerate(items, start=1):
+                        target = folder_path / self._suggested_pdf_office_path(item, extension).name
+                        progress_emit(index - 1, file_count, f"({index}/{file_count}) {item.name}")
+                        _page_count, last_method = self._convert_pdf_to_office_file(
+                            item,
+                            target,
+                            fmt,
+                            password,
+                            pages,
+                            language,
+                            dpi,
+                            progress=progress_emit,
+                        )
+                        local_outputs.append(target)
+                    return local_outputs, last_method
+
+                local_outputs, last_method = self._run_callable_in_background(
+                    work,
+                    lambda current, total, text: self._update_pdf_office_progress(
+                        dialog, current, total, text
+                    ),
+                )
+                outputs.extend(local_outputs)
+                method_label = self._pdf_office_method_label(fmt, last_method)
+                self._last_tool_status_message = (
+                    f"已轉換 {len(outputs)} 個 PDF → {kind_label}（{method_label}）→ {folder_path}"
+                )
+
+            def on_success() -> None:
+                self._finish_pdf_office_progress(dialog, self._last_tool_status_message)
+                self.set_status(self._last_tool_status_message)
+                self._open_converted_office_files(outputs, folder_path)
+
+            try:
+                self.run_pdf_job(
+                    job,
+                    "",
+                    on_success=on_success,
+                    audit_operation=f"pdf_to_{fmt}",
+                    audit_source=self.pdf_office_file_items[0],
+                    audit_target=folder_path,
+                    audit_detail=f"{len(self.pdf_office_file_items)} files",
+                )
+            finally:
+                if dialog.isVisible():
+                    self._finish_pdf_office_progress(dialog, self.pdf_office_progress_label.text())
+            return
+
+        source = self.pdf_office_file_items[0]
+        suggested = str(self._suggested_pdf_office_path(source, extension))
+        target, _ = QFileDialog.getSaveFileName(self, f"另存 {kind_label}", suggested, dialog_filter)
+        if not target:
+            return
+        target_path = Path(target)
+        if target_path.suffix.lower() != extension:
+            target_path = target_path.with_suffix(extension)
+        dialog = self._pdf_office_progress_dialog(f"正在轉換 {source.name}…")
+        self._update_pdf_office_progress(dialog, 0, 0, f"正在轉換 {source.name}…")
+
+        def job() -> None:
+            def work(progress_emit):
+                return self._convert_pdf_to_office_file(
+                    source,
+                    target_path,
+                    fmt,
+                    password,
+                    pages,
+                    language,
+                    dpi,
+                    progress=progress_emit,
+                )
+
+            page_count, method = self._run_callable_in_background(
+                work,
+                lambda current, total, text: self._update_pdf_office_progress(
+                    dialog, current, total, text
+                ),
+            )
+            method_label = self._pdf_office_method_label(fmt, method)
+            self._last_tool_status_message = f"已把 {page_count} 頁轉成 {kind_label}（{method_label}）。"
+
+        def on_success() -> None:
+            self._finish_pdf_office_progress(dialog, self._last_tool_status_message)
+            self.set_status(self._last_tool_status_message)
+            self._open_converted_office_files([target_path])
+
+        try:
+            self.run_pdf_job(
+                job,
+                "",
+                on_success=on_success,
+                audit_operation=f"pdf_to_{fmt}",
+                audit_source=source,
+                audit_target=target_path,
+            )
+        finally:
+            if dialog.isVisible():
+                self._finish_pdf_office_progress(dialog, self.pdf_office_progress_label.text())
 
     def drop_advanced_pdf(self, paths: list[str]) -> None:
         pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
@@ -7346,52 +7818,22 @@ class VictorPdfToolsQt(QMainWindow):
                 source,
                 target_path,
                 password,
-                language=self.tool_ocr_language_combo.currentData(),
+                language=self.tool_ocr_language_combo.currentData() or "auto",
                 pages_spec=self.tool_pages_input.text(),
                 dpi=int(self.tool_image_dpi_combo.currentText()),
             )
-            self._last_tool_status_message = f"已 OCR 抽出 {page_count} 頁文字。"
+            self._last_tool_status_message = f"已 OCR{self._ocr_language_status()} 抽出 {page_count} 頁文字。"
             return
         elif operation == "ocr_searchable_pdf":
             page_count = ocr_pdf_to_searchable_pdf(
                 source,
                 target_path,
                 password,
-                language=self.tool_ocr_language_combo.currentData(),
+                language=self.tool_ocr_language_combo.currentData() or "auto",
                 pages_spec=self.tool_pages_input.text(),
                 dpi=int(self.tool_image_dpi_combo.currentText()),
             )
-            self._last_tool_status_message = f"已產生 {page_count} 頁可搜尋 PDF。"
-            return
-        elif operation == "pdf_to_word":
-            page_count, method = pdf_to_docx(
-                source,
-                target_path,
-                password,
-                pages_spec=self.tool_pages_input.text(),
-                language=self.tool_ocr_language_combo.currentData() or "eng+chi_tra",
-                dpi=int(self.tool_image_dpi_combo.currentText() or "200"),
-            )
-            method_label = {
-                "word": "Microsoft Word",
-                "libreoffice": "LibreOffice",
-                "pdf2docx": "版面重建",
-                "text": "文字層",
-                "ocr": "OCR",
-            }.get(method, method)
-            self._last_tool_status_message = f"已把 {page_count} 頁轉成 Word（{method_label}）。"
-            return
-        elif operation == "pdf_to_excel":
-            page_count, method = pdf_to_xlsx(
-                source,
-                target_path,
-                password,
-                pages_spec=self.tool_pages_input.text(),
-                language=self.tool_ocr_language_combo.currentData() or "eng+chi_tra",
-                dpi=int(self.tool_image_dpi_combo.currentText() or "200"),
-            )
-            method_label = {"tables": "偵測表格", "text": "文字層", "ocr": "OCR"}.get(method, method)
-            self._last_tool_status_message = f"已把 {page_count} 頁轉成 Excel（{method_label}）。"
+            self._last_tool_status_message = f"已產生 {page_count} 頁可搜尋 PDF{self._ocr_language_status()}。"
             return
         elif operation == "info":
             write_pdf_info(source, target_path, password)

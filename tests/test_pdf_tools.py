@@ -63,9 +63,32 @@ from pdf_core import (
     merge_text_blocks,
     ocr_pdf_to_searchable_pdf,
     ocr_pdf_to_text,
+    detect_ocr_language,
+    last_ocr_language,
+    ocr_language_short_label,
+    _docx_body_font_name,
+    _is_noisy_ocr_token,
+    _ocr_words_to_plain_text,
+    _ocr_words_to_rows,
+    _detect_page_gutter_x,
+    _add_docx_ocr_page,
+    _add_docx_layout_table,
+    _configure_docx_section_from_pdf,
+    _page_rows_are_two_column,
+    _rows_are_side_by_side_layout,
+    _column_tess_lang,
+    _tesseract_column_config,
+    configure_tesseract,
+    ensure_ocr_available,
+    normalize_cjk_text,
+    count_cjk_chars,
     pdf_to_docx,
     pdf_to_images,
     pdf_to_xlsx,
+    _is_useful_table,
+    _pymupdf_page_tables,
+    _table_looks_fragmented,
+    _words_to_table_rows,
     redact_matching_text_blocks_overlay,
     redact_text_block_secure,
     redact_text_block_overlay,
@@ -870,13 +893,81 @@ class PdfToolsTests(unittest.TestCase):
     def test_ocr_pdf_to_text_writes_text(self):
         target = Path(self.temp_dir.name) / "ocr.txt"
         with patch("pdf_core.ensure_ocr_available"), patch(
-            "pdf_core.render_pdf_page_images",
+            "pdf_core.iter_pdf_page_images",
             return_value=[(0, Image.new("RGB", (10, 10), "white"))],
         ), patch("pdf_core.pytesseract", Mock(image_to_string=Mock(return_value="Hello OCR"))):
             count = ocr_pdf_to_text(Path("source.pdf"), target, language="eng")
 
         self.assertEqual(count, 1)
         self.assertIn("Hello OCR", target.read_text(encoding="utf-8"))
+
+    def test_normalize_cjk_text_fixes_radicals_and_spaces(self):
+        self.assertEqual(normalize_cjk_text("中 英 ⽂ ⾴ ⾦"), "中英文頁金")
+        self.assertGreaterEqual(count_cjk_chars("金額核對"), 4)
+
+    def test_ocr_pdf_to_text_uses_chinese_primary_language_and_normalizes(self):
+        target = Path(self.temp_dir.name) / "ocr-cjk.txt"
+        ocr = Mock(image_to_string=Mock(return_value="中 英 ⽂ 年 報"))
+        with patch("pdf_core.ensure_ocr_available"), patch(
+            "pdf_core.iter_pdf_page_images",
+            return_value=[(0, Image.new("RGB", (10, 10), "white"))],
+        ), patch("pdf_core.pytesseract", ocr):
+            count = ocr_pdf_to_text(Path("source.pdf"), target, language="eng+chi_tra", dpi=200)
+
+        self.assertEqual(count, 1)
+        self.assertIn("中英文年報", target.read_text(encoding="utf-8"))
+        kwargs = ocr.image_to_string.call_args.kwargs
+        self.assertEqual(kwargs["lang"], "chi_tra+eng")
+        self.assertIn("--psm 3", kwargs["config"])
+
+    def test_detect_ocr_language_simplified_traditional_and_english(self):
+        self.assertEqual(
+            detect_ocr_language("深圳投资审计报告会计师事务所财务报表"),
+            "eng+chi_sim",
+        )
+        self.assertEqual(
+            detect_ocr_language("這份報告會與財務報表核對並請審閱"),
+            "eng+chi_tra",
+        )
+        self.assertEqual(
+            detect_ocr_language("Quarterly report for ABC Limited"),
+            "eng",
+        )
+        self.assertEqual(ocr_language_short_label("eng+chi_sim"), "英文+簡中")
+
+    def test_ocr_pdf_to_text_auto_detects_simplified_chinese(self):
+        target = Path(self.temp_dir.name) / "ocr-auto.txt"
+        ocr = Mock(image_to_string=Mock(return_value="深圳投资审计报告会计师事务所"))
+        with patch("pdf_core.ensure_ocr_available"), patch(
+            "pdf_core.iter_pdf_page_images",
+            return_value=[(0, Image.new("RGB", (10, 10), "white"))],
+        ), patch("pdf_core.pytesseract", ocr):
+            count = ocr_pdf_to_text(Path("source.pdf"), target, language="auto", dpi=200)
+
+        self.assertEqual(count, 1)
+        self.assertEqual(last_ocr_language(), "eng+chi_sim")
+        self.assertEqual(ocr.image_to_string.call_args.kwargs["lang"], "chi_sim+eng")
+        self.assertIn("深圳投资审计报告", target.read_text(encoding="utf-8"))
+
+    def test_ocr_pdf_to_text_reports_page_progress(self):
+        target = Path(self.temp_dir.name) / "ocr-progress.txt"
+        seen: list[str] = []
+        with patch("pdf_core.ensure_ocr_available"), patch(
+            "pdf_core.iter_pdf_page_images",
+            return_value=[
+                (0, Image.new("RGB", (10, 10), "white")),
+                (1, Image.new("RGB", (10, 10), "white")),
+            ],
+        ), patch("pdf_core.pytesseract", Mock(image_to_string=Mock(return_value="page"))):
+            count = ocr_pdf_to_text(
+                Path("source.pdf"),
+                target,
+                language="eng",
+                progress=lambda current, total, text: seen.append(text),
+            )
+        self.assertEqual(count, 2)
+        self.assertTrue(any("第 1 頁" in text for text in seen))
+        self.assertTrue(any("第 2 頁" in text for text in seen))
 
     def test_ocr_pdf_to_searchable_pdf_merges_ocr_pages(self):
         target = Path(self.temp_dir.name) / "searchable.pdf"
@@ -885,7 +976,7 @@ class PdfToolsTests(unittest.TestCase):
         writer.add_blank_page(width=100, height=100)
         writer.write(pdf_stream)
         with patch("pdf_core.ensure_ocr_available"), patch(
-            "pdf_core.render_pdf_page_images",
+            "pdf_core.iter_pdf_page_images",
             return_value=[(0, Image.new("RGB", (10, 10), "white"))],
         ), patch(
             "pdf_core.pytesseract",
@@ -895,6 +986,27 @@ class PdfToolsTests(unittest.TestCase):
 
         self.assertEqual(count, 1)
         self.assertEqual(len(PdfReader(str(target)).pages), 1)
+
+    def test_configure_tesseract_uses_discovered_exe(self):
+        fake_dir = Path(self.temp_dir.name) / "Tesseract-OCR"
+        fake_dir.mkdir()
+        fake_exe = fake_dir / "tesseract.exe"
+        fake_exe.write_bytes(b"stub")
+        mock = Mock()
+        mock.get_tesseract_version.side_effect = [Exception("not on PATH"), "5.4.0"]
+        mock.pytesseract = Mock()
+        with patch("pdf_core.OCR_AVAILABLE", True), patch("pdf_core.pytesseract", mock):
+            with patch("pdf_core._tesseract_exe_candidates", return_value=[fake_exe]):
+                found = configure_tesseract()
+        self.assertEqual(found, fake_exe)
+        self.assertEqual(mock.pytesseract.tesseract_cmd, str(fake_exe))
+
+    def test_ensure_ocr_available_explains_scan_pdf_when_missing(self):
+        with patch("pdf_core.OCR_AVAILABLE", False), patch("pdf_core.pytesseract", None):
+            with self.assertRaises(ValueError) as raised:
+                ensure_ocr_available()
+        self.assertIn("掃描件", str(raised.exception))
+        self.assertIn("Tesseract", str(raised.exception))
 
     def test_split_pdf_to_zip(self):
         source = Path(self.temp_dir.name) / "source.pdf"
@@ -1623,6 +1735,400 @@ class PdfToolsTests(unittest.TestCase):
         self.assertTrue(target.exists())
         texts = [paragraph.text for paragraph in Document(str(target)).paragraphs]
         self.assertTrue(any("Quarterly contracted sales" in text for text in texts))
+        run = next(run for paragraph in Document(str(target)).paragraphs for run in paragraph.runs if run.text.strip())
+        self.assertEqual(run.font.name, "Calibri")
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_docx_keeps_landscape_page_size(self):
+        import fitz
+        from docx import Document
+
+        source = Path(self.temp_dir.name) / "slide.pdf"
+        target = Path(self.temp_dir.name) / "slide.docx"
+        doc = fitz.open()
+        page = doc.new_page(width=960, height=540)
+        page.insert_text((40, 80), "中国海外宏洋集团有限公司审计策略正文段落测试", fontname="china-t", fontsize=12)
+        page.insert_text((40, 120), "根据近期会谈我们呈报审计策略概述并说明计划范围", fontname="china-t", fontsize=11)
+        doc.save(str(source))
+        doc.close()
+
+        with patch("pdf_core._pdf_to_docx_via_word", return_value=(False, "skip")):
+            with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
+                with patch("pdf_core._convert_pdf_to_docx_pdf2docx", return_value=False):
+                    pages, method = pdf_to_docx(source, target)
+
+        self.assertEqual(method, "text")
+        section = Document(str(target)).sections[0]
+        self.assertGreater(int(section.page_width), int(section.page_height))
+        self.assertEqual(len(Document(str(target)).tables), 0)
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_docx_skips_word_when_cjk_would_be_dropped(self):
+        import fitz
+        from docx import Document
+
+        source = Path(self.temp_dir.name) / "cjk-report.pdf"
+        target = Path(self.temp_dir.name) / "cjk-report.docx"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=500)
+        page.insert_text(
+            (36, 72),
+            "金額核對工作流程審核香港上市公司年報中英文版本差異翻譯完整性",
+            fontname="china-t",
+            fontsize=11,
+        )
+        page.insert_text(
+            (36, 96),
+            "金額核對工作流程審核香港上市公司年報中英文版本差異翻譯完整性",
+            fontname="china-t",
+            fontsize=11,
+        )
+        doc.save(str(source))
+        doc.close()
+
+        def fake_word(_source, output):
+            dropped = Document()
+            dropped.add_paragraph("Skill annual-report-bilingual-audit HKFRS")
+            dropped.save(str(output))
+            return True, "word"
+
+        with patch("pdf_core._pdf_to_docx_via_word", side_effect=fake_word):
+            with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
+                with patch("pdf_core._convert_pdf_to_docx_pdf2docx", return_value=False):
+                    pages, method = pdf_to_docx(source, target)
+
+        self.assertEqual(pages, 1)
+        self.assertEqual(method, "text")
+        texts = "\n".join(paragraph.text for paragraph in Document(str(target)).paragraphs)
+        self.assertIn("金額核對", texts)
+        self.assertGreater(count_cjk_chars(texts), 20)
+        run = next(run for paragraph in Document(str(target)).paragraphs for run in paragraph.runs if "金額" in run.text)
+        from docx.oxml.ns import qn
+
+        self.assertEqual(run.font.name, "微軟正黑體")
+        self.assertEqual(run._element.rPr.rFonts.get(qn("w:eastAsia")), "微軟正黑體")
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_docx_text_layer_keeps_bilingual_columns(self):
+        import fitz
+        from docx import Document
+
+        source = Path(self.temp_dir.name) / "bilingual.pdf"
+        target = Path(self.temp_dir.name) / "bilingual.docx"
+        doc = fitz.open()
+        page = doc.new_page(width=500, height=420)
+        pairs = [
+            (80, "BUSINESS REVIEW", "業務回顧"),
+            (120, "Revenue grew", "收入上升"),
+            (160, "in first half", "於上半年"),
+            (200, "Outlook remains", "前景仍然"),
+        ]
+        for y, english, chinese in pairs:
+            page.insert_text((40, y), english, fontsize=11)
+            page.insert_text((300, y), chinese, fontname="china-t", fontsize=11)
+        doc.save(str(source))
+        doc.close()
+
+        with patch("pdf_core._pdf_to_docx_via_word", return_value=(False, "skip")):
+            with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
+                with patch("pdf_core._convert_pdf_to_docx_pdf2docx", return_value=False):
+                    pages, method = pdf_to_docx(source, target)
+
+        self.assertEqual(pages, 1)
+        self.assertEqual(method, "text")
+        document = Document(str(target))
+        self.assertGreaterEqual(len(document.tables), 1)
+        table = document.tables[0]
+        left = " ".join(row.cells[0].text for row in table.rows)
+        right = " ".join(row.cells[1].text for row in table.rows)
+        self.assertIn("BUSINESS", left)
+        self.assertIn("業務回顧", right)
+        self.assertIn("Revenue", left)
+        self.assertIn("收入", right)
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_docx_text_layer_rebuilds_data_table(self):
+        import fitz
+        from docx import Document
+
+        source = Path(self.temp_dir.name) / "table-report.pdf"
+        target = Path(self.temp_dir.name) / "table-report.docx"
+        doc = fitz.open()
+        page = doc.new_page(width=500, height=400)
+        rows = [
+            (80, "Item", "Amount", "Note"),
+            (120, "Rent", "1000", "A"),
+            (160, "Tax", "200", "B"),
+            (200, "Total", "1200", "C"),
+        ]
+        for y, first, second, third in rows:
+            page.insert_text((50, y), first, fontsize=11)
+            page.insert_text((220, y), second, fontsize=11)
+            page.insert_text((360, y), third, fontsize=11)
+        doc.save(str(source))
+        doc.close()
+
+        with patch("pdf_core._pdf_to_docx_via_word", return_value=(False, "skip")):
+            with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
+                with patch("pdf_core._convert_pdf_to_docx_pdf2docx", return_value=False):
+                    pages, method = pdf_to_docx(source, target)
+
+        self.assertEqual(method, "text")
+        document = Document(str(target))
+        self.assertGreaterEqual(len(document.tables), 1)
+        joined = [" ".join(cell.text for cell in row.cells) for row in document.tables[0].rows]
+        self.assertTrue(any("Item" in line and "Amount" in line for line in joined))
+        self.assertTrue(any("Rent" in line and "1000" in line for line in joined))
+
+    def test_docx_body_font_name_picks_simplified_and_traditional(self):
+        self.assertEqual(_docx_body_font_name("我们的审计方法财务报表测试"), "微软雅黑")
+        self.assertEqual(_docx_body_font_name("這份報告會與財務報表核對並請審閱"), "微軟正黑體")
+        self.assertEqual(_docx_body_font_name("Quarterly report"), "Calibri")
+
+    def test_ocr_filters_garbage_and_keeps_bilingual_columns(self):
+        self.assertTrue(_is_noisy_ocr_token("$5!", 80))
+        self.assertTrue(_is_noisy_ocr_token("BCDFGHJ", 90))
+        self.assertFalse(_is_noisy_ocr_token("HKFRS", 90))
+        self.assertFalse(_is_noisy_ocr_token("管理層", 80))
+        words = [
+            (20, 40, 80, 54, "BUSINESS", 0, 0, 0),
+            (90, 40, 150, 54, "REVIEW", 0, 0, 1),
+            (320, 40, 380, 54, "業務回顧", 0, 0, 2),
+            (20, 80, 70, 94, "Revenue", 0, 1, 0),
+            (320, 80, 370, 94, "收入", 0, 1, 1),
+        ]
+        text = _ocr_words_to_plain_text(words, 500)
+        self.assertIn("BUSINESS", text)
+        self.assertIn("業務回顧", text)
+        self.assertIn("|", text)
+
+    def test_ocr_words_to_rows_pairs_left_english_right_chinese(self):
+        words = [
+            (20, 40, 80, 54, "BUSINESS", 0, 0, 0),
+            (90, 40, 150, 54, "REVIEW", 0, 0, 1),
+            (320, 40, 400, 54, "業務回顧", 0, 0, 2),
+            (20, 80, 90, 94, "Revenue", 0, 1, 0),
+            (320, 80, 370, 94, "收入", 0, 1, 1),
+            (20, 120, 70, 134, "grew", 0, 2, 0),
+            (20, 160, 100, 174, "steadily", 0, 3, 0),
+            (320, 120, 400, 134, "穩步增長", 0, 2, 1),
+            (20, 200, 80, 214, "Outlook", 0, 4, 0),
+            (320, 200, 380, 214, "前景", 0, 4, 1),
+            (20, 240, 90, 254, "remains", 0, 5, 0),
+            (320, 240, 400, 254, "仍然穩健", 0, 5, 1),
+        ]
+        rows = _ocr_words_to_rows(words, 500, split_at=250)
+        self.assertGreaterEqual(len(rows), 3)
+        self.assertEqual(rows[0][0], "BUSINESS REVIEW")
+        self.assertEqual(rows[0][1], "業務回顧")
+        self.assertTrue(any(row[0] == "Revenue" and row[1] == "收入" for row in rows))
+
+    def test_detect_page_gutter_x_finds_center_valley(self):
+        image = Image.new("L", (400, 300), 255)
+        pixels = image.load()
+        for x in range(30, 160):
+            for y in range(40, 260):
+                pixels[x, y] = 20
+        for x in range(240, 370):
+            for y in range(40, 260):
+                pixels[x, y] = 20
+        gutter = _detect_page_gutter_x(image)
+        self.assertIsNotNone(gutter)
+        self.assertGreater(gutter, 160)
+        self.assertLess(gutter, 240)
+
+    def test_detect_page_gutter_x_ignores_gray_paper_noise(self):
+        image = Image.new("L", (400, 300), 210)
+        pixels = image.load()
+        for x in range(30, 160):
+            for y in range(40, 260):
+                pixels[x, y] = 40
+        for x in range(240, 370):
+            for y in range(40, 260):
+                pixels[x, y] = 40
+        gutter = _detect_page_gutter_x(image)
+        self.assertIsNotNone(gutter)
+        self.assertGreater(gutter, 160)
+        self.assertLess(gutter, 240)
+
+    def test_ocr_page_keeps_two_columns_for_short_headings(self):
+        from docx import Document
+
+        document = Document()
+        rows = [
+            ["MANAGEMENT DISCUSSION AND", "管理層討論及分析"],
+            ["BUSINESS REVIEW", "業務回顧"],
+        ]
+        _add_docx_ocr_page(document, rows, "Calibri")
+        self.assertEqual(len(document.tables), 1)
+        self.assertEqual(document.tables[0].cell(0, 0).text.strip(), "MANAGEMENT DISCUSSION AND")
+        self.assertEqual(document.tables[0].cell(0, 1).text.strip(), "管理層討論及分析")
+        mixed = [paragraph.text for paragraph in document.paragraphs if "MANAGEMENT" in paragraph.text and "管理層" in paragraph.text]
+        self.assertEqual(mixed, [])
+
+    def test_docx_ocr_page_writes_bilingual_table(self):
+        from docx import Document
+        from docx.oxml.ns import qn
+
+        document = Document()
+        rows = [
+            ["BUSINESS REVIEW", "業務回顧"],
+            ["Revenue increased", "收入上升"],
+            ["in the first half", "於上半年"],
+            ["Outlook remains", "前景仍然"],
+        ]
+        _add_docx_ocr_page(document, rows, "Calibri")
+        self.assertEqual(len(document.tables), 1)
+        table = document.tables[0]
+        self.assertEqual(table.cell(0, 0).text.strip(), "BUSINESS REVIEW")
+        self.assertEqual(table.cell(0, 1).text.strip(), "業務回顧")
+        self.assertEqual(table.cell(1, 1).text.strip(), "收入上升")
+        right_run = table.cell(0, 1).paragraphs[0].runs[0]
+        self.assertEqual(right_run._element.rPr.rFonts.get(qn("w:eastAsia")), "微軟正黑體")
+
+    def test_toc_page_numbers_are_not_side_by_side_layout(self):
+        rows = [
+            ["审计目标及管理层的责任", "04"],
+            ["审计团队", "07"],
+            ["我们的审计方法", "10"],
+            ["对舞弊风险的认识", "24"],
+        ]
+        self.assertTrue(_page_rows_are_two_column(rows))
+        self.assertFalse(_rows_are_side_by_side_layout(rows))
+
+    def test_docx_layout_table_fits_landscape_page(self):
+        from docx import Document
+
+        document = Document()
+        _configure_docx_section_from_pdf(document, 960, 540)
+        section = document.sections[0]
+        self.assertGreater(int(section.page_width), int(section.page_height))
+        rows = [
+            ["BUSINESS REVIEW", "業務回顧"],
+            ["Revenue increased", "收入上升"],
+            ["in the first half", "於上半年"],
+            ["Outlook remains", "前景仍然"],
+        ]
+        _add_docx_layout_table(document, rows, "Calibri", 11.0, bordered=False)
+        table = document.tables[0]
+        usable = int(section.page_width - section.left_margin - section.right_margin)
+        cell_w = int(table.cell(0, 0).width)
+        self.assertGreater(cell_w, usable * 0.3)
+        self.assertLess(cell_w, usable * 0.7)
+        self.assertLess(cell_w * 2, usable + 200000)
+
+    def test_column_ocr_uses_english_first_on_left(self):
+        self.assertEqual(_column_tess_lang("chi_tra+eng", prefer_cjk=False), "eng+chi_tra")
+        self.assertEqual(_column_tess_lang("chi_tra+eng", prefer_cjk=True), "chi_tra+eng")
+        self.assertIn("--psm 6", _tesseract_column_config("--oem 1 --psm 3 -c preserve_interword_spaces=1"))
+
+    def test_words_to_table_rows_splits_aligned_columns(self):
+        words = [
+            (50, 80, 90, 92, "Item", 0, 0, 0),
+            (280, 80, 340, 92, "Amount", 0, 0, 1),
+            (50, 120, 90, 132, "Rent", 0, 1, 0),
+            (280, 120, 320, 132, "1000", 0, 1, 1),
+            (50, 160, 80, 172, "Tax", 0, 2, 0),
+            (280, 160, 310, 172, "200", 0, 2, 1),
+            (50, 200, 90, 212, "Total", 0, 3, 0),
+            (280, 200, 320, 212, "1200", 0, 3, 1),
+        ]
+        rows = _words_to_table_rows(words, 500)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0][:2], ["Item", "Amount"])
+        self.assertEqual(rows[1][:2], ["Rent", "1000"])
+        self.assertTrue(_is_useful_table(rows))
+        self.assertFalse(_is_useful_table([["logo"], [""]]))
+        self.assertFalse(_is_useful_table([["only one column"], ["still one"]]))
+
+    def test_table_looks_fragmented_rejects_split_words(self):
+        fragmented = [
+            ["HKFRS Ac", "counting S", "tandards", "Update No", ".", "3"],
+            ["ection I. Am", "ended Sta", "ndards issued", "that are ap", "plicable to", "2027"],
+            ["HKFRS 9 a", "nd HKFRS", "7 Classifi", "cation and", "Measure", "ment"],
+        ]
+        self.assertTrue(_table_looks_fragmented(fragmented))
+        intact = [
+            ["Standards affected", "Amendments relate to", "Members' Handbook"],
+            ["HKFRS 9 and HKFRS 7", "Classification and Measurement of Financial Instruments", "Update No. 315"],
+            ["HKFRS 1, HKFRS 7", "Annual Improvements to HKFRS Accounting Standards", "Update No. 316"],
+        ]
+        self.assertFalse(_table_looks_fragmented(intact))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pymupdf_page_tables_uses_default_lines_only(self):
+        import fitz
+        from types import SimpleNamespace
+
+        calls: list[dict] = []
+
+        def fake_find_tables(*_args, **kwargs):
+            calls.append(kwargs)
+            return SimpleNamespace(tables=[])
+
+        source = Path(self.temp_dir.name) / "lines-only.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_text((50, 80), "Item")
+        page.insert_text((220, 80), "Amount")
+        doc.save(str(source))
+        doc.close()
+
+        document = fitz.open(str(source))
+        try:
+            with patch.object(type(document[0]), "find_tables", fake_find_tables):
+                rows = _pymupdf_page_tables(document[0])
+        finally:
+            document.close()
+
+        self.assertEqual(rows, [])
+        self.assertEqual(len(calls), 1)
+        self.assertNotIn("strategy", calls[0])
+        self.assertNotEqual(calls[0].get("vertical_strategy"), "text")
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_xlsx_reports_page_progress(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "progress.pdf"
+        target = Path(self.temp_dir.name) / "progress.xlsx"
+        doc = fitz.open()
+        for index in range(2):
+            page = doc.new_page(width=400, height=300)
+            page.insert_text((50, 80), f"Row {index + 1}")
+            page.insert_text((220, 80), str((index + 1) * 10))
+        doc.save(str(source))
+        doc.close()
+
+        seen: list[tuple[int, int, str]] = []
+
+        def progress(current: int, total: int, text: str) -> None:
+            seen.append((current, total, text))
+
+        pages, method = pdf_to_xlsx(source, target, progress=progress)
+
+        self.assertEqual(pages, 2)
+        self.assertTrue(target.exists())
+        self.assertTrue(any("第 1 / 2 頁" in text for _current, _total, text in seen))
+        self.assertTrue(any(current == 1 and total == 2 for current, total, _text in seen))
 
     @unittest.skipUnless(
         __import__("pdf_core").PYMUPDF_AVAILABLE,
@@ -1644,10 +2150,121 @@ class PdfToolsTests(unittest.TestCase):
         pages, method = pdf_to_xlsx(source, target)
 
         self.assertEqual(pages, 1)
-        self.assertIn(method, {"tables", "text"})
+        self.assertIn(method, {"tables", "columns", "text"})
         self.assertTrue(target.exists())
         values = [cell.value for row in load_workbook(target).active.iter_rows() for cell in row]
         self.assertTrue(any(value and "Alpha" in str(value) for value in values))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_xlsx_extracts_borderless_columns(self):
+        import fitz
+        from openpyxl import load_workbook
+
+        source = Path(self.temp_dir.name) / "borderless.pdf"
+        target = Path(self.temp_dir.name) / "borderless.xlsx"
+        doc = fitz.open()
+        page = doc.new_page(width=500, height=400)
+        page.insert_text((50, 80), "Item")
+        page.insert_text((280, 80), "Amount")
+        page.insert_text((50, 120), "Rent")
+        page.insert_text((280, 120), "1000")
+        page.insert_text((50, 160), "Tax")
+        page.insert_text((280, 160), "200")
+        page.insert_text((50, 200), "Total")
+        page.insert_text((280, 200), "1200")
+        doc.save(str(source))
+        doc.close()
+
+        pages, method = pdf_to_xlsx(source, target)
+
+        self.assertEqual(pages, 1)
+        self.assertIn(method, {"tables", "columns"})
+        rows = [tuple(cell.value for cell in row) for row in load_workbook(target).active.iter_rows()]
+        joined = [" ".join("" if cell is None else str(cell) for cell in row) for row in rows]
+        self.assertTrue(any("Item" in line and "Amount" in line for line in joined))
+        self.assertTrue(any("Rent" in line and "1000" in line for line in joined))
+        widths = {len(row) for row in rows}
+        self.assertTrue(any(width >= 2 for width in widths))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_xlsx_skips_junk_tables_and_keeps_columns(self):
+        import fitz
+        from openpyxl import load_workbook
+        from types import SimpleNamespace
+
+        source = Path(self.temp_dir.name) / "junk-table.pdf"
+        target = Path(self.temp_dir.name) / "junk-table.xlsx"
+        doc = fitz.open()
+        page = doc.new_page(width=500, height=400)
+        page.insert_text((50, 80), "Account")
+        page.insert_text((280, 80), "Balance")
+        page.insert_text((50, 120), "Cash")
+        page.insert_text((280, 120), "500")
+        page.insert_text((50, 160), "Debt")
+        page.insert_text((280, 160), "80")
+        doc.save(str(source))
+        doc.close()
+
+        junk = SimpleNamespace(extract=lambda: [["logo"], [""]])
+        finder = SimpleNamespace(tables=[junk])
+        with patch("fitz.Page.find_tables", return_value=finder):
+            pages, method = pdf_to_xlsx(source, target)
+
+        self.assertEqual(pages, 1)
+        self.assertEqual(method, "columns")
+        rows = [tuple(cell.value for cell in row) for row in load_workbook(target).active.iter_rows()]
+        joined = [" ".join("" if cell is None else str(cell) for cell in row) for row in rows]
+        self.assertTrue(any("Cash" in line and "500" in line for line in joined))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_to_xlsx_ocr_rebuilds_columns_from_boxes(self):
+        import fitz
+        from openpyxl import load_workbook
+        from types import SimpleNamespace
+
+        source = Path(self.temp_dir.name) / "scan-table.pdf"
+        target = Path(self.temp_dir.name) / "scan-table.xlsx"
+        image_path = Path(self.temp_dir.name) / "scan.png"
+        Image.new("RGB", (400, 300), "white").save(image_path)
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_image(page.rect, filename=str(image_path))
+        doc.save(str(source))
+        doc.close()
+
+        data = {
+            "text": ["Item", "Amount", "Rent", "1000", "Tax", "200"],
+            "conf": ["90"] * 6,
+            "left": [50, 280, 50, 280, 50, 280],
+            "top": [80, 80, 120, 120, 160, 160],
+            "width": [40, 60, 40, 40, 30, 30],
+            "height": [12] * 6,
+        }
+        ocr = Mock()
+        ocr.Output = SimpleNamespace(DICT="dict")
+        ocr.image_to_data = Mock(return_value=data)
+        ocr.image_to_string = Mock(return_value="Item Amount")
+        with patch("pdf_core.ensure_ocr_available"), patch(
+            "pdf_core.iter_pdf_page_images",
+            return_value=[(0, Image.new("RGB", (400, 300), "white"))],
+        ), patch("pdf_core.pytesseract", ocr):
+            pages, method = pdf_to_xlsx(source, target)
+
+        self.assertEqual(pages, 1)
+        self.assertEqual(method, "ocr")
+        rows = [tuple(cell.value for cell in row) for row in load_workbook(target).active.iter_rows()]
+        joined = [" ".join("" if cell is None else str(cell) for cell in row) for row in rows]
+        self.assertTrue(any("Item" in line and "Amount" in line for line in joined))
+        self.assertTrue(any("Rent" in line and "1000" in line for line in joined))
 
     def setUp(self):
         import tempfile

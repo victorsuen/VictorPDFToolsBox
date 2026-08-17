@@ -3,12 +3,14 @@ from __future__ import annotations
 import ctypes
 import io
 import math
+import os
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
 import threading
+import unicodedata
 import zipfile
 from collections.abc import Callable
 from copy import copy
@@ -75,12 +77,87 @@ OFFICE_DIALOG_FILTER = (
     "All files (*.*)"
 )
 OCR_LANGUAGE_OPTIONS = {
-    "eng": "English",
-    "chi_tra": "Traditional Chinese",
-    "chi_sim": "Simplified Chinese",
-    "eng+chi_tra": "English + Traditional Chinese",
-    "eng+chi_sim": "English + Simplified Chinese",
+    "auto": "自動偵測（繁／簡／英）",
+    "eng": "英文",
+    "chi_tra": "繁體中文",
+    "chi_sim": "簡體中文",
+    "eng+chi_tra": "英文 + 繁中",
+    "eng+chi_sim": "英文 + 簡中",
 }
+
+_TRAD_SIMP_PAIRS = (
+    ("國", "国"),
+    ("個", "个"),
+    ("這", "这"),
+    ("為", "为"),
+    ("與", "与"),
+    ("從", "从"),
+    ("後", "后"),
+    ("發", "发"),
+    ("對", "对"),
+    ("會", "会"),
+    ("學", "学"),
+    ("經", "经"),
+    ("業", "业"),
+    ("東", "东"),
+    ("車", "车"),
+    ("門", "门"),
+    ("開", "开"),
+    ("關", "关"),
+    ("麼", "么"),
+    ("並", "并"),
+    ("萬", "万"),
+    ("億", "亿"),
+    ("餘", "余"),
+    ("於", "于"),
+    ("過", "过"),
+    ("還", "还"),
+    ("說", "说"),
+    ("請", "请"),
+    ("語", "语"),
+    ("證", "证"),
+    ("據", "据"),
+    ("總", "总"),
+    ("報", "报"),
+    ("務", "务"),
+    ("審", "审"),
+    ("計", "计"),
+    ("財", "财"),
+    ("帳", "账"),
+    ("虧", "亏"),
+    ("損", "损"),
+    ("權", "权"),
+    ("債", "债"),
+    ("資", "资"),
+    ("產", "产"),
+    ("現", "现"),
+    ("廣", "广"),
+    ("體", "体"),
+    ("銀", "银"),
+    ("錄", "录"),
+    ("際", "际"),
+    ("點", "点"),
+    ("樣", "样"),
+    ("將", "将"),
+    ("來", "来"),
+    ("們", "们"),
+    ("條", "条"),
+    ("額", "额"),
+    ("匯", "汇"),
+    ("兌", "兑"),
+    ("團", "团"),
+    ("聯", "联"),
+    ("營", "营"),
+    ("處", "处"),
+    ("號", "号"),
+    ("師", "师"),
+    ("書", "书"),
+    ("頁", "页"),
+    ("係", "系"),
+)
+_TRAD_ONLY_CHARS = {traditional for traditional, _simplified in _TRAD_SIMP_PAIRS}
+_SIMP_ONLY_CHARS = {simplified for _traditional, simplified in _TRAD_SIMP_PAIRS}
+LAST_OCR_LANGUAGE = ""
 
 
 @dataclass(frozen=True)
@@ -520,6 +597,23 @@ def _page_indexes_or_all(source: Path, password: str = "", pages_spec: str = "")
     return list(range(len(reader.pages)))
 
 
+def _pdf_page_size(source: Path, password: str = "", page_index: int = 0) -> tuple[float, float]:
+    if PYMUPDF_AVAILABLE and fitz is not None:
+        document = fitz.open(str(source))
+        try:
+            if document.is_encrypted and password:
+                document.authenticate(password)
+            if document.page_count <= 0:
+                return 595.0, 842.0
+            page = document[min(max(page_index, 0), document.page_count - 1)]
+            return float(page.rect.width), float(page.rect.height)
+        finally:
+            document.close()
+    reader = open_reader(source, password)
+    box = reader.pages[min(max(page_index, 0), len(reader.pages) - 1)].mediabox
+    return float(box.width), float(box.height)
+
+
 def _pdf_extractable_char_count(source: Path, password: str = "", pages_spec: str = "") -> int:
     reader = open_reader(source, password)
     indexes = _page_indexes_or_all(source, password, pages_spec)
@@ -527,6 +621,234 @@ def _pdf_extractable_char_count(source: Path, password: str = "", pages_spec: st
     for index in indexes:
         total += len((reader.pages[index].extract_text() or "").strip())
     return total
+
+
+def _is_cjk_char(char: str) -> bool:
+    code = ord(char)
+    return (
+        0x2E80 <= code <= 0x2EFF
+        or 0x2F00 <= code <= 0x2FDF
+        or 0x3400 <= code <= 0x4DBF
+        or 0x4E00 <= code <= 0x9FFF
+        or 0xF900 <= code <= 0xFAFF
+    )
+
+
+def count_cjk_chars(text: str) -> int:
+    return sum(1 for char in text or "" if _is_cjk_char(char))
+
+
+_CJK_RADICAL_SUPPLEMENT = str.maketrans(
+    {
+        "\u2e9d": "\u6c11",  # ⺠ → 民
+        "\u2ed1": "\u9577",  # ⻑ → 長
+    }
+)
+
+
+def normalize_cjk_text(text: str) -> str:
+    """Fix Tesseract / pypdf CJK radicals and spaces between Chinese characters."""
+    if not text:
+        return text
+    normalized = unicodedata.normalize("NFKC", text).translate(_CJK_RADICAL_SUPPLEMENT)
+    return re.sub(
+        r"(?<=[\u2e80-\u2fdf\u3400-\u9fff\uf900-\ufaff])[ \t]+(?=[\u2e80-\u2fdf\u3400-\u9fff\uf900-\ufaff])",
+        "",
+        normalized,
+    )
+
+
+def _pdf_plain_text(source: Path, password: str = "", pages_spec: str = "") -> str:
+    indexes = _page_indexes_or_all(source, password, pages_spec)
+    if PYMUPDF_AVAILABLE and fitz is not None:
+        document = None
+        try:
+            document = fitz.open(str(source))
+            if document.is_encrypted:
+                if not password or document.authenticate(password) == 0:
+                    raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+            return "\n".join((document[index].get_text("text") or "") for index in indexes)
+        except ValueError:
+            raise
+        except Exception:
+            pass
+        finally:
+            if document is not None:
+                document.close()
+    reader = open_reader(source, password)
+    return "\n".join((reader.pages[index].extract_text() or "") for index in indexes)
+
+
+def _pdf_cjk_char_count(source: Path, password: str = "", pages_spec: str = "") -> int:
+    return count_cjk_chars(_pdf_plain_text(source, password, pages_spec))
+
+
+def _docx_plain_text(path: Path) -> str:
+    try:
+        with zipfile.ZipFile(path) as archive:
+            xml = archive.read("word/document.xml").decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+    return "".join(re.findall(r"<w:t[^>]*>([^<]*)</w:t>", xml))
+
+
+def _docx_keeps_cjk(target: Path, source_cjk: int) -> bool:
+    if source_cjk < 24:
+        return True
+    if not target.is_file():
+        return False
+    kept = count_cjk_chars(_docx_plain_text(target))
+    return kept >= max(12, int(source_cjk * 0.35))
+
+
+def _tesseract_language(language: str) -> str:
+    mapping = {
+        "eng+chi_tra": "chi_tra+eng",
+        "eng+chi_sim": "chi_sim+eng",
+        "eng+chi_tra+chi_sim": "chi_tra+chi_sim+eng",
+        "auto": "chi_tra+chi_sim+eng",
+    }
+    return mapping.get(language or "", language or "eng")
+
+
+def _tesseract_config(language: str) -> str:
+    lang = _tesseract_language(language)
+    if "chi_" in lang:
+        return "--oem 1 --psm 3 -c preserve_interword_spaces=1"
+    return "--psm 3 -c preserve_interword_spaces=1"
+
+
+def _tesseract_column_config(tess_config: str) -> str:
+    config = tess_config or "--psm 6 -c preserve_interword_spaces=1"
+    if re.search(r"--psm \d+", config):
+        return re.sub(r"--psm \d+", "--psm 6", config)
+    return f"{config} --psm 6".strip()
+
+
+def _column_tess_lang(tess_lang: str, prefer_cjk: bool) -> str:
+    parts = [part for part in (tess_lang or "eng").split("+") if part]
+    if not parts:
+        return "eng"
+    chinese = [part for part in parts if part.startswith("chi_")]
+    rest = [part for part in parts if not part.startswith("chi_")]
+    if not chinese:
+        return "+".join(parts)
+    if prefer_cjk:
+        return "+".join(chinese + rest)
+    return "+".join(rest + chinese) if rest else "+".join(chinese)
+
+
+def _ocr_render_dpi(language: str, dpi: int) -> int:
+    requested = language or ""
+    if requested in {"auto", "eng+chi_tra+chi_sim"} or "chi_" in requested:
+        if dpi < 300:
+            return 300
+    return dpi
+
+
+def detect_ocr_language(text: str) -> str:
+    """Pick a Tesseract language pack from a short OCR sample."""
+    sample = text or ""
+    trad = sum(1 for char in sample if char in _TRAD_ONLY_CHARS)
+    simp = sum(1 for char in sample if char in _SIMP_ONLY_CHARS)
+    cjk = count_cjk_chars(sample)
+    latin = sum(1 for char in sample if ("A" <= char <= "Z") or ("a" <= char <= "z"))
+    if cjk < 8 and latin >= 12:
+        return "eng"
+    if simp > trad and simp >= 3:
+        return "eng+chi_sim"
+    if trad > simp and trad >= 3:
+        return "eng+chi_tra"
+    if cjk >= 8:
+        return "eng+chi_tra+chi_sim"
+    if latin >= 8:
+        return "eng"
+    return "eng+chi_tra+chi_sim"
+
+
+def ocr_language_label(language: str) -> str:
+    return OCR_LANGUAGE_OPTIONS.get(language, language or "自動偵測")
+
+
+def last_ocr_language() -> str:
+    return LAST_OCR_LANGUAGE
+
+
+def ocr_language_short_label(language: str) -> str:
+    return {
+        "eng": "英文",
+        "chi_tra": "繁中",
+        "chi_sim": "簡中",
+        "eng+chi_tra": "英文+繁中",
+        "eng+chi_sim": "英文+簡中",
+        "eng+chi_tra+chi_sim": "中英混合",
+        "auto": "自動偵測",
+    }.get(language, language or "自動偵測")
+
+
+def _set_last_ocr_language(language: str) -> None:
+    global LAST_OCR_LANGUAGE
+    LAST_OCR_LANGUAGE = language
+
+
+def _resolved_ocr_settings(language: str, sample_image: Image.Image | None = None) -> tuple[str, str, str]:
+    resolved = resolve_ocr_language(language, sample_image)
+    _set_last_ocr_language(resolved)
+    return resolved, _tesseract_language(resolved), _tesseract_config(resolved)
+
+
+def _ocr_image_to_string(image: Image.Image, language: str) -> str:
+    prepared = _prepare_ocr_image(image)
+    try:
+        tess_lang = _tesseract_language(language)
+        return pytesseract.image_to_string(
+            prepared,
+            lang=tess_lang,
+            config=_tesseract_config(language),
+        )
+    finally:
+        if prepared is not image:
+            prepared.close()
+
+
+def _probe_ocr_text(image: Image.Image) -> str:
+    for language in ("eng+chi_tra+chi_sim", "eng+chi_sim", "eng+chi_tra", "eng"):
+        try:
+            text = _ocr_image_to_string(image, language)
+        except Exception:
+            continue
+        if (text or "").strip():
+            return text
+    return ""
+
+
+def resolve_ocr_language(language: str, sample_image: Image.Image | None = None) -> str:
+    requested = (language or "auto").strip() or "auto"
+    if requested != "auto":
+        return requested
+    if sample_image is None:
+        return "eng+chi_tra+chi_sim"
+    return detect_ocr_language(_probe_ocr_text(sample_image))
+
+
+def _prepare_ocr_image(image: Image.Image) -> Image.Image:
+    from PIL import ImageFilter, ImageOps
+
+    width, height = image.size
+    longest = max(width, height)
+    work = image
+    resample = getattr(getattr(Image, "Resampling", Image), "LANCZOS", Image.LANCZOS)
+    if longest < 1800:
+        scale = 1800 / float(longest)
+        work = image.resize((max(1, int(width * scale)), max(1, int(height * scale))), resample)
+    elif longest > 3200:
+        scale = 3200 / float(longest)
+        work = image.resize((max(1, int(width * scale)), max(1, int(height * scale))), resample)
+    gray = work.convert("L")
+    if work is not image:
+        work.close()
+    gray = ImageOps.autocontrast(gray, cutoff=1)
+    return gray.filter(ImageFilter.UnsharpMask(radius=1.2, percent=140, threshold=2))
 
 
 def _write_unlocked_pdf_copy(source: Path, password: str = "") -> Path:
@@ -657,36 +979,475 @@ def _pdf_to_office_via_libreoffice(source: Path, target: Path, convert_to: str) 
         return True, "libreoffice"
 
 
+def _docx_body_font_name(text: str) -> str:
+    sample = text or ""
+    if count_cjk_chars(sample) < 8:
+        return "Calibri"
+    trad = sum(1 for char in sample if char in _TRAD_ONLY_CHARS)
+    simp = sum(1 for char in sample if char in _SIMP_ONLY_CHARS)
+    if trad > simp:
+        return "微軟正黑體"
+    return "微软雅黑"
+
+
+def _docx_body_size(sizes: list[float]) -> float:
+    if not sizes:
+        return 11.0
+    ordered = sorted(float(size) for size in sizes if size)
+    if not ordered:
+        return 11.0
+    median = ordered[len(ordered) // 2]
+    return max(10.0, min(12.0, round(median)))
+
+
+def _docx_display_size(raw_size: float, body_size: float) -> float:
+    size = float(raw_size or body_size)
+    if size >= body_size * 1.75:
+        return min(18.0, body_size + 5)
+    if size >= body_size * 1.3:
+        return min(14.0, body_size + 2)
+    if size <= body_size * 0.8:
+        return max(9.0, body_size - 1)
+    return body_size
+
+
+def _docx_set_rfonts(element, font_name: str) -> None:
+    from docx.oxml.ns import qn
+
+    r_pr = element.get_or_add_rPr()
+    r_fonts = r_pr.find(qn("w:rFonts"))
+    if r_fonts is None:
+        from docx.oxml import OxmlElement
+
+        r_fonts = OxmlElement("w:rFonts")
+        r_pr.append(r_fonts)
+    r_fonts.set(qn("w:ascii"), font_name)
+    r_fonts.set(qn("w:hAnsi"), font_name)
+    r_fonts.set(qn("w:eastAsia"), font_name)
+    r_fonts.set(qn("w:cs"), font_name)
+
+
+def _configure_docx_normal_style(document, font_name: str, body_size: float) -> None:
+    from docx.shared import Pt
+
+    style = document.styles["Normal"]
+    style.font.name = font_name
+    style.font.size = Pt(body_size)
+    _docx_set_rfonts(style.element, font_name)
+
+
+def _configure_docx_section_from_pdf(document, width_pt: float, height_pt: float) -> None:
+    from docx.enum.section import WD_ORIENT
+    from docx.shared import Inches, Pt
+
+    width_pt = max(200.0, float(width_pt or 595.0))
+    height_pt = max(200.0, float(height_pt or 842.0))
+    section = document.sections[0]
+    landscape = width_pt > height_pt
+    section.orientation = WD_ORIENT.LANDSCAPE if landscape else WD_ORIENT.PORTRAIT
+    section.page_width = Pt(width_pt)
+    section.page_height = Pt(height_pt)
+    margin = Pt(28) if landscape else Inches(0.85)
+    section.left_margin = margin
+    section.right_margin = margin
+    section.top_margin = margin
+    section.bottom_margin = margin
+
+
+def _style_docx_run(run, font_name: str, size_pt: float, bold: bool = False) -> None:
+    from docx.shared import Pt
+
+    run.font.name = font_name
+    run.font.size = Pt(size_pt)
+    run.font.bold = bool(bold)
+    run.font.italic = False
+    _docx_set_rfonts(run._element, font_name)
+
+
+def _add_docx_paragraph(document, text: str, font_name: str, size_pt: float, bold: bool = False, align=None):
+    paragraph = document.add_paragraph()
+    run = paragraph.add_run(text)
+    _style_docx_run(run, font_name, size_pt, bold)
+    _set_docx_paragraph_spacing(paragraph, after_pt=3.0)
+    if align is not None:
+        paragraph.alignment = align
+    return paragraph
+
+
+def _docx_cell_font_name(text: str, fallback: str = "Calibri") -> str:
+    sample = text or ""
+    if count_cjk_chars(sample) <= 0:
+        return "Calibri" if any(char.isascii() and char.isalpha() for char in sample) else fallback
+    trad = sum(1 for char in sample if char in _TRAD_ONLY_CHARS)
+    simp = sum(1 for char in sample if char in _SIMP_ONLY_CHARS)
+    if simp > trad:
+        return "微软雅黑"
+    return "微軟正黑體"
+
+
+def _set_docx_paragraph_spacing(paragraph, after_pt: float = 0.0) -> None:
+    from docx.shared import Pt
+
+    paragraph.paragraph_format.space_before = Pt(0)
+    paragraph.paragraph_format.space_after = Pt(after_pt)
+    paragraph.paragraph_format.line_spacing = 1.08
+
+
+def _set_docx_cell_text(cell, text: str, font_name: str, size_pt: float) -> None:
+    from docx.enum.table import WD_CELL_VERTICAL_ALIGNMENT
+
+    cell.vertical_alignment = WD_CELL_VERTICAL_ALIGNMENT.TOP
+    cleaned = normalize_cjk_text(text or "").strip()
+    cell.text = cleaned
+    paragraph = cell.paragraphs[0]
+    _set_docx_paragraph_spacing(paragraph)
+    if paragraph.runs:
+        _style_docx_run(paragraph.runs[0], font_name, size_pt)
+
+
+def _set_docx_table_no_borders(table) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+
+    borders = OxmlElement("w:tblBorders")
+    for edge in ("top", "left", "bottom", "right", "insideH", "insideV"):
+        element = OxmlElement(f"w:{edge}")
+        element.set(qn("w:val"), "nil")
+        element.set(qn("w:sz"), "0")
+        element.set(qn("w:space"), "0")
+        element.set(qn("w:color"), "auto")
+        borders.append(element)
+    table._tbl.tblPr.append(borders)
+
+
+def _style_docx_layout_table(table, document, bordered: bool = False) -> None:
+    from docx.oxml import OxmlElement
+    from docx.oxml.ns import qn
+    from docx.shared import Emu
+
+    section = document.sections[0]
+    usable = int(section.page_width - section.left_margin - section.right_margin)
+    cols = max(len(table.columns), 1)
+    col_emu = max(1, usable // cols)
+    table.autofit = False
+    table.allow_autofit = False
+    tbl_pr = table._tbl.tblPr
+    tbl_w = tbl_pr.find(qn("w:tblW"))
+    if tbl_w is None:
+        tbl_w = OxmlElement("w:tblW")
+        tbl_pr.append(tbl_w)
+    tbl_w.set(qn("w:w"), str(int(Emu(usable).twips)))
+    tbl_w.set(qn("w:type"), "dxa")
+    layout = tbl_pr.find(qn("w:tblLayout"))
+    if layout is None:
+        layout = OxmlElement("w:tblLayout")
+        tbl_pr.append(layout)
+    layout.set(qn("w:type"), "fixed")
+    grid = table._tbl.find(qn("w:tblGrid"))
+    if grid is not None:
+        for grid_col in grid.findall(qn("w:gridCol")):
+            grid_col.set(qn("w:w"), str(int(Emu(col_emu).twips)))
+    if bordered:
+        try:
+            table.style = "Table Grid"
+        except Exception:
+            pass
+    else:
+        _set_docx_table_no_borders(table)
+    for row in table.rows:
+        for cell in row.cells:
+            cell.width = Emu(col_emu)
+            tc_pr = cell._tc.get_or_add_tcPr()
+            tc_w = tc_pr.find(qn("w:tcW"))
+            if tc_w is None:
+                tc_w = OxmlElement("w:tcW")
+                tc_pr.append(tc_w)
+            tc_w.set(qn("w:w"), str(int(Emu(col_emu).twips)))
+            tc_w.set(qn("w:type"), "dxa")
+
+
+def _style_bilingual_docx_table(table, document) -> None:
+    _style_docx_layout_table(table, document, bordered=False)
+
+
+def _add_docx_layout_table(
+    document,
+    rows: list[list[str]],
+    default_font: str,
+    size_pt: float,
+    bordered: bool = False,
+) -> None:
+    cleaned_rows: list[list[str]] = []
+    for row in rows or []:
+        cells = [normalize_cjk_text(str(cell or "")).strip() for cell in row]
+        if any(cells):
+            cleaned_rows.append(cells)
+    if not cleaned_rows:
+        return
+    width = max(len(row) for row in cleaned_rows)
+    cleaned_rows = [row + [""] * (width - len(row)) for row in cleaned_rows]
+    table = document.add_table(rows=len(cleaned_rows), cols=width)
+    _style_docx_layout_table(table, document, bordered=bordered)
+    for index, row in enumerate(cleaned_rows):
+        for column, text in enumerate(row):
+            _set_docx_cell_text(
+                table.cell(index, column),
+                text,
+                _docx_cell_font_name(text, default_font),
+                size_pt,
+            )
+
+
+def _page_rows_are_two_column(rows: list[list[str]]) -> bool:
+    if len(rows) < 3:
+        return False
+    wide = 0
+    paired = 0
+    for row in rows:
+        filled = [str(cell).strip() for cell in row if str(cell).strip()]
+        if len(filled) >= 3:
+            wide += 1
+        if len(row) >= 2 and str(row[0]).strip() and str(row[1]).strip() and len(filled) == 2:
+            paired += 1
+    if wide >= 2:
+        return False
+    return paired >= max(3, int(len(rows) * 0.3))
+
+
+def _rows_are_side_by_side_layout(rows: list[list[str]]) -> bool:
+    if not _page_rows_are_two_column(rows):
+        return False
+    left = " ".join(str(row[0]).strip() for row in rows if row)
+    right = " ".join(str(row[1]).strip() for row in rows if len(row) > 1)
+    if min(len(left), len(right)) < 12:
+        return False
+    right_alnum = [char for char in right if char.isalnum() or _is_cjk_char(char)]
+    if right_alnum and sum(char.isdigit() for char in right_alnum) >= max(3, int(len(right_alnum) * 0.55)):
+        return False
+    left_cjk = count_cjk_chars(left)
+    right_cjk = count_cjk_chars(right)
+    left_latin = sum(1 for char in left if char.isascii() and char.isalpha())
+    right_latin = sum(1 for char in right if char.isascii() and char.isalpha())
+    bilingual = (left_latin >= 16 and right_cjk >= 6 and left_cjk <= left_latin) or (
+        right_latin >= 16 and left_cjk >= 6 and right_cjk <= right_latin
+    )
+    balanced = min(len(left), len(right)) >= 40
+    return bilingual or balanced
+
+
+def _ocr_rows_use_two_column_table(rows: list[list[str]]) -> bool:
+    if _page_rows_are_two_column(rows):
+        return True
+    paired = 0
+    for row in rows:
+        if len(row) >= 2 and str(row[0]).strip() and str(row[1]).strip():
+            paired += 1
+    return paired >= 2
+
+
+def _add_docx_ocr_page(document, rows: list[list[str]], default_font: str, size_pt: float = 11.0) -> None:
+    cleaned_rows: list[list[str]] = []
+    for row in rows or []:
+        cells = [normalize_cjk_text(str(cell or "")).strip() for cell in row]
+        if any(cells):
+            cleaned_rows.append(cells)
+    if not cleaned_rows:
+        _add_docx_paragraph(document, "（此頁沒有可辨識文字）", default_font, size_pt)
+        return
+    if _ocr_rows_use_two_column_table(cleaned_rows):
+        _add_docx_layout_table(document, cleaned_rows, default_font, size_pt, bordered=False)
+        return
+    for row in cleaned_rows:
+        text = "  ".join(cell for cell in row if cell)
+        if text:
+            _add_docx_paragraph(document, text, _docx_cell_font_name(text, default_font), size_pt)
+
+
+def _block_bbox(block: TextBlock) -> tuple[float, float, float, float]:
+    if block.bbox != (0.0, 0.0, 0.0, 0.0):
+        return block.bbox
+    return (block.x, block.y - block.height, block.x + block.width, block.y)
+
+
+def _text_blocks_to_words(blocks: list[TextBlock]) -> list[tuple]:
+    words: list[tuple] = []
+    for block in blocks:
+        text = normalize_cjk_text((block.text or "").strip())
+        if not text:
+            continue
+        x0, y0, x1, y1 = _block_bbox(block)
+        words.append((float(x0), float(y0), float(x1), float(y1), text, 0, 0, 0))
+    return words
+
+
+def _fitz_page_words(page) -> list[tuple]:
+    words: list[tuple] = []
+    try:
+        raw = page.get_text("words") or []
+    except Exception:
+        return words
+    for item in raw:
+        x0, y0, x1, y1, text, *_rest = item
+        cleaned = normalize_cjk_text(str(text or "")).strip()
+        if cleaned:
+            words.append((float(x0), float(y0), float(x1), float(y1), cleaned, 0, 0, 0))
+    return words
+
+
+def _page_width_from_blocks(blocks: list[TextBlock], fallback: float = 500.0) -> float:
+    rights = [_block_bbox(block)[2] for block in blocks]
+    if not rights:
+        return fallback
+    return max(max(rights) * 1.08, fallback * 0.5)
+
+
+def _block_is_centered(block: TextBlock, page_width: float) -> bool:
+    if page_width <= 0:
+        return False
+    x0, _y0, x1, _y1 = _block_bbox(block)
+    mid = (x0 + x1) / 2
+    return x0 > page_width * 0.18 and abs(mid - page_width / 2) <= page_width * 0.14
+
+
+def _add_docx_formatted_blocks(
+    document,
+    blocks: list[TextBlock],
+    page_width: float,
+    default_font: str,
+    body_size: float,
+) -> None:
+    from docx.enum.text import WD_ALIGN_PARAGRAPH
+
+    ordered = sorted(blocks, key=lambda block: (_block_bbox(block)[1], _block_bbox(block)[0]))
+    for block in ordered:
+        text = normalize_cjk_text((block.text or "").strip())
+        if not text:
+            continue
+        bold = bool(block.font_flags & 16) or "bold" in (block.font_name or "").lower()
+        size = _docx_display_size(float(block.font_size or body_size), body_size)
+        font_name = _docx_cell_font_name(text, default_font)
+        align = WD_ALIGN_PARAGRAPH.CENTER if _block_is_centered(block, page_width) else None
+        _add_docx_paragraph(document, text, font_name, size, bold, align=align)
+
+
+def _add_docx_page_layout(
+    document,
+    page_width: float,
+    blocks: list[TextBlock],
+    words: list[tuple],
+    tables: list[list[list[str]]],
+    default_font: str,
+    body_size: float,
+) -> None:
+    col_rows = _ocr_words_to_rows(words, page_width) if words else []
+    if _rows_are_side_by_side_layout(col_rows):
+        _add_docx_layout_table(document, col_rows, default_font, body_size, bordered=False)
+        return
+    useful_tables = [rows for rows in tables if _table_looks_like_data(rows)]
+    if useful_tables:
+        for rows in useful_tables:
+            bordered = _table_filled_columns(rows) >= 3
+            _add_docx_layout_table(document, rows, default_font, body_size, bordered=bordered)
+        return
+    if col_rows and _is_useful_table(col_rows) and _table_filled_columns(col_rows) >= 3:
+        _add_docx_layout_table(document, col_rows, default_font, body_size, bordered=True)
+        return
+    if not blocks:
+        _add_docx_paragraph(document, "（此頁沒有可抽取的文字）", default_font, body_size)
+        return
+    _add_docx_formatted_blocks(document, blocks, page_width, default_font, body_size)
+
+
 def _write_docx_from_text_blocks(
     source: Path,
     target: Path,
     password: str = "",
     pages_spec: str = "",
+    progress=None,
 ) -> None:
     from docx import Document
-    from docx.shared import Pt
 
     indexes = _page_indexes_or_all(source, password, pages_spec)
+    layouts: list[tuple[float, float, list[TextBlock], list[tuple], list[list[list[str]]]]] = []
+    all_text: list[str] = []
+    all_sizes: list[float] = []
+    if PYMUPDF_AVAILABLE and fitz is not None:
+        document_pdf = fitz.open(str(source))
+        try:
+            if document_pdf.is_encrypted:
+                if not password or document_pdf.authenticate(password) == 0:
+                    raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+            total_pages = len(indexes)
+            for offset, page_index in enumerate(indexes):
+                if page_index < 0 or page_index >= document_pdf.page_count:
+                    raise ValueError("頁碼超出範圍。")
+                if progress:
+                    progress(
+                        offset + 1,
+                        total_pages,
+                        f"正在檢查第 {page_index + 1} / {total_pages} 頁版面…",
+                    )
+                page = document_pdf[page_index]
+                blocks = _text_blocks_from_fitz_page(page)
+                if not blocks:
+                    text = normalize_cjk_text((page.get_text("text") or "").strip())
+                    for line in text.splitlines():
+                        if line.strip():
+                            blocks.append(TextBlock(line.strip(), 0, 0, 0, 0, 11.0))
+                words = _fitz_page_words(page) or _text_blocks_to_words(blocks)
+                tables = _pymupdf_page_tables(page)
+                layouts.append((float(page.rect.width), float(page.rect.height), blocks, words, tables))
+                for block in blocks:
+                    all_text.append(block.text or "")
+                    if block.font_size:
+                        all_sizes.append(float(block.font_size))
+        finally:
+            document_pdf.close()
+    else:
+        reader = open_reader(source, password)
+        for page_index in indexes:
+            blocks = extract_page_text_blocks(source, page_index, password)
+            if not blocks:
+                text = normalize_cjk_text((reader.pages[page_index].extract_text() or "").strip())
+                blocks = [
+                    TextBlock(line.strip(), 0, 0, 0, 0, 11.0)
+                    for line in text.splitlines()
+                    if line.strip()
+                ]
+            box = reader.pages[page_index].mediabox
+            page_width = float(box.width)
+            page_height = float(box.height)
+            words = _text_blocks_to_words(blocks)
+            layouts.append((page_width, page_height, blocks, words, []))
+            for block in blocks:
+                all_text.append(block.text or "")
+                if block.font_size:
+                    all_sizes.append(float(block.font_size))
+    if not any(layout[2] or layout[3] or layout[4] for layout in layouts):
+        layouts = [
+            (
+                595.0,
+                842.0,
+                [TextBlock("（此頁沒有可抽取的文字）", 0, 0, 0, 0, 11.0)],
+                [],
+                [],
+            )
+        ]
+    font_name = _docx_body_font_name("\n".join(all_text))
+    body_size = _docx_body_size(all_sizes)
     document = Document()
-    for offset, page_index in enumerate(indexes):
+    _configure_docx_normal_style(document, font_name, body_size)
+    first_width, first_height = layouts[0][0], layouts[0][1]
+    _configure_docx_section_from_pdf(document, first_width, first_height)
+    total = len(layouts)
+    for offset, (page_width, _page_height, blocks, words, tables) in enumerate(layouts):
+        if progress:
+            progress(offset + 1, total, f"正在重建第 {offset + 1} 頁版面…")
         if offset:
             document.add_page_break()
-        blocks = extract_page_text_blocks(source, page_index, password)
-        if not blocks:
-            reader = open_reader(source, password)
-            text = (reader.pages[page_index].extract_text() or "").strip()
-            if text:
-                for line in text.splitlines():
-                    if line.strip():
-                        document.add_paragraph(line.strip())
-            else:
-                document.add_paragraph("（此頁沒有可抽取的文字）")
-            continue
-        for block in blocks:
-            paragraph = document.add_paragraph((block.text or "").strip())
-            if paragraph.runs:
-                size = max(8.0, min(float(block.font_size or 12.0), 36.0))
-                paragraph.runs[0].font.size = Pt(size)
+        _add_docx_page_layout(document, page_width, blocks, words, tables, font_name, body_size)
+    if progress:
+        progress(total, total, f"已重建 {total} 頁版面")
     target.parent.mkdir(parents=True, exist_ok=True)
     document.save(str(target))
 
@@ -696,25 +1457,57 @@ def _write_docx_from_ocr(
     target: Path,
     password: str = "",
     pages_spec: str = "",
-    language: str = "eng+chi_tra",
+    language: str = "auto",
     dpi: int = 200,
+    progress=None,
 ) -> int:
     from docx import Document
 
-    handle = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
-    handle.close()
-    text_path = Path(handle.name)
+    pages, tess_lang, tess_config = _ocr_iter_pages(source, password, pages_spec, language, dpi, progress)
+    page_rows: list[list[list[str]]] = []
+    all_text: list[str] = []
+    count = 0
+    for _page_index, image in pages:
+        count += 1
+        if progress:
+            progress(count - 1, 0, f"掃描件 OCR 第 {_page_index + 1} 頁，請稍候…")
+        try:
+            rows = _ocr_image_to_rows(image, tess_lang, tess_config)
+        finally:
+            image.close()
+        page_rows.append(rows)
+        all_text.extend(cell for row in rows for cell in row)
+    if progress:
+        progress(count, count, f"OCR 完成 {count} 頁")
+    font_name = _docx_body_font_name("\n".join(all_text))
+    document = Document()
+    _configure_docx_normal_style(document, font_name, 11.0)
+    width_pt, height_pt = _pdf_page_size(source, password)
+    _configure_docx_section_from_pdf(document, width_pt, height_pt)
+    for offset, rows in enumerate(page_rows):
+        if offset:
+            document.add_page_break()
+        _add_docx_ocr_page(document, rows, font_name)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    document.save(str(target))
+    return count
+
+
+def _convert_pdf_to_docx_pdf2docx(source: Path, target: Path) -> bool:
+    if not _pdf2docx_available():
+        return False
     try:
-        page_count = ocr_pdf_to_text(source, text_path, password, language, pages_spec, dpi)
-        document = Document()
-        for paragraph in text_path.read_text(encoding="utf-8").splitlines():
-            if paragraph.strip():
-                document.add_paragraph(paragraph.strip())
-        target.parent.mkdir(parents=True, exist_ok=True)
-        document.save(str(target))
-        return page_count
-    finally:
-        text_path.unlink(missing_ok=True)
+        from pdf2docx import Converter
+
+        converter = Converter(str(source))
+        try:
+            converter.convert(str(target))
+        finally:
+            converter.close()
+        return target.is_file() and target.stat().st_size > 0
+    except Exception:
+        target.unlink(missing_ok=True)
+        return False
 
 
 def pdf_to_docx(
@@ -722,42 +1515,719 @@ def pdf_to_docx(
     target: Path,
     password: str = "",
     pages_spec: str = "",
-    language: str = "eng+chi_tra",
+    language: str = "auto",
     dpi: int = 200,
+    progress=None,
 ) -> tuple[int, str]:
     if not _docx_available():
         raise ValueError("PDF 轉 Word 需要安裝 python-docx。")
     indexes = _page_indexes_or_all(source, password, pages_spec)
     if not indexes:
         raise ValueError("沒有可轉換的頁面。")
+    if progress:
+        progress(0, 0, "正在檢查 PDF 文字層…")
     unlocked = _write_unlocked_pdf_copy(source, password)
     try:
         char_count = _pdf_extractable_char_count(unlocked, "", pages_spec)
-        if char_count >= 20 and not (pages_spec or "").strip():
+        source_cjk = _pdf_cjk_char_count(unlocked, "", pages_spec)
+        plain_len = len(_pdf_plain_text(unlocked, "", pages_spec).strip())
+        has_text_layer = char_count >= 8 or source_cjk >= 8 or plain_len >= 8
+        cjk_heavy = source_cjk >= 40
+        limited_pages = bool((pages_spec or "").strip())
+
+        def accept_layout(method: str) -> bool:
+            if not target.is_file() or target.stat().st_size <= 0:
+                return False
+            if _docx_keeps_cjk(target, source_cjk):
+                return True
+            target.unlink(missing_ok=True)
+            return False
+
+        # Word/LibreOffice often drop subset CJK fonts. Prefer Unicode extractors first.
+        if cjk_heavy:
+            if not limited_pages and _convert_pdf_to_docx_pdf2docx(unlocked, target) and accept_layout("pdf2docx"):
+                return len(indexes), "pdf2docx"
+            if has_text_layer:
+                _write_docx_from_text_blocks(source, target, password, pages_spec, progress)
+                return len(indexes), "text"
+        elif char_count >= 20 and not limited_pages:
             ok, _reason = _pdf_to_docx_via_word(unlocked, target)
-            if ok:
+            if ok and accept_layout("word"):
                 return len(indexes), "word"
             ok, _reason = _pdf_to_office_via_libreoffice(unlocked, target, "docx")
-            if ok:
+            if ok and accept_layout("libreoffice"):
                 return len(indexes), "libreoffice"
-            if _pdf2docx_available():
-                from pdf2docx import Converter
-
-                converter = Converter(str(unlocked))
-                try:
-                    converter.convert(str(target))
-                finally:
-                    converter.close()
-                if target.is_file() and target.stat().st_size > 0:
-                    return len(indexes), "pdf2docx"
-        if char_count >= 8:
-            _write_docx_from_text_blocks(source, target, password, pages_spec)
+            if _convert_pdf_to_docx_pdf2docx(unlocked, target) and accept_layout("pdf2docx"):
+                return len(indexes), "pdf2docx"
+        if has_text_layer:
+            _write_docx_from_text_blocks(source, target, password, pages_spec, progress)
             return len(indexes), "text"
-        page_count = _write_docx_from_ocr(source, target, password, pages_spec, language, dpi)
+        page_count = _write_docx_from_ocr(source, target, password, pages_spec, language, dpi, progress)
         return page_count, "ocr"
     finally:
         if unlocked != source:
             unlocked.unlink(missing_ok=True)
+
+
+def _normalize_extracted_rows(raw_rows) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for row in raw_rows or []:
+        cells = []
+        for cell in row:
+            text = "" if cell is None else str(cell).replace("\n", " ").strip()
+            cells.append(normalize_cjk_text(text))
+        if any(cell for cell in cells):
+            rows.append(cells)
+    return _pad_table_rows(rows)
+
+
+def _pad_table_rows(rows: list[list[str]]) -> list[list[str]]:
+    width = max((len(row) for row in rows), default=0)
+    return [row + [""] * (width - len(row)) for row in rows]
+
+
+def _table_filled_columns(rows: list[list[str]]) -> int:
+    if not rows:
+        return 0
+    width = max(len(row) for row in rows)
+    filled = 0
+    for column in range(width):
+        if any(column < len(row) and str(row[column]).strip() for row in rows):
+            filled += 1
+    return filled
+
+
+def _is_useful_table(rows: list[list[str]]) -> bool:
+    if not rows:
+        return False
+    nonempty_rows = [row for row in rows if any(str(cell).strip() for cell in row)]
+    filled_cols = _table_filled_columns(rows)
+    cells = sum(1 for row in nonempty_rows for cell in row if str(cell).strip())
+    if filled_cols < 2 or cells < 6:
+        return False
+    if filled_cols >= 3 and len(nonempty_rows) >= 2:
+        return True
+    return len(nonempty_rows) >= 3
+
+
+def _table_looks_like_data(rows: list[list[str]]) -> bool:
+    if not _is_useful_table(rows):
+        return False
+    if _table_looks_fragmented(rows):
+        return False
+    cols = _table_filled_columns(rows)
+    nonempty = [row for row in rows if any(str(cell).strip() for cell in row)]
+    filled = sum(1 for row in nonempty for cell in row if str(cell).strip())
+    total = max(1, len(nonempty) * max(cols, 1))
+    if cols >= 6 and filled < total * 0.45:
+        return False
+    return True
+
+
+def _table_looks_fragmented(rows: list[list[str]]) -> bool:
+    cells = [str(cell).strip() for row in rows for cell in row if str(cell).strip()]
+    if not cells:
+        return True
+    cols = _table_filled_columns(rows)
+    lengths = sorted(len(cell) for cell in cells)
+    median = lengths[len(lengths) // 2]
+    short = sum(1 for length in lengths if length <= 8)
+    if cols >= 6 and median <= 12:
+        return True
+    if cols >= 5 and short >= max(6, int(len(cells) * 0.55)):
+        return True
+    return False
+
+
+def _join_word_cluster(words: list[tuple]) -> str:
+    texts = [str(word[4]).strip() for word in words if str(word[4]).strip()]
+    if not texts:
+        return ""
+    joined = texts[0]
+    for index, text in enumerate(texts[1:], start=1):
+        previous = texts[index - 1]
+        if previous and text and _is_cjk_char(previous[-1]) and _is_cjk_char(text[0]):
+            joined += text
+        else:
+            joined += " " + text
+    return normalize_cjk_text(joined).strip()
+
+
+def _group_words_into_lines(words: list[tuple], y_tol: float | None = None) -> list[list[tuple]]:
+    if not words:
+        return []
+    heights = sorted(max(1.0, float(word[3]) - float(word[1])) for word in words)
+    median_height = heights[len(heights) // 2]
+    tolerance = y_tol if y_tol is not None else max(3.0, median_height * 0.45)
+    ordered = sorted(words, key=lambda word: ((float(word[1]) + float(word[3])) / 2, float(word[0])))
+    lines: list[list[tuple]] = []
+    line_ys: list[float] = []
+    for word in ordered:
+        y_mid = (float(word[1]) + float(word[3])) / 2
+        if lines and abs(y_mid - line_ys[-1]) <= tolerance:
+            lines[-1].append(word)
+            count = len(lines[-1])
+            line_ys[-1] = (line_ys[-1] * (count - 1) + y_mid) / count
+        else:
+            lines.append([word])
+            line_ys.append(y_mid)
+    for line in lines:
+        line.sort(key=lambda word: float(word[0]))
+    return lines
+
+
+def _column_gap_threshold(lines: list[list[tuple]], page_width: float) -> float:
+    gaps: list[float] = []
+    for line in lines:
+        for previous, current in zip(line, line[1:]):
+            gap = float(current[0]) - float(previous[2])
+            if gap > 0:
+                gaps.append(gap)
+    floor = max(10.0, page_width * 0.03)
+    ceiling = max(floor, page_width * 0.14)
+    if not gaps:
+        return max(floor, page_width * 0.025)
+    small = [gap for gap in gaps if gap < page_width * 0.04]
+    if small:
+        typical = small[len(small) // 2]
+        return max(floor, min(ceiling, typical * 4.0))
+    return max(floor, page_width * 0.04)
+
+
+def _split_line_by_x_gaps(line_words: list[tuple], min_gap: float) -> list[str]:
+    if not line_words:
+        return []
+    clusters = [[line_words[0]]]
+    for previous, current in zip(line_words, line_words[1:]):
+        gap = float(current[0]) - float(previous[2])
+        if gap >= min_gap:
+            clusters.append([current])
+        else:
+            clusters[-1].append(current)
+    return [_join_word_cluster(cluster) for cluster in clusters]
+
+
+def _words_to_table_rows(words: list[tuple], page_width: float) -> list[list[str]]:
+    if not words:
+        return []
+    lines = _group_words_into_lines(words)
+    threshold = _column_gap_threshold(lines, page_width)
+    rows = [_split_line_by_x_gaps(line, threshold) for line in lines]
+    rows = [row for row in rows if any(str(cell).strip() for cell in row)]
+    return _pad_table_rows(rows)
+
+
+def _text_lines_to_rows(lines: list[str]) -> list[list[str]]:
+    rows: list[list[str]] = []
+    for line in lines:
+        cleaned = normalize_cjk_text(line).strip()
+        if not cleaned:
+            continue
+        if cleaned.startswith("--- Page "):
+            rows.append([cleaned])
+            continue
+        if "\t" in cleaned:
+            parts = [normalize_cjk_text(part).strip() for part in cleaned.split("\t")]
+        else:
+            parts = [part.strip() for part in re.split(r" {2,}", cleaned)]
+        rows.append(parts or [cleaned])
+    return _pad_table_rows(rows)
+
+
+def _page_looks_scanned(page) -> bool:
+    text = page.get_text("text") or ""
+    stripped = text.strip()
+    if len(stripped) >= 40 or count_cjk_chars(text) >= 16:
+        return False
+    if len(stripped) < 8 and count_cjk_chars(text) < 4:
+        return True
+    try:
+        images = page.get_images() or []
+    except Exception:
+        images = []
+    return bool(images) and len(stripped) < 24
+
+
+def _pymupdf_page_tables(page) -> list[list[list[str]]]:
+    # Lined tables only. Text-grid strategies split words across cells and can
+    # freeze the UI for many seconds on pages with dense drawings.
+    try:
+        finder = page.find_tables()
+    except Exception:
+        return []
+    useful: list[list[list[str]]] = []
+    for table in getattr(finder, "tables", None) or []:
+        try:
+            rows = _normalize_extracted_rows(table.extract())
+        except Exception:
+            continue
+        if _is_useful_table(rows) and not _table_looks_fragmented(rows):
+            useful.append(rows)
+    return useful
+
+
+def _page_words_to_table(page) -> list[list[str]] | None:
+    try:
+        words = page.get_text("words") or []
+    except Exception:
+        return None
+    rows = _words_to_table_rows(words, float(page.rect.width))
+    if rows and _is_useful_table(rows) and not _table_looks_fragmented(rows):
+        return rows
+    return None
+
+
+def _page_text_to_rows(page) -> list[list[str]]:
+    text = normalize_cjk_text(page.get_text("text") or "")
+    return _text_lines_to_rows(text.splitlines())
+
+
+def _is_noisy_ocr_token(text: str, confidence: float) -> bool:
+    token = (text or "").strip()
+    if not token:
+        return True
+    if confidence < 40:
+        return True
+    cjk = count_cjk_chars(token)
+    latin = sum(1 for char in token if char.isascii() and char.isalpha())
+    symbols = sum(
+        1
+        for char in token
+        if not (
+            char.isalnum()
+            or _is_cjk_char(char)
+            or char in " .,;:%()[]-+/&'’\"“”《》【】、。|｜"
+        )
+    )
+    if symbols >= 2 and symbols >= max(2, len(token) * 0.35):
+        return True
+    if cjk == 0 and latin >= 6:
+        vowels = sum(1 for char in token.lower() if char in "aeiou")
+        if vowels == 0:
+            return True
+    return False
+
+
+def _is_noisy_ocr_line(text: str) -> bool:
+    line = (text or "").strip()
+    if not line:
+        return True
+    cjk = count_cjk_chars(line)
+    latin = sum(1 for char in line if char.isascii() and char.isalpha())
+    symbols = sum(
+        1
+        for char in line
+        if not (char.isalnum() or _is_cjk_char(char) or char.isspace() or char in ".,;:%()[]-+/&'|｜《》【】、。")
+    )
+    if symbols >= 4 and symbols >= cjk + max(latin, 1):
+        return True
+    tokens = [part for part in re.split(r"\s+", line) if part]
+    if not tokens:
+        return True
+    noisy = sum(1 for token in tokens if _is_noisy_ocr_token(token, 100))
+    if cjk < 4 and noisy >= max(2, int(len(tokens) * 0.5)):
+        return True
+    return False
+
+
+def _detect_page_gutter_x(image: Image.Image) -> float | None:
+    """Find a vertical whitespace valley near page centre (typical EN | 中 layout)."""
+    gray = image.convert("L") if image.mode != "L" else image
+    width, height = gray.size
+    if width < 240 or height < 160:
+        return None
+    target_w = min(width, 480)
+    scale = target_w / float(width)
+    target_h = max(48, int(height * scale))
+    small = gray.resize((target_w, target_h), getattr(getattr(Image, "Resampling", Image), "BILINEAR", Image.BILINEAR))
+    try:
+        pixels = small.load()
+        y0 = int(target_h * 0.12)
+        y1 = max(y0 + 1, int(target_h * 0.88))
+        band_h = y1 - y0
+        window = max(3, target_w // 70)
+        x0 = int(target_w * 0.28)
+        x1 = int(target_w * 0.72)
+        best: tuple[float, int] | None = None
+        for thresh in (100, 120, 140):
+            ink = [0.0] * target_w
+            for x in range(target_w):
+                count = 0
+                for y in range(y0, y1):
+                    if pixels[x, y] < thresh:
+                        count += 1
+                ink[x] = count / float(band_h)
+            smooth = []
+            for x in range(target_w):
+                lo = max(0, x - window)
+                hi = min(target_w, x + window + 1)
+                smooth.append(sum(ink[lo:hi]) / (hi - lo))
+            band = smooth[x0:x1]
+            if not band:
+                continue
+            min_val = min(band)
+            min_x = x0 + band.index(min_val)
+            left_peak = max(smooth[:x0], default=0.0)
+            right_peak = max(smooth[x1:], default=0.0)
+            peak = min(left_peak, right_peak)
+            if peak < 0.003:
+                continue
+            dip = (peak - min_val) / peak
+            if dip < 0.32:
+                continue
+            run = 0
+            for value in band:
+                if value <= min_val + max(0.002, (peak - min_val) * 0.2):
+                    run += 1
+            if run < max(3, int(target_w * 0.012)):
+                continue
+            if best is None or dip > best[0]:
+                best = (dip, min_x)
+        if best is None:
+            return None
+        return best[1] / scale
+    finally:
+        if small is not gray and small is not image:
+            small.close()
+
+
+def _ocr_column_split_x(words: list[tuple], page_width: float) -> float | None:
+    if len(words) < 10 or page_width <= 0:
+        return None
+    mids = sorted((float(word[0]) + float(word[2])) / 2 for word in words)
+    best_gap = 0.0
+    split_at = None
+    center = page_width * 0.5
+    for left_mid, right_mid in zip(mids, mids[1:]):
+        gap_mid = (left_mid + right_mid) / 2
+        if abs(gap_mid - center) > page_width * 0.22:
+            continue
+        gap = right_mid - left_mid
+        if gap > best_gap:
+            best_gap = gap
+            split_at = gap_mid
+    if split_at is None or best_gap < page_width * 0.06:
+        return None
+    left_count = sum(1 for word in words if (float(word[0]) + float(word[2])) / 2 < split_at)
+    right_count = len(words) - left_count
+    if left_count < 6 or right_count < 6:
+        return None
+    return split_at
+
+
+def _ocr_column_line_entries(words: list[tuple]) -> list[tuple[float, str]]:
+    entries: list[tuple[float, str]] = []
+    for line in _group_words_into_lines(words):
+        text = normalize_cjk_text(_join_word_cluster(line))
+        if not text or _is_noisy_ocr_line(text):
+            continue
+        y_mid = sum((float(word[1]) + float(word[3])) / 2 for word in line) / len(line)
+        entries.append((y_mid, text))
+    return entries
+
+
+def _ocr_words_to_rows(
+    words: list[tuple],
+    page_width: float,
+    split_at: float | None = None,
+) -> list[list[str]]:
+    if not words:
+        return []
+    gutter = split_at if split_at is not None else _ocr_column_split_x(words, page_width)
+    if gutter is not None:
+        left_words = [word for word in words if (float(word[0]) + float(word[2])) / 2 < gutter]
+        right_words = [word for word in words if (float(word[0]) + float(word[2])) / 2 >= gutter]
+        if len(left_words) >= 3 and len(right_words) >= 3:
+            left_entries = _ocr_column_line_entries(left_words)
+            right_entries = _ocr_column_line_entries(right_words)
+            heights = [max(1.0, float(word[3]) - float(word[1])) for word in words]
+            heights.sort()
+            y_tol = max(10.0, heights[len(heights) // 2] * 1.05)
+            rows: list[list[str]] = []
+            left_index = 0
+            right_index = 0
+            while left_index < len(left_entries) or right_index < len(right_entries):
+                if left_index >= len(left_entries):
+                    rows.append(["", right_entries[right_index][1]])
+                    right_index += 1
+                    continue
+                if right_index >= len(right_entries):
+                    rows.append([left_entries[left_index][1], ""])
+                    left_index += 1
+                    continue
+                left_y, left_text = left_entries[left_index]
+                right_y, right_text = right_entries[right_index]
+                if abs(left_y - right_y) <= y_tol:
+                    rows.append([left_text, right_text])
+                    left_index += 1
+                    right_index += 1
+                elif left_y < right_y:
+                    rows.append([left_text, ""])
+                    left_index += 1
+                else:
+                    rows.append(["", right_text])
+                    right_index += 1
+            return rows
+    lines = _group_words_into_lines(words)
+    threshold = max(_column_gap_threshold(lines, page_width), page_width * 0.1)
+    rows = []
+    for line in lines:
+        parts = [normalize_cjk_text(part) for part in _split_line_by_x_gaps(line, threshold)]
+        parts = [part for part in parts if part and not _is_noisy_ocr_line(part)]
+        if parts:
+            rows.append(parts)
+    return _pad_table_rows(rows)
+
+
+def _ocr_rows_to_plain_text(rows: list[list[str]]) -> str:
+    lines: list[str] = []
+    for row in rows or []:
+        cells = [normalize_cjk_text(str(cell or "")).strip() for cell in row]
+        if len(cells) >= 2 and cells[0] and cells[1]:
+            lines.append(f"{cells[0]}  |  {cells[1]}")
+        else:
+            filled = [cell for cell in cells if cell]
+            if filled:
+                lines.append(filled[0] if len(filled) == 1 else "  |  ".join(filled))
+    return "\n".join(lines)
+
+
+def _ocr_words_to_plain_text(words: list[tuple], page_width: float) -> str:
+    return _ocr_rows_to_plain_text(_ocr_words_to_rows(words, page_width))
+
+
+def _tesseract_data_to_words(data: dict) -> list[tuple]:
+    texts = data.get("text") or []
+    words: list[tuple] = []
+    for index, raw in enumerate(texts):
+        text = str(raw or "").strip()
+        try:
+            confidence = float((data.get("conf") or ["-1"])[index])
+        except Exception:
+            confidence = 0.0
+        if not text or _is_noisy_ocr_token(text, confidence):
+            continue
+        try:
+            left = float(data["left"][index])
+            top = float(data["top"][index])
+            width = float(data["width"][index])
+            height = float(data["height"][index])
+        except Exception:
+            continue
+        words.append((left, top, left + width, top + height, text, 0, 0, index))
+    return words
+
+
+def _ocr_image_to_words(image: Image.Image, tess_lang: str, tess_config: str) -> list[tuple]:
+    output_type = getattr(getattr(pytesseract, "Output", None), "DICT", "dict")
+    try:
+        data = pytesseract.image_to_data(
+            image,
+            lang=tess_lang,
+            config=tess_config,
+            output_type=output_type,
+        )
+    except Exception as exc:
+        detail = str(exc)
+        if "traineddata" in detail or "Failed loading language" in detail:
+            raise ValueError(
+                f"Tesseract 找不到語言包「{tess_lang}」。請確認 tessdata 內有 chi_sim / chi_tra。"
+            ) from exc
+        return []
+    if isinstance(data, dict):
+        return _tesseract_data_to_words(data)
+    return []
+
+
+def _offset_ocr_words(words: list[tuple], dx: float, dy: float) -> list[tuple]:
+    shifted: list[tuple] = []
+    for word in words:
+        left, top, right, bottom, text, *rest = word
+        shifted.append((left + dx, top + dy, right + dx, bottom + dy, text, *rest))
+    return shifted
+
+
+def _ocr_bilingual_column_words(
+    image: Image.Image,
+    gutter: float,
+    tess_lang: str,
+    tess_config: str,
+) -> list[tuple]:
+    width, height = image.size
+    pad = max(8, int(width * 0.012))
+    gutter_x = max(1, min(width - 1, int(gutter)))
+    col_config = _tesseract_column_config(tess_config)
+    left_box = (0, 0, min(width, gutter_x + pad), height)
+    right_origin = max(0, gutter_x - pad)
+    right_box = (right_origin, 0, width, height)
+    left_img = image.crop(left_box)
+    right_img = image.crop(right_box)
+    try:
+        left_words = _ocr_image_to_words(left_img, _column_tess_lang(tess_lang, prefer_cjk=False), col_config)
+        right_words = _ocr_image_to_words(right_img, _column_tess_lang(tess_lang, prefer_cjk=True), col_config)
+    finally:
+        left_img.close()
+        right_img.close()
+    left_kept = [
+        word
+        for word in left_words
+        if (float(word[0]) + float(word[2])) / 2 < gutter
+    ]
+    right_kept = [
+        word
+        for word in _offset_ocr_words(right_words, right_origin, 0)
+        if (float(word[0]) + float(word[2])) / 2 >= gutter
+    ]
+    if len(left_kept) < 4 or len(right_kept) < 4:
+        return []
+    return left_kept + right_kept
+
+
+def _ocr_image_to_rows(image: Image.Image, tess_lang: str, tess_config: str) -> list[list[str]]:
+    prepared = _prepare_ocr_image(image)
+    try:
+        raw_gutter = _detect_page_gutter_x(image)
+        if raw_gutter is not None and image.width:
+            gutter = raw_gutter * (prepared.width / float(image.width))
+        else:
+            gutter = _detect_page_gutter_x(prepared)
+        words: list[tuple] = []
+        if gutter is not None:
+            words = _ocr_bilingual_column_words(prepared, gutter, tess_lang, tess_config)
+        if not words:
+            words = _ocr_image_to_words(prepared, tess_lang, tess_config)
+        if words:
+            rows = _ocr_words_to_rows(words, float(prepared.width), split_at=gutter)
+            if rows:
+                return rows
+        try:
+            text = pytesseract.image_to_string(prepared, lang=tess_lang, config=tess_config)
+        except Exception as exc:
+            detail = str(exc)
+            if "traineddata" in detail or "Failed loading language" in detail:
+                raise ValueError(
+                    f"Tesseract 找不到語言包「{tess_lang}」。請確認 tessdata 內有 chi_sim / chi_tra。"
+                ) from exc
+            text = ""
+        rows = []
+        for line in (text or "").splitlines():
+            cleaned = normalize_cjk_text(line).strip()
+            if cleaned and not _is_noisy_ocr_line(cleaned):
+                rows.append([cleaned])
+        return rows
+    finally:
+        if prepared is not image:
+            prepared.close()
+
+
+def _ocr_indexes_to_tables(
+    source: Path,
+    password: str,
+    page_indexes: list[int],
+    language: str,
+    dpi: int,
+    progress=None,
+) -> list[tuple[int, list[list[str]]]]:
+    if not page_indexes:
+        return []
+    pages_spec = ",".join(str(index + 1) for index in page_indexes)
+    pages, tess_lang, tess_config = _ocr_iter_pages(source, password, pages_spec, language, dpi, progress)
+    sheets: list[tuple[int, list[list[str]]]] = []
+    count = 0
+    for page_index, image in pages:
+        count += 1
+        if progress:
+            progress(count - 1, 0, f"掃描件 OCR 第 {page_index + 1} 頁，請稍候…")
+        try:
+            rows = _ocr_image_to_rows(image, tess_lang, tess_config)
+        finally:
+            image.close()
+        if rows:
+            sheets.append((page_index, rows))
+    return sheets
+
+
+def _preferred_xlsx_method(methods: list[str]) -> str:
+    for name in ("tables", "columns", "ocr", "text"):
+        if name in methods:
+            return name
+    return "text"
+
+
+def _collect_xlsx_sheets(
+    source: Path,
+    password: str = "",
+    pages_spec: str = "",
+    language: str = "auto",
+    dpi: int = 200,
+    progress=None,
+) -> tuple[list[tuple[int, list[list[str]]]], str]:
+    indexes = _page_indexes_or_all(source, password, pages_spec)
+    sheets: list[tuple[int, list[list[str]]]] = []
+    methods: list[str] = []
+    ocr_indexes: list[int] = []
+    if PYMUPDF_AVAILABLE and fitz is not None:
+        document = fitz.open(str(source))
+        try:
+            if document.is_encrypted:
+                if not password or document.authenticate(password) == 0:
+                    raise ValueError(f"{source.name} 已加密，請輸入密碼。")
+            total = len(indexes)
+            for offset, page_index in enumerate(indexes):
+                if progress:
+                    progress(
+                        offset + 1,
+                        total,
+                        f"正在檢查第 {page_index + 1} / {total} 頁表格…",
+                    )
+                page = document[page_index]
+                page_tables = _pymupdf_page_tables(page)
+                if page_tables:
+                    sheets.extend((page_index, rows) for rows in page_tables)
+                    methods.append("tables")
+                    continue
+                clustered = _page_words_to_table(page)
+                if clustered:
+                    sheets.append((page_index, clustered))
+                    methods.append("columns")
+                    continue
+                text_rows = _page_text_to_rows(page)
+                if text_rows and not _page_looks_scanned(page):
+                    sheets.append((page_index, text_rows))
+                    methods.append("text")
+                    continue
+                ocr_indexes.append(page_index)
+        finally:
+            document.close()
+    else:
+        reader = open_reader(source, password)
+        total = len(indexes)
+        for offset, page_index in enumerate(indexes):
+            if progress:
+                progress(
+                    offset + 1,
+                    total,
+                    f"正在檢查第 {page_index + 1} / {total} 頁文字…",
+                )
+            text = normalize_cjk_text(reader.pages[page_index].extract_text() or "")
+            rows = _text_lines_to_rows(text.splitlines())
+            if rows and (len(text.strip()) >= 8 or count_cjk_chars(text) >= 4):
+                sheets.append((page_index, rows))
+                methods.append("text")
+            else:
+                ocr_indexes.append(page_index)
+    if ocr_indexes:
+        try:
+            ocr_sheets = _ocr_indexes_to_tables(source, password, ocr_indexes, language, dpi, progress)
+        except Exception:
+            if not sheets:
+                raise
+            ocr_sheets = []
+        if ocr_sheets:
+            sheets.extend(ocr_sheets)
+            methods.append("ocr")
+    sheets.sort(key=lambda item: item[0])
+    return sheets, _preferred_xlsx_method(methods)
 
 
 def _extract_pdf_tables(
@@ -765,56 +2235,69 @@ def _extract_pdf_tables(
     password: str = "",
     pages_spec: str = "",
 ) -> list[tuple[int, list[list[str]]]]:
-    if not PYMUPDF_AVAILABLE or fitz is None:
-        return []
-    indexes = _page_indexes_or_all(source, password, pages_spec)
-    document = fitz.open(str(source))
-    tables: list[tuple[int, list[list[str]]]] = []
-    try:
-        if document.is_encrypted:
-            if not password or document.authenticate(password) == 0:
-                raise ValueError(f"{source.name} 已加密，請輸入密碼。")
-        for page_index in indexes:
-            page = document[page_index]
-            try:
-                finder = page.find_tables()
-            except Exception:
-                continue
-            found = getattr(finder, "tables", None) or []
-            for table in found:
-                try:
-                    raw_rows = table.extract()
-                except Exception:
-                    continue
-                rows = [[("" if cell is None else str(cell).replace("\n", " ").strip()) for cell in row] for row in raw_rows]
-                if any(any(cell for cell in row) for row in rows):
-                    tables.append((page_index, rows))
-    finally:
-        document.close()
-    return tables
+    sheets, _method = _collect_xlsx_sheets(source, password, pages_spec)
+    return [(page_index, rows) for page_index, rows in sheets if _is_useful_table(rows)]
+
+
+def _xlsx_sheet_name(page_index: int, table_number: int, used_names: set[str]) -> str:
+    base = f"第{page_index + 1}頁" if table_number == 1 else f"第{page_index + 1}頁_表{table_number}"
+    name = base[:31]
+    suffix = 2
+    while name in used_names:
+        name = f"{base[:28]}_{suffix}"[:31]
+        suffix += 1
+    used_names.add(name)
+    return name
+
+
+def _excel_cell_value(value: str):
+    text = (value or "").strip()
+    if not text:
+        return ""
+    negative = text.startswith("(") and text.endswith(")")
+    body = text[1:-1].strip() if negative else text
+    percent = body.endswith("%")
+    if percent:
+        body = body[:-1].strip()
+    compact = body.replace(",", "").replace("，", "").replace(" ", "")
+    if not re.fullmatch(r"-?\d+(?:\.\d+)?", compact):
+        return text
+    if re.fullmatch(r"0\d+", compact):
+        return text
+    number = float(compact)
+    if negative:
+        number = -number
+    if percent:
+        return number / 100.0
+    if "." not in compact and number == int(number):
+        return int(number)
+    return number
 
 
 def _write_xlsx_tables(tables: list[tuple[int, list[list[str]]]], target: Path) -> None:
     from openpyxl import Workbook
+    from openpyxl.utils import get_column_letter
 
     workbook = Workbook()
     first = True
     used_names: set[str] = set()
-    for offset, (page_index, rows) in enumerate(tables, start=1):
-        base = f"P{page_index + 1}_T{offset}"
-        name = base[:31]
-        suffix = 2
-        while name in used_names:
-            name = f"{base[:28]}_{suffix}"[:31]
-            suffix += 1
-        used_names.add(name)
+    table_numbers: dict[int, int] = {}
+    for page_index, rows in tables:
+        table_numbers[page_index] = table_numbers.get(page_index, 0) + 1
+        name = _xlsx_sheet_name(page_index, table_numbers[page_index], used_names)
         sheet = workbook.active if first else workbook.create_sheet(title=name)
         if first:
             sheet.title = name
             first = False
         for row_index, row in enumerate(rows, start=1):
             for column_index, value in enumerate(row, start=1):
-                sheet.cell(row_index, column_index, value)
+                sheet.cell(row_index, column_index, _excel_cell_value(value))
+        for column_index in range(1, (max((len(row) for row in rows), default=0) + 1)):
+            longest = 8
+            for row in rows:
+                if column_index - 1 < len(row):
+                    longest = max(longest, min(42, len(str(row[column_index - 1] or ""))))
+            sheet.column_dimensions[get_column_letter(column_index)].width = longest + 2
     target.parent.mkdir(parents=True, exist_ok=True)
     workbook.save(str(target))
 
@@ -826,31 +2309,17 @@ def _write_xlsx_from_text(
     pages_spec: str = "",
     lines: list[str] | None = None,
 ) -> None:
-    from openpyxl import Workbook
-
-    workbook = Workbook()
-    sheet = workbook.active
-    sheet.title = "Text"
-    row_index = 1
     if lines is None:
         indexes = _page_indexes_or_all(source, password, pages_spec)
         reader = open_reader(source, password)
+        collected: list[str] = []
         for page_index in indexes:
-            sheet.cell(row_index, 1, f"--- Page {page_index + 1} ---")
-            row_index += 1
-            text = reader.pages[page_index].extract_text() or ""
-            for line in text.splitlines():
-                if line.strip():
-                    sheet.cell(row_index, 1, line.strip())
-                    row_index += 1
-            row_index += 1
+            collected.append(f"--- Page {page_index + 1} ---")
+            collected.extend((reader.pages[page_index].extract_text() or "").splitlines())
+        rows = _text_lines_to_rows(collected)
     else:
-        for line in lines:
-            if line.strip():
-                sheet.cell(row_index, 1, line.strip())
-                row_index += 1
-    target.parent.mkdir(parents=True, exist_ok=True)
-    workbook.save(str(target))
+        rows = _text_lines_to_rows(lines)
+    _write_xlsx_tables([(0, rows or [["（沒有可抽出的文字）"]])], target)
 
 
 def pdf_to_xlsx(
@@ -858,31 +2327,27 @@ def pdf_to_xlsx(
     target: Path,
     password: str = "",
     pages_spec: str = "",
-    language: str = "eng+chi_tra",
+    language: str = "auto",
     dpi: int = 200,
+    progress=None,
 ) -> tuple[int, str]:
     if not _xlsx_available():
         raise ValueError("PDF 轉 Excel 需要安裝 openpyxl。")
     indexes = _page_indexes_or_all(source, password, pages_spec)
     if not indexes:
         raise ValueError("沒有可轉換的頁面。")
-    tables = _extract_pdf_tables(source, password, pages_spec)
-    if tables:
-        _write_xlsx_tables(tables, target)
-        return len(indexes), "tables"
-    if _pdf_extractable_char_count(source, password, pages_spec) >= 8:
-        _write_xlsx_from_text(source, target, password, pages_spec)
-        return len(indexes), "text"
-    handle = tempfile.NamedTemporaryFile(suffix=".txt", delete=False)
-    handle.close()
-    text_path = Path(handle.name)
+    if progress:
+        progress(0, len(indexes), "正在檢查 PDF 表格／文字層…")
+    unlocked = _write_unlocked_pdf_copy(source, password)
     try:
-        page_count = ocr_pdf_to_text(source, text_path, password, language, pages_spec, dpi)
-        lines = text_path.read_text(encoding="utf-8").splitlines()
-        _write_xlsx_from_text(source, target, password, pages_spec, lines=lines)
-        return page_count, "ocr"
+        sheets, method = _collect_xlsx_sheets(unlocked, "", pages_spec, language, dpi, progress)
+        if not sheets:
+            raise ValueError("無法從這份 PDF 抽出表格或文字。掃描件請確認已安裝 Tesseract OCR。")
+        _write_xlsx_tables(sheets, target)
+        return len(indexes), method
     finally:
-        text_path.unlink(missing_ok=True)
+        if unlocked != source:
+            unlocked.unlink(missing_ok=True)
 
 
 def write_pdf_info(source: Path, target: Path, password: str = "") -> None:
@@ -1074,6 +2539,49 @@ def _text_blocks_from_pymupdf_dict(page_data: dict, page_fonts: list[tuple]) -> 
     return blocks
 
 
+def _text_blocks_from_fitz_page(page) -> list[TextBlock]:
+    page_fonts = page.get_fonts()
+    flags = _pymupdf_text_flags()
+    blocks = _text_blocks_from_pymupdf_dict(page.get_text("dict", flags=flags), page_fonts)
+    if not blocks:
+        blocks = _text_blocks_from_pymupdf_dict(page.get_text("rawdict", flags=flags), page_fonts)
+    if not blocks:
+        for item in page.get_text("words", flags=flags):
+            x0, y0, x1, y1, word, *_rest = item
+            text = (word or "").strip()
+            if not text:
+                continue
+            height = max(float(y1) - float(y0), 8.0)
+            width = max(float(x1) - float(x0), 8.0)
+            blocks.append(
+                TextBlock(
+                    text,
+                    float(x0),
+                    float(y1),
+                    width,
+                    height,
+                    height,
+                    bbox=(float(x0), float(y0), float(x1), float(y1)),
+                )
+            )
+    if not blocks:
+        plain = (page.get_text("text") or "").strip()
+        if plain:
+            rect = page.rect
+            blocks.append(
+                TextBlock(
+                    plain,
+                    float(rect.x0),
+                    float(rect.y1),
+                    float(rect.width),
+                    float(rect.height),
+                    12.0,
+                    bbox=(float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)),
+                )
+            )
+    return merge_text_blocks(blocks)
+
+
 def extract_page_text_blocks_pymupdf(source: Path, page_index: int, password: str = "") -> list[TextBlock]:
     ensure_pymupdf_available()
     document = fitz.open(str(source))
@@ -1083,47 +2591,7 @@ def extract_page_text_blocks_pymupdf(source: Path, page_index: int, password: st
                 raise ValueError(f"{source.name} 已加密，請輸入密碼。")
         if page_index < 0 or page_index >= document.page_count:
             raise ValueError("頁碼超出範圍。")
-        page = document[page_index]
-        page_fonts = page.get_fonts()
-        flags = _pymupdf_text_flags()
-        blocks = _text_blocks_from_pymupdf_dict(page.get_text("dict", flags=flags), page_fonts)
-        if not blocks:
-            blocks = _text_blocks_from_pymupdf_dict(page.get_text("rawdict", flags=flags), page_fonts)
-        if not blocks:
-            for item in page.get_text("words", flags=flags):
-                x0, y0, x1, y1, word, *_rest = item
-                text = (word or "").strip()
-                if not text:
-                    continue
-                height = max(float(y1) - float(y0), 8.0)
-                width = max(float(x1) - float(x0), 8.0)
-                blocks.append(
-                    TextBlock(
-                        text,
-                        float(x0),
-                        float(y1),
-                        width,
-                        height,
-                        height,
-                        bbox=(float(x0), float(y0), float(x1), float(y1)),
-                    )
-                )
-        if not blocks:
-            plain = (page.get_text("text") or "").strip()
-            if plain:
-                rect = page.rect
-                blocks.append(
-                    TextBlock(
-                        plain,
-                        float(rect.x0),
-                        float(rect.y1),
-                        float(rect.width),
-                        float(rect.height),
-                        12.0,
-                        bbox=(float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)),
-                    )
-                )
-        return merge_text_blocks(blocks)
+        return _text_blocks_from_fitz_page(document[page_index])
     finally:
         document.close()
 
@@ -1666,15 +3134,66 @@ def font_key_for_pdf_font(font_name: str) -> str:
     return "helvetica"
 
 
-def ensure_ocr_available() -> None:
+def _tesseract_exe_candidates() -> list[Path]:
+    names = ["tesseract.exe"] if sys.platform == "win32" else ["tesseract"]
+    folders = []
+    if sys.platform == "win32":
+        folders.extend(
+            [
+                Path(os.environ.get("ProgramFiles", r"C:\Program Files")) / "Tesseract-OCR",
+                Path(os.environ.get("ProgramFiles(x86)", r"C:\Program Files (x86)")) / "Tesseract-OCR",
+                Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR",
+                Path.home() / "scoop" / "apps" / "tesseract" / "current",
+            ]
+        )
+    found: list[Path] = []
+    for folder in folders:
+        for name in names:
+            candidate = folder / name
+            if candidate not in found:
+                found.append(candidate)
+    return found
+
+
+def configure_tesseract() -> Path | None:
     if not OCR_AVAILABLE or pytesseract is None:
-        raise ValueError("OCR 需要安裝 pytesseract Python 套件和 Tesseract OCR。")
+        return None
     try:
         pytesseract.get_tesseract_version()
-    except TesseractNotFoundError as exc:
+        cmd = getattr(getattr(pytesseract, "pytesseract", None), "tesseract_cmd", None)
+        return Path(cmd) if cmd else Path("tesseract")
+    except TesseractNotFoundError:
+        pass
+    except Exception:
+        pass
+    for candidate in _tesseract_exe_candidates():
+        if not candidate.is_file():
+            continue
+        pytesseract.pytesseract.tesseract_cmd = str(candidate)
+        tessdata = candidate.parent / "tessdata"
+        if tessdata.is_dir():
+            os.environ["TESSDATA_PREFIX"] = str(tessdata)
+        try:
+            pytesseract.get_tesseract_version()
+            return candidate
+        except Exception:
+            continue
+    return None
+
+
+def ensure_ocr_available() -> None:
+    if not OCR_AVAILABLE or pytesseract is None:
         raise ValueError(
-            "找不到 Tesseract OCR 執行檔。請先安裝 Tesseract，或把 tesseract.exe 加入 PATH。"
-        ) from exc
+            "這份 PDF 沒有可抽取的文字層（掃描件），需要本機 OCR。\n"
+            "請安裝 pytesseract，以及 Tesseract OCR（含 chi_sim / chi_tra 語言包）。\n"
+            "Windows 安裝包：https://github.com/UB-Mannheim/tesseract/wiki"
+        )
+    if configure_tesseract() is None:
+        raise ValueError(
+            "找不到 Tesseract OCR 執行檔。掃描 PDF 必須用 OCR 才能轉 Word / Excel。\n"
+            "本機若已安裝，常見路徑是 C:\\Program Files\\Tesseract-OCR\\tesseract.exe。\n"
+            "尚未安裝請用 UB Mannheim 安裝包，並勾選 chi_sim / chi_tra。"
+        )
 
 
 def selected_page_indexes(source: Path, password: str = "", pages_spec: str = "") -> list[int]:
@@ -1684,12 +3203,12 @@ def selected_page_indexes(source: Path, password: str = "", pages_spec: str = ""
     return list(range(len(reader.pages)))
 
 
-def render_pdf_page_images(
+def iter_pdf_page_images(
     source: Path,
     password: str = "",
     pages_spec: str = "",
     dpi: int = 200,
-) -> list[tuple[int, Image.Image]]:
+):
     if not PDF_RENDER_AVAILABLE or pdfium is None:
         raise ValueError("PDF OCR 需要 pypdfium2 預覽元件。")
     if dpi < 72 or dpi > 600:
@@ -1700,7 +3219,6 @@ def render_pdf_page_images(
         raise ValueError("沒有可處理的頁面。")
 
     scale = dpi / 72.0
-    images: list[tuple[int, Image.Image]] = []
     document = pdfium.PdfDocument(str(source), password=password or None)
     try:
         for page_index in page_indexes:
@@ -1709,57 +3227,113 @@ def render_pdf_page_images(
                 image = page.render(scale=scale).to_pil().convert("RGB")
             finally:
                 page.close()
-            images.append((page_index, image))
+            yield page_index, image
     finally:
         document.close()
-    return images
+
+
+def render_pdf_page_images(
+    source: Path,
+    password: str = "",
+    pages_spec: str = "",
+    dpi: int = 200,
+) -> list[tuple[int, Image.Image]]:
+    return list(iter_pdf_page_images(source, password, pages_spec, dpi))
+
+
+def _ocr_image_with_lang(image: Image.Image, tess_lang: str, tess_config: str) -> str:
+    return _ocr_rows_to_plain_text(_ocr_image_to_rows(image, tess_lang, tess_config))
+
+
+def _ocr_iter_pages(
+    source: Path,
+    password: str,
+    pages_spec: str,
+    language: str,
+    dpi: int,
+    progress=None,
+):
+    ensure_ocr_available()
+    render_dpi = _ocr_render_dpi(language, dpi)
+    iterator = iter(iter_pdf_page_images(source, password, pages_spec, render_dpi))
+    first = next(iterator, None)
+    if first is None:
+        raise ValueError("沒有可處理的頁面。")
+    _first_index, first_image = first
+    requested = (language or "auto").strip() or "auto"
+    if progress:
+        progress(0, 0, "掃描件：正在偵測 OCR 語言…" if requested == "auto" else "掃描件：開始 OCR…")
+    _resolved, tess_lang, tess_config = _resolved_ocr_settings(language, first_image)
+
+    def pages():
+        yield first
+        yield from iterator
+
+    return pages(), tess_lang, tess_config
 
 
 def ocr_pdf_to_text(
     source: Path,
     target: Path,
     password: str = "",
-    language: str = "eng+chi_tra",
+    language: str = "auto",
     pages_spec: str = "",
     dpi: int = 200,
+    progress=None,
 ) -> int:
-    ensure_ocr_available()
+    pages, tess_lang, tess_config = _ocr_iter_pages(source, password, pages_spec, language, dpi, progress)
     pieces: list[str] = []
-    rendered_pages = render_pdf_page_images(source, password, pages_spec, dpi)
-    for page_index, image in rendered_pages:
-        text = pytesseract.image_to_string(image, lang=language)
-        pieces.append(f"--- Page {page_index + 1} ---\n{text.strip()}\n")
-        image.close()
+    count = 0
+    for page_index, image in pages:
+        count += 1
+        if progress:
+            progress(count - 1, 0, f"掃描件 OCR 第 {page_index + 1} 頁，請稍候…")
+        try:
+            text = _ocr_image_with_lang(image, tess_lang, tess_config)
+        finally:
+            image.close()
+        pieces.append(f"--- Page {page_index + 1} ---\n{normalize_cjk_text(text).strip()}\n")
+    if progress:
+        progress(count, count, f"OCR 完成 {count} 頁")
     target.write_text("\n".join(pieces), encoding="utf-8")
-    return len(rendered_pages)
+    return count
 
 
 def ocr_pdf_to_searchable_pdf(
     source: Path,
     target: Path,
     password: str = "",
-    language: str = "eng+chi_tra",
+    language: str = "auto",
     pages_spec: str = "",
     dpi: int = 200,
+    progress=None,
 ) -> int:
-    ensure_ocr_available()
+    pages, tess_lang, tess_config = _ocr_iter_pages(source, password, pages_spec, language, dpi, progress)
     writer = PdfWriter()
-    rendered_pages = render_pdf_page_images(source, password, pages_spec, dpi)
-    try:
-        for _page_index, image in rendered_pages:
+    count = 0
+    for _page_index, image in pages:
+        count += 1
+        if progress:
+            progress(count - 1, 0, f"掃描件 OCR 第 {_page_index + 1} 頁，請稍候…")
+        prepared = _prepare_ocr_image(image)
+        try:
             pdf_bytes = pytesseract.image_to_pdf_or_hocr(
-                image,
+                prepared,
                 extension="pdf",
-                lang=language,
+                lang=tess_lang,
+                config=tess_config,
             )
-            reader = PdfReader(io.BytesIO(pdf_bytes))
-            for page in reader.pages:
-                writer.add_page(page)
-    finally:
-        for _page_index, image in rendered_pages:
+        finally:
+            if prepared is not image:
+                prepared.close()
             image.close()
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+    if progress:
+        progress(count, count, f"OCR 完成 {count} 頁")
     write_pdf(writer, target)
-    return len(rendered_pages)
+    return count
 
 
 IMAGE_EXPORT_FORMATS = {"png", "jpg", "jpeg", "webp"}
