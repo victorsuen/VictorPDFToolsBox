@@ -1,6 +1,6 @@
 @echo off
 cd /d "%~dp0"
-python -m PyInstaller --noconfirm --clean --onedir --noconsole --icon NONE --name "VictorPDFToolsBox" --hidden-import fitz --hidden-import pymupdf --hidden-import document_workspace --hidden-import audit_log --hidden-import stamp_library --hidden-import flow_layout --hidden-import win32com --hidden-import win32com.client --hidden-import pythoncom --hidden-import docx --hidden-import openpyxl --hidden-import lxml --hidden-import pytesseract --distpath "C:\tmp\victor_pdf_dist" --workpath "C:\tmp\victor_pdf_build" qt_app.py
+python -m PyInstaller --noconfirm --clean --onedir --noconsole --icon NONE --name "VictorPDFToolsBox" --hidden-import fitz --hidden-import pymupdf --hidden-import document_workspace --hidden-import audit_log --hidden-import stamp_library --hidden-import flow_layout --hidden-import runtime_deps --hidden-import win32com --hidden-import win32com.client --hidden-import pythoncom --hidden-import docx --hidden-import openpyxl --hidden-import lxml --hidden-import pytesseract --hidden-import pptx --distpath "C:\tmp\victor_pdf_dist" --workpath "C:\tmp\victor_pdf_build" qt_app.py
 if errorlevel 1 goto build_failed
 
 set "TOOLS_DIR=%USERPROFILE%\Desktop\Cursor Tools"

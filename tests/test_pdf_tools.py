@@ -85,6 +85,20 @@ from pdf_core import (
     pdf_to_docx,
     pdf_to_images,
     pdf_to_xlsx,
+    pdf_has_usable_text_layer,
+    parse_size_bytes,
+    signature_coverage_is_intact,
+    prepare_scanned_page_image,
+    cleanup_scanned_pdf,
+    compress_pdf_to_size,
+    sanitize_pdf_for_external,
+    flatten_or_strip_annotations,
+    pdf_to_pptx,
+    inspect_pdf_signatures,
+    verify_pdf_signatures,
+    extract_pdf_attachments,
+    split_pdf_by_size,
+    _rotate_image_clockwise,
     _is_useful_table,
     _pymupdf_page_tables,
     _table_looks_fragmented,
@@ -1007,6 +1021,88 @@ class PdfToolsTests(unittest.TestCase):
                 ensure_ocr_available()
         self.assertIn("掃描件", str(raised.exception))
         self.assertIn("Tesseract", str(raised.exception))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_pdf_has_usable_text_layer_detects_text_and_blank(self):
+        import fitz
+
+        text_pdf = Path(self.temp_dir.name) / "text.pdf"
+        blank_pdf = Path(self.temp_dir.name) / "blank.pdf"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=400)
+        page.insert_text((72, 72), "Contracted sales 2026")
+        doc.save(str(text_pdf))
+        doc.close()
+        writer = PdfWriter()
+        writer.add_blank_page(width=300, height=400)
+        with blank_pdf.open("wb") as stream:
+            writer.write(stream)
+        self.assertTrue(pdf_has_usable_text_layer(text_pdf))
+        self.assertFalse(pdf_has_usable_text_layer(blank_pdf))
+
+    def test_missing_ocr_dependencies_when_tesseract_absent(self):
+        from runtime_deps import missing_ocr_dependencies
+
+        with patch("runtime_deps.find_tesseract_executable", return_value=None):
+            with patch("pdf_core.OCR_AVAILABLE", True), patch("pdf_core.PDF_RENDER_AVAILABLE", True):
+                items = missing_ocr_dependencies()
+        self.assertEqual([item.key for item in items], ["tesseract"])
+
+    def test_missing_ocr_dependencies_when_pytesseract_absent(self):
+        from runtime_deps import missing_ocr_dependencies
+
+        exe = Path(self.temp_dir.name) / "tesseract.exe"
+        tessdata = Path(self.temp_dir.name) / "tessdata"
+        tessdata.mkdir()
+        for lang in ("eng", "chi_sim", "chi_tra"):
+            (tessdata / f"{lang}.traineddata").write_bytes(b"x" * 2048)
+        with patch("runtime_deps.find_tesseract_executable", return_value=exe):
+            with patch("runtime_deps.tesseract_tessdata_dir", return_value=tessdata):
+                with patch("pdf_core.OCR_AVAILABLE", False), patch("pdf_core.PDF_RENDER_AVAILABLE", True):
+                    with patch("runtime_deps._frozen", return_value=False):
+                        items = missing_ocr_dependencies()
+        self.assertEqual([item.key for item in items], ["pytesseract"])
+
+    def test_missing_ocr_dependencies_when_language_pack_absent(self):
+        from runtime_deps import missing_ocr_dependencies
+
+        tessdata = Path(self.temp_dir.name) / "tessdata"
+        tessdata.mkdir()
+        (tessdata / "eng.traineddata").write_bytes(b"eng")
+        exe = Path(self.temp_dir.name) / "tesseract.exe"
+        with patch("runtime_deps.find_tesseract_executable", return_value=exe):
+            with patch("runtime_deps.tesseract_tessdata_dir", return_value=tessdata):
+                with patch("pdf_core.OCR_AVAILABLE", True), patch("pdf_core.PDF_RENDER_AVAILABLE", True):
+                    items = missing_ocr_dependencies()
+        self.assertEqual(items[0].key, "tesseract_langs")
+        self.assertIn("chi_sim", items[0].prompt)
+
+    def test_install_tesseract_languages_writes_traineddata(self):
+        from runtime_deps import install_tesseract_languages
+
+        tessdata = Path(self.temp_dir.name) / "tessdata"
+        tessdata.mkdir()
+        (tessdata / "eng.traineddata").write_bytes(b"eng")
+
+        def fake_download(url, dest, progress=None, label=""):
+            dest.write_bytes(b"x" * 2048)
+
+        exe = Path(self.temp_dir.name) / "tesseract.exe"
+        with patch("runtime_deps.find_tesseract_executable", return_value=exe):
+            with patch("runtime_deps.tesseract_tessdata_dir", return_value=tessdata):
+                with patch("runtime_deps._download_file", side_effect=fake_download):
+                    install_tesseract_languages()
+        self.assertTrue((tessdata / "chi_sim.traineddata").exists())
+        self.assertTrue((tessdata / "chi_tra.traineddata").exists())
+
+    def test_missing_office_to_pdf_dependencies_skips_when_backend_exists(self):
+        from runtime_deps import missing_office_to_pdf_dependencies
+
+        with patch("runtime_deps.find_libreoffice_executable", return_value=Path("soffice")):
+            self.assertEqual(missing_office_to_pdf_dependencies(), [])
 
     def test_split_pdf_to_zip(self):
         source = Path(self.temp_dir.name) / "source.pdf"
@@ -2265,6 +2361,253 @@ class PdfToolsTests(unittest.TestCase):
         joined = [" ".join("" if cell is None else str(cell) for cell in row) for row in rows]
         self.assertTrue(any("Item" in line and "Amount" in line for line in joined))
         self.assertTrue(any("Rent" in line and "1000" in line for line in joined))
+
+    def test_parse_size_bytes_accepts_mb_and_default_unit(self):
+        self.assertEqual(parse_size_bytes("10MB"), 10 * 1024 * 1024)
+        self.assertEqual(parse_size_bytes("2"), 2 * 1024 * 1024)
+        self.assertEqual(parse_size_bytes("512KB"), 512 * 1024)
+        self.assertEqual(parse_size_bytes("", 8), 8)
+
+    def test_signature_coverage_is_intact_requires_full_file(self):
+        self.assertTrue(signature_coverage_is_intact(1000, [0, 200, 400, 600]))
+        self.assertFalse(signature_coverage_is_intact(1200, [0, 200, 400, 600]))
+        self.assertFalse(signature_coverage_is_intact(1000, [0, 200]))
+
+    def test_rotate_image_clockwise_turns_90(self):
+        image = Image.new("RGB", (20, 10), "white")
+        image.putpixel((0, 0), (255, 0, 0))
+        rotated = _rotate_image_clockwise(image, 90)
+        self.assertEqual(rotated.size, (10, 20))
+
+    def test_prepare_scanned_page_image_applies_osd_rotation(self):
+        image = Image.new("RGB", (40, 20), "white")
+        with patch("pdf_core._osd_rotate_degrees", return_value=90):
+            with patch("pdf_core.deskew_image", side_effect=lambda image, max_degrees=8.0: image):
+                prepared = prepare_scanned_page_image(image)
+        self.assertEqual(prepared.size[0], 20)
+        self.assertEqual(prepared.size[1], 40)
+
+    def test_cleanup_scanned_pdf_writes_searchable_output(self):
+        source = Path(self.temp_dir.name) / "scan.pdf"
+        target = Path(self.temp_dir.name) / "cleaned.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        page_pdf = io.BytesIO()
+        page_writer = PdfWriter()
+        page_writer.add_blank_page(width=200, height=200)
+        page_writer.write(page_pdf)
+        ocr = Mock(image_to_pdf_or_hocr=Mock(return_value=page_pdf.getvalue()), image_to_osd=Mock(return_value="Rotate: 0"))
+        with patch("pdf_core.ensure_ocr_available"), patch(
+            "pdf_core._ocr_iter_pages",
+            return_value=(iter([(0, Image.new("RGB", (40, 40), "white"))]), "eng", ""),
+        ), patch("pdf_core.pytesseract", ocr):
+            count = cleanup_scanned_pdf(source, target, language="eng")
+        self.assertEqual(count, 1)
+        self.assertTrue(target.exists())
+        self.assertEqual(len(PdfReader(str(target)).pages), 1)
+
+    def test_compress_pdf_to_size_copies_when_already_small(self):
+        source = Path(self.temp_dir.name) / "small.pdf"
+        target = Path(self.temp_dir.name) / "out.pdf"
+        writer = PdfWriter()
+        writer.add_blank_page(width=120, height=120)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        old_size, new_size, method = compress_pdf_to_size(source, target, 10 * 1024 * 1024)
+        self.assertEqual(method, "already-small")
+        self.assertEqual(old_size, source.stat().st_size)
+        self.assertEqual(new_size, target.stat().st_size)
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_compress_pdf_to_size_shrinks_noisy_image_pdf(self):
+        source = Path(self.temp_dir.name) / "photo.pdf"
+        target = Path(self.temp_dir.name) / "small.pdf"
+        image = Image.new("RGB", (900, 1200))
+        for x in range(0, 900, 3):
+            for y in range(0, 1200, 3):
+                image.putpixel((x, y), ((x * 3) % 255, (y * 5) % 255, 90))
+        image_path = Path(self.temp_dir.name) / "photo.jpg"
+        image.save(image_path, format="JPEG", quality=95)
+        import fitz
+
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=500)
+        page.insert_image(page.rect, filename=str(image_path))
+        doc.save(str(source))
+        doc.close()
+        old_size, new_size, method = compress_pdf_to_size(source, target, 80_000)
+        self.assertTrue(target.exists())
+        self.assertLessEqual(new_size, old_size)
+        self.assertNotEqual(method, "")
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_sanitize_pdf_for_external_removes_metadata_annots_and_attachments(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "dirty.pdf"
+        target = Path(self.temp_dir.name) / "clean.pdf"
+        doc = fitz.open()
+        page = doc.new_page()
+        page.add_text_annot((72, 72), "internal note")
+        doc.set_metadata({"author": "Sensitive User", "title": "Secret"})
+        doc.embfile_add("hidden.txt", b"do-not-send")
+        doc.save(str(source))
+        doc.close()
+        summary = sanitize_pdf_for_external(source, target)
+        self.assertGreaterEqual(summary["annotations"], 1)
+        self.assertGreaterEqual(summary["embedded_files"], 1)
+        cleaned = fitz.open(str(target))
+        try:
+            self.assertIsNone(cleaned[0].first_annot)
+            self.assertEqual(cleaned.embfile_count(), 0)
+            metadata = cleaned.metadata or {}
+            self.assertFalse((metadata.get("author") or "").strip())
+        finally:
+            cleaned.close()
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_flatten_and_strip_annotations(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "marked.pdf"
+        flattened = Path(self.temp_dir.name) / "flat.pdf"
+        stripped = Path(self.temp_dir.name) / "strip.pdf"
+        doc = fitz.open()
+        page = doc.new_page()
+        page.add_highlight_annot(fitz.Rect(50, 50, 200, 80))
+        doc.save(str(source))
+        doc.close()
+        self.assertEqual(flatten_or_strip_annotations(source, flattened, "flatten"), 1)
+        self.assertEqual(flatten_or_strip_annotations(source, stripped, "strip"), 1)
+        for path in (flattened, stripped):
+            opened = fitz.open(str(path))
+            try:
+                self.assertEqual(list(opened[0].annots() or []), [])
+            finally:
+                opened.close()
+
+    def test_pdf_to_pptx_writes_one_slide_per_page(self):
+        from pptx import Presentation
+
+        source = Path(self.temp_dir.name) / "slides.pdf"
+        target = Path(self.temp_dir.name) / "slides.pptx"
+        writer = PdfWriter()
+        writer.add_blank_page(width=400, height=300)
+        writer.add_blank_page(width=400, height=300)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
+            pages, method = pdf_to_pptx(source, target, dpi=72)
+        self.assertEqual(pages, 2)
+        self.assertEqual(method, "images")
+        self.assertEqual(len(Presentation(str(target)).slides), 2)
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_inspect_pdf_signatures_reports_unsigned_field(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "unsigned-sig.pdf"
+        report = Path(self.temp_dir.name) / "sig.txt"
+        doc = fitz.open()
+        page = doc.new_page()
+        widget = fitz.Widget()
+        widget.field_name = "Signature1"
+        widget.field_type = fitz.PDF_WIDGET_TYPE_SIGNATURE
+        widget.rect = fitz.Rect(50, 50, 200, 100)
+        page.add_widget(widget)
+        doc.save(str(source))
+        doc.close()
+        infos = inspect_pdf_signatures(source)
+        self.assertGreaterEqual(len(infos), 1)
+        self.assertFalse(infos[0].intact)
+        count = verify_pdf_signatures(source, report)
+        self.assertGreaterEqual(count, 1)
+        self.assertIn("數位簽章", report.read_text(encoding="utf-8"))
+
+    def test_verify_pdf_signatures_reports_none_for_plain_pdf(self):
+        source = Path(self.temp_dir.name) / "plain.pdf"
+        report = Path(self.temp_dir.name) / "none.txt"
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        count = verify_pdf_signatures(source, report)
+        self.assertEqual(count, 0)
+        self.assertIn("沒有憑證數位簽章", report.read_text(encoding="utf-8"))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_extract_pdf_attachments_writes_zip(self):
+        import zipfile
+        import fitz
+
+        source = Path(self.temp_dir.name) / "with-file.pdf"
+        target = Path(self.temp_dir.name) / "files.zip"
+        doc = fitz.open()
+        doc.new_page()
+        doc.embfile_add("memo.txt", b"board-pack-secret", filename="memo.txt")
+        doc.save(str(source))
+        doc.close()
+        count = extract_pdf_attachments(source, target)
+        self.assertEqual(count, 1)
+        with zipfile.ZipFile(target) as archive:
+            names = archive.namelist()
+            self.assertTrue(any(name.endswith("memo.txt") for name in names))
+            self.assertEqual(archive.read(names[0]), b"board-pack-secret")
+
+    def test_split_pdf_by_size_keeps_one_part_when_limit_is_large(self):
+        import zipfile
+
+        source = Path(self.temp_dir.name) / "three.pdf"
+        target = Path(self.temp_dir.name) / "parts.zip"
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=200, height=200)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        count = split_pdf_by_size(source, target, 10 * 1024 * 1024)
+        self.assertEqual(count, 1)
+        with zipfile.ZipFile(target) as archive:
+            self.assertEqual(len(archive.namelist()), 1)
+            with archive.open(archive.namelist()[0]) as handle:
+                self.assertEqual(len(PdfReader(handle).pages), 3)
+
+    def test_split_pdf_by_size_splits_when_limit_is_tight(self):
+        import zipfile
+
+        source = Path(self.temp_dir.name) / "three.pdf"
+        target = Path(self.temp_dir.name) / "tight.zip"
+        writer = PdfWriter()
+        for _ in range(3):
+            writer.add_blank_page(width=400, height=500)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        one_page = Path(self.temp_dir.name) / "one.pdf"
+        one_writer = PdfWriter()
+        one_writer.add_page(PdfReader(str(source)).pages[0])
+        with one_page.open("wb") as stream:
+            one_writer.write(stream)
+        limit = one_page.stat().st_size + 80
+        count = split_pdf_by_size(source, target, limit)
+        self.assertGreaterEqual(count, 2)
+        with zipfile.ZipFile(target) as archive:
+            self.assertGreaterEqual(len(archive.namelist()), 2)
 
     def setUp(self):
         import tempfile

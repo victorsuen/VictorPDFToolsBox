@@ -50,6 +50,14 @@ from PySide6.QtWidgets import (
 )
 
 from document_workspace import DocumentWorkspace
+from runtime_deps import (
+    RuntimeDependency,
+    install_runtime_dependency,
+    missing_ocr_dependencies,
+    missing_office_to_pdf_dependencies,
+    missing_pdf_office_python_dependencies,
+    pdfs_need_ocr,
+)
 from audit_log import append_audit_event, audit_log_path, read_audit_events
 from flow_layout import FlowLayout, prevent_button_clip
 from pdf_core import (
@@ -124,6 +132,15 @@ from pdf_core import (
     pdf_to_docx,
     pdf_to_images,
     pdf_to_xlsx,
+    pdf_to_pptx,
+    parse_size_bytes,
+    cleanup_scanned_pdf,
+    compress_pdf_to_size,
+    sanitize_pdf_for_external,
+    flatten_or_strip_annotations,
+    verify_pdf_signatures,
+    extract_pdf_attachments,
+    split_pdf_by_size,
     open_reader,
     paint_callout_markup,
     page_item_label,
@@ -182,6 +199,13 @@ TOOL_OPERATIONS = [
     ("flatten_forms", "壓平表單"),
     ("search_markup", "搜尋並螢光"),
     ("secure_redact", "安全塗銷關鍵字"),
+    ("scan_cleanup", "掃描件一鍵整理"),
+    ("compress_to_size", "壓縮到指定大小"),
+    ("sanitize_external", "對外發送前清理"),
+    ("flatten_annots", "註解壓平／清除"),
+    ("verify_signatures", "驗證數位簽章"),
+    ("extract_attachments", "抽出內嵌附件"),
+    ("split_by_size", "依檔案大小拆分"),
 ]
 
 PDF_OUTPUT_OPERATIONS = frozenset(
@@ -210,6 +234,10 @@ PDF_OUTPUT_OPERATIONS = frozenset(
         "flatten_forms",
         "search_markup",
         "secure_redact",
+        "scan_cleanup",
+        "compress_to_size",
+        "sanitize_external",
+        "flatten_annots",
     }
 )
 
@@ -223,6 +251,9 @@ FOLDER_REVEAL_OPERATIONS = frozenset(
         "pdf_to_images",
         "compare_text",
         "split_bookmarks",
+        "verify_signatures",
+        "extract_attachments",
+        "split_by_size",
     }
 )
 
@@ -249,6 +280,13 @@ BATCHABLE_OPERATIONS = frozenset(
         "extract",
         "ocr_text",
         "ocr_searchable_pdf",
+        "scan_cleanup",
+        "compress_to_size",
+        "sanitize_external",
+        "flatten_annots",
+        "verify_signatures",
+        "extract_attachments",
+        "split_by_size",
     }
 )
 
@@ -262,9 +300,9 @@ def tool_output_extension(operation: str) -> str:
         return ".docx"
     if operation == "pdf_to_excel":
         return ".xlsx"
-    if operation in {"extract_text", "ocr_text", "info", "compare_text"}:
+    if operation in {"extract_text", "ocr_text", "info", "compare_text", "verify_signatures"}:
         return ".txt"
-    if operation in {"split", "split_advanced", "split_bookmarks"}:
+    if operation in {"split", "split_advanced", "split_bookmarks", "extract_attachments", "split_by_size"}:
         return ".zip"
     return ".pdf"
 
@@ -2314,6 +2352,27 @@ class VictorPdfToolsQt(QMainWindow):
         self.tool_perm_modify_checkbox.setChecked(True)
         form_layout.addWidget(self.tool_perm_modify_checkbox)
 
+        form_layout.addWidget(QLabel("目標大小（壓縮到指定大小／依檔案大小拆分）"))
+        size_row = QHBoxLayout()
+        self.tool_size_combo = QComboBox()
+        self.tool_size_combo.addItem("2 MB", 2 * 1024 * 1024)
+        self.tool_size_combo.addItem("5 MB", 5 * 1024 * 1024)
+        self.tool_size_combo.addItem("10 MB", 10 * 1024 * 1024)
+        self.tool_size_combo.addItem("25 MB", 25 * 1024 * 1024)
+        self.tool_size_combo.addItem("自訂", "custom")
+        self.tool_size_combo.setCurrentIndex(self.tool_size_combo.findData(10 * 1024 * 1024))
+        size_row.addWidget(self.tool_size_combo, 1)
+        self.tool_size_custom_input = QLineEdit("10MB")
+        self.tool_size_custom_input.setPlaceholderText("例如 8MB")
+        size_row.addWidget(self.tool_size_custom_input, 1)
+        form_layout.addLayout(size_row)
+
+        form_layout.addWidget(QLabel("註解處理（註解壓平／清除）"))
+        self.tool_annot_action_combo = QComboBox()
+        self.tool_annot_action_combo.addItem("壓平註解（畫進頁面）", "flatten")
+        self.tool_annot_action_combo.addItem("清除註解（不保留外觀）", "strip")
+        form_layout.addWidget(self.tool_annot_action_combo)
+
         run_button = self.add_button(form_layout, "處理並另存", self.run_tool_operation, "primary")
         run_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
@@ -2335,7 +2394,7 @@ class VictorPdfToolsQt(QMainWindow):
         hint = QLabel(
             "提示：可把 PDF / 圖片直接拖入左側清單。合併 / 圖片轉 PDF 本身支援多檔；"
             "其餘工具預設用第一個 PDF。勾選「批次處理」後，旋轉／壓縮／浮水印／頁碼／加密等會對清單每個 PDF 各輸出一份到資料夾。"
-            "Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁；PDF 轉 Word / Excel 請到「PDF 轉 Office」分頁。"
+            "Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁；PDF 轉 Word / Excel / PowerPoint 請到「PDF 轉 Office」分頁。"
         )
         hint.setObjectName("muted")
         hint.setWordWrap(True)
@@ -2457,6 +2516,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.pdf_office_format_combo = QComboBox()
         self.pdf_office_format_combo.addItem("轉 Word（.docx）", "word")
         self.pdf_office_format_combo.addItem("轉 Excel（.xlsx）", "excel")
+        self.pdf_office_format_combo.addItem("轉 PowerPoint（.pptx）", "powerpoint")
         form_layout.addWidget(self.pdf_office_format_combo)
 
         form_layout.addWidget(QLabel("頁碼 / 範圍"))
@@ -2511,6 +2571,7 @@ class VictorPdfToolsQt(QMainWindow):
             "提示：把 PDF 拖入左側清單。有文字層的 PDF 轉 Word 會依座標重建雙欄、表格與標題，"
             "不是只抽出純文字（Microsoft Word 開啟部分中文字型會整段丟字，程式會改自行組版）。"
             "轉 Excel 會先找有框線的表，沒有框線則依欄位對齊抽出；掃描件用 OCR 座標重建欄位。"
+            "轉 PowerPoint 會優先用 LibreOffice，否則每頁做成一張投影片圖片。"
             "左右中英對照會排成左右兩欄（英文／中文）。"
             "掃描件會逐頁 OCR，進度會顯示頁碼；雙欄頁可能稍慢，請勿強制結束。"
             "轉換結果是可再編輯草稿，版面不會與 Adobe 完全一致。"
@@ -6125,6 +6186,8 @@ class VictorPdfToolsQt(QMainWindow):
             )
             if not folder:
                 return
+            if not self._ensure_runtime_dependencies(missing_office_to_pdf_dependencies()):
+                return
             folder_path = Path(folder)
             outputs: list[Path] = []
             dialog = self._office_progress_dialog("正在轉換 Office 檔…")
@@ -6181,6 +6244,8 @@ class VictorPdfToolsQt(QMainWindow):
         if not target:
             return
         target_path = Path(target)
+        if not self._ensure_runtime_dependencies(missing_office_to_pdf_dependencies()):
+            return
         dialog = self._office_progress_dialog(f"正在轉換 {source.name}…")
         state = {"current": 0, "total": 0, "text": f"正在轉換 {source.name}…"}
 
@@ -6276,6 +6341,56 @@ class VictorPdfToolsQt(QMainWindow):
         self.pdf_office_file_items.clear()
         self.refresh_pdf_office_file_list()
 
+    def _install_runtime_dependency_with_progress(self, item: RuntimeDependency) -> None:
+        dialog = QProgressDialog(f"正在安裝 {item.title}…", None, 0, 0, self)
+        dialog.setWindowTitle("安裝套件")
+        dialog.setWindowModality(Qt.WindowModal)
+        dialog.setMinimumDuration(0)
+        dialog.setAutoClose(False)
+        dialog.setAutoReset(False)
+        dialog.setCancelButton(None)
+        dialog.setMinimumWidth(420)
+        dialog.show()
+
+        def work(progress_emit):
+            install_runtime_dependency(item.key, progress=progress_emit)
+            return True
+
+        def on_progress(current: int, total: int, text: str) -> None:
+            dialog.setLabelText(text)
+            if total:
+                dialog.setRange(0, total)
+                dialog.setValue(min(current, total))
+            else:
+                dialog.setRange(0, 0)
+            QApplication.processEvents()
+
+        try:
+            self._run_callable_in_background(work, on_progress)
+        finally:
+            dialog.hide()
+            dialog.deleteLater()
+
+    def _ensure_runtime_dependencies(self, items: list[RuntimeDependency]) -> bool:
+        for item in items:
+            answer = QMessageBox.question(
+                self,
+                "缺少套件",
+                f"{item.prompt}\n\n要現在安裝「{item.title}」嗎？",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if answer != QMessageBox.Yes:
+                self.set_status(f"已取消。這個功能需要 {item.title}。")
+                return False
+            try:
+                self._install_runtime_dependency_with_progress(item)
+            except Exception as exc:
+                self.show_error(exc)
+                return False
+            self.set_status(f"已安裝 {item.title}。")
+        return True
+
     def _run_callable_in_background(self, fn, on_progress=None):
         events: queue.Queue = queue.Queue()
         box = {"value": None}
@@ -6361,7 +6476,7 @@ class VictorPdfToolsQt(QMainWindow):
 
     def _pdf_office_options(self) -> tuple[str, str, str, str, str, int]:
         fmt = self.pdf_office_format_combo.currentData() or "word"
-        extension = ".docx" if fmt == "word" else ".xlsx"
+        extension = { "word": ".docx", "excel": ".xlsx", "powerpoint": ".pptx" }.get(fmt, ".docx")
         password = self.pdf_office_password_input.text()
         pages = self.pdf_office_pages_input.text()
         language = self.pdf_office_ocr_combo.currentData() or "auto"
@@ -6386,6 +6501,11 @@ class VictorPdfToolsQt(QMainWindow):
                 "pdf2docx": "版面重建",
                 "text": "版面重建（文字層）",
                 "ocr": ocr_label,
+            }.get(method, method)
+        if fmt == "powerpoint":
+            return {
+                "libreoffice": "LibreOffice",
+                "images": "每頁投影片圖片",
             }.get(method, method)
         return {
             "tables": "偵測表格",
@@ -6415,6 +6535,15 @@ class VictorPdfToolsQt(QMainWindow):
                 dpi=dpi,
                 progress=progress,
             )
+        if fmt == "powerpoint":
+            return pdf_to_pptx(
+                source,
+                target,
+                password,
+                pages_spec=pages,
+                dpi=dpi,
+                progress=progress,
+            )
         return pdf_to_xlsx(
             source,
             target,
@@ -6436,19 +6565,34 @@ class VictorPdfToolsQt(QMainWindow):
         if folder is not None and self.pdf_office_open_output_folder_checkbox.isChecked():
             reveal_output(folder)
 
+    def _pdf_office_missing_dependencies(self, fmt: str, password: str) -> list[RuntimeDependency]:
+        needed: list[RuntimeDependency] = []
+        if fmt != "powerpoint" and pdfs_need_ocr(self.pdf_office_file_items, password):
+            needed.extend(missing_ocr_dependencies())
+        needed.extend(missing_pdf_office_python_dependencies(fmt))
+        return needed
+
     def run_pdf_to_office(self) -> None:
         if not self.pdf_office_file_items:
             self.set_status("請先加入 PDF 檔案。")
             return
         fmt, extension, password, pages, language, dpi = self._pdf_office_options()
-        kind_label = "Word" if fmt == "word" else "Excel"
-        dialog_filter = "Word files (*.docx)" if fmt == "word" else "Excel files (*.xlsx)"
+        kind_label = {"word": "Word", "excel": "Excel", "powerpoint": "PowerPoint"}.get(fmt, "Word")
+        dialog_filter = {
+            "word": "Word files (*.docx)",
+            "excel": "Excel files (*.xlsx)",
+            "powerpoint": "PowerPoint files (*.pptx)",
+        }.get(fmt, "Word files (*.docx)")
         separate = len(self.pdf_office_file_items) > 1
         if separate:
             folder = QFileDialog.getExistingDirectory(
                 self, "選擇輸出資料夾", str(self.pdf_office_file_items[0].parent)
             )
             if not folder:
+                return
+            if not self._ensure_runtime_dependencies(
+                self._pdf_office_missing_dependencies(fmt, password)
+            ):
                 return
             folder_path = Path(folder)
             outputs: list[Path] = []
@@ -6518,6 +6662,8 @@ class VictorPdfToolsQt(QMainWindow):
         target_path = Path(target)
         if target_path.suffix.lower() != extension:
             target_path = target_path.with_suffix(extension)
+        if not self._ensure_runtime_dependencies(self._pdf_office_missing_dependencies(fmt, password)):
+            return
         dialog = self._pdf_office_progress_dialog(f"正在轉換 {source.name}…")
         self._update_pdf_office_progress(dialog, 0, 0, f"正在轉換 {source.name}…")
 
@@ -7589,6 +7735,15 @@ class VictorPdfToolsQt(QMainWindow):
         extension = tool_output_extension(operation)
         return folder / safe_output_name(f"{source.stem}_{operation}{extension}")
 
+    def _tool_max_bytes(self) -> int:
+        data = self.tool_size_combo.currentData()
+        if data == "custom":
+            return parse_size_bytes(self.tool_size_custom_input.text(), 10 * 1024 * 1024)
+        try:
+            return int(data)
+        except (TypeError, ValueError):
+            return 10 * 1024 * 1024
+
     def watermark_options(self) -> dict:
         try:
             x_percent = float(self.tool_watermark_x_input.text().strip() or "50")
@@ -7649,6 +7804,9 @@ class VictorPdfToolsQt(QMainWindow):
             folder = QFileDialog.getExistingDirectory(self, "選擇批次輸出資料夾")
             if not folder:
                 return
+            if operation in {"ocr_text", "ocr_searchable_pdf", "scan_cleanup"}:
+                if not self._ensure_runtime_dependencies(missing_ocr_dependencies()):
+                    return
             target_path = Path(folder)
 
             def on_batch_success() -> None:
@@ -7699,6 +7857,10 @@ class VictorPdfToolsQt(QMainWindow):
             if not target:
                 return
             target_path = Path(target)
+
+        if operation in {"ocr_text", "ocr_searchable_pdf", "scan_cleanup"}:
+            if not self._ensure_runtime_dependencies(missing_ocr_dependencies()):
+                return
 
         def on_success() -> None:
             self.set_status(self._last_tool_status_message)
@@ -7978,6 +8140,53 @@ class VictorPdfToolsQt(QMainWindow):
                 password,
             )
             self._last_tool_status_message = f"已安全塗銷 {redact_count} 處符合文字。"
+            return
+        elif operation == "scan_cleanup":
+            page_count = cleanup_scanned_pdf(
+                source,
+                target_path,
+                password,
+                language=self.tool_ocr_language_combo.currentData() or "auto",
+                pages_spec=self.tool_pages_input.text(),
+                dpi=int(self.tool_image_dpi_combo.currentText()),
+            )
+            self._last_tool_status_message = f"已整理 {page_count} 頁掃描件並做成可搜尋 PDF{self._ocr_language_status()}。"
+            return
+        elif operation == "compress_to_size":
+            max_bytes = self._tool_max_bytes()
+            old_size, new_size, method = compress_pdf_to_size(source, target_path, max_bytes, password)
+            if new_size <= max_bytes:
+                self._last_tool_status_message = (
+                    f"已壓縮到指定大小：{old_size} → {new_size} bytes（{method}）。"
+                )
+            else:
+                self._last_tool_status_message = (
+                    f"已壓到最小仍超過目標：{old_size} → {new_size} bytes（目標 {max_bytes}，{method}）。"
+                )
+            return
+        elif operation == "sanitize_external":
+            summary = sanitize_pdf_for_external(source, target_path, password)
+            self._last_tool_status_message = (
+                f"已清理對外副本（註解 {summary['annotations']}、內嵌檔 {summary['embedded_files']}）。"
+            )
+            return
+        elif operation == "flatten_annots":
+            mode = self.tool_annot_action_combo.currentData() or "flatten"
+            count = flatten_or_strip_annotations(source, target_path, mode, password)
+            action = "壓平" if mode == "flatten" else "清除"
+            self._last_tool_status_message = f"已{action} {count} 個註解。"
+            return
+        elif operation == "verify_signatures":
+            count = verify_pdf_signatures(source, target_path, password)
+            self._last_tool_status_message = f"已檢查數位簽章，共 {count} 個簽章欄位。"
+            return
+        elif operation == "extract_attachments":
+            count = extract_pdf_attachments(source, target_path, password)
+            self._last_tool_status_message = f"已抽出 {count} 個內嵌附件。"
+            return
+        elif operation == "split_by_size":
+            file_count = split_pdf_by_size(source, target_path, self._tool_max_bytes(), password)
+            self._last_tool_status_message = f"已依檔案大小拆分成 {file_count} 個檔並打包成 ZIP。"
             return
         else:
             raise ValueError(f"未知工具：{operation}")

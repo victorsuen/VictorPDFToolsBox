@@ -193,6 +193,17 @@ class FormField:
     choices: tuple[str, ...] = ()
 
 
+@dataclass(frozen=True)
+class SignatureInfo:
+    field_name: str
+    page_index: int
+    signer: str
+    signed_at: str
+    has_contents: bool
+    intact: bool
+    detail: str
+
+
 FORM_WIDGET_TYPE_NAMES = {
     0: "unknown",
     1: "button",
@@ -681,6 +692,15 @@ def _pdf_plain_text(source: Path, password: str = "", pages_spec: str = "") -> s
 
 def _pdf_cjk_char_count(source: Path, password: str = "", pages_spec: str = "") -> int:
     return count_cjk_chars(_pdf_plain_text(source, password, pages_spec))
+
+
+def pdf_has_usable_text_layer(source: Path, password: str = "", pages_spec: str = "") -> bool:
+    try:
+        chars = _pdf_extractable_char_count(source, password, pages_spec)
+        cjk = _pdf_cjk_char_count(source, password, pages_spec)
+    except Exception:
+        return True
+    return chars >= 8 or cjk >= 8
 
 
 def _docx_plain_text(path: Path) -> str:
@@ -6054,3 +6074,609 @@ def secure_redact_query(
     finally:
         document.close()
     return match_count
+
+
+def parse_size_bytes(value: str, default: int | None = None) -> int:
+    text = (value or "").strip().lower().replace(" ", "")
+    if not text:
+        if default is not None:
+            return default
+        raise ValueError("請輸入檔案大小，例如 10MB。")
+    match = re.fullmatch(r"(\d+(?:\.\d+)?)(kb|mb|gb|b|k|m|g)?", text)
+    if not match:
+        raise ValueError("檔案大小格式無效，例如 10MB、25MB 或 512KB。")
+    amount = float(match.group(1))
+    unit = match.group(2) or "mb"
+    factor = {
+        "b": 1,
+        "k": 1024,
+        "kb": 1024,
+        "m": 1024 * 1024,
+        "mb": 1024 * 1024,
+        "g": 1024 * 1024 * 1024,
+        "gb": 1024 * 1024 * 1024,
+    }[unit]
+    size = int(amount * factor)
+    if size < 1:
+        raise ValueError("檔案大小必須大於 0。")
+    return size
+
+
+def _copy_pdf_file(source: Path, target: Path) -> None:
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if source.resolve() == target.resolve():
+        return
+    shutil.copy2(source, target)
+
+
+def _osd_rotate_degrees(image: Image.Image) -> int:
+    if not OCR_AVAILABLE or pytesseract is None:
+        return 0
+    try:
+        osd = pytesseract.image_to_osd(image)
+    except Exception:
+        return 0
+    match = re.search(r"Rotate:\s*(\d+)", str(osd or ""))
+    if not match:
+        return 0
+    return int(match.group(1)) % 360
+
+
+def _rotate_image_clockwise(image: Image.Image, degrees: int) -> Image.Image:
+    turn = int(degrees) % 360
+    if turn == 90:
+        return image.transpose(Image.ROTATE_270)
+    if turn == 180:
+        return image.transpose(Image.ROTATE_180)
+    if turn == 270:
+        return image.transpose(Image.ROTATE_90)
+    return image
+
+
+def _upright_scanned_image(image: Image.Image) -> Image.Image:
+    degrees = _osd_rotate_degrees(image)
+    if not degrees:
+        return image
+    return _rotate_image_clockwise(image, degrees)
+
+
+def _binary_row_variance(image: Image.Image) -> float:
+    gray = image.convert("L")
+    width, height = gray.size
+    pixels = gray.tobytes()
+    totals: list[int] = []
+    for row in range(0, height, 2):
+        start = row * width
+        totals.append(sum(1 for pixel in pixels[start : start + width] if pixel < 128))
+    if len(totals) < 2:
+        return 0.0
+    mean = sum(totals) / len(totals)
+    return sum((value - mean) ** 2 for value in totals) / len(totals)
+
+
+def estimate_skew_degrees(image: Image.Image) -> float:
+    gray = image.convert("L")
+    longest = max(gray.size)
+    if longest > 720:
+        scale = 720 / float(longest)
+        resample = getattr(getattr(Image, "Resampling", Image), "BILINEAR", Image.BILINEAR)
+        gray = gray.resize(
+            (max(1, int(gray.width * scale)), max(1, int(gray.height * scale))),
+            resample,
+        )
+    binary = gray.point(lambda pixel: 0 if pixel < 180 else 255)
+    best_angle = 0.0
+    best_score = -1.0
+    for tenths in range(-70, 71, 5):
+        angle = tenths / 10.0
+        rotated = binary.rotate(angle, resample=Image.NEAREST, expand=False, fillcolor=255)
+        score = _binary_row_variance(rotated)
+        if score > best_score:
+            best_score = score
+            best_angle = angle
+    return best_angle
+
+
+def deskew_image(image: Image.Image, max_degrees: float = 8.0) -> Image.Image:
+    angle = estimate_skew_degrees(image)
+    if abs(angle) < 0.35 or abs(angle) > max_degrees:
+        return image
+    return image.rotate(angle, resample=getattr(Image, "BICUBIC", Image.BILINEAR), expand=True, fillcolor="white")
+
+
+def prepare_scanned_page_image(image: Image.Image) -> Image.Image:
+    from PIL import ImageFilter
+
+    upright = _upright_scanned_image(image)
+    deskewed = deskew_image(upright)
+    cleaned = deskewed.filter(ImageFilter.MedianFilter(size=3))
+    if deskewed is not upright and upright is not image:
+        upright.close()
+    if cleaned is not deskewed and deskewed is not image:
+        deskewed.close()
+    return cleaned
+
+
+def cleanup_scanned_pdf(
+    source: Path,
+    target: Path,
+    password: str = "",
+    language: str = "auto",
+    pages_spec: str = "",
+    dpi: int = 300,
+    progress=None,
+) -> int:
+    """Deskew, auto-orient, denoise, then rebuild a searchable PDF."""
+
+    ensure_ocr_available()
+    pages, tess_lang, tess_config = _ocr_iter_pages(source, password, pages_spec, language, dpi, progress)
+    writer = PdfWriter()
+    count = 0
+    for page_index, image in pages:
+        count += 1
+        if progress:
+            progress(count - 1, 0, f"掃描件整理第 {page_index + 1} 頁，請稍候…")
+        cleaned = prepare_scanned_page_image(image)
+        prepared = _prepare_ocr_image(cleaned)
+        try:
+            pdf_bytes = pytesseract.image_to_pdf_or_hocr(
+                prepared,
+                extension="pdf",
+                lang=tess_lang,
+                config=tess_config,
+            )
+        finally:
+            if prepared is not cleaned:
+                prepared.close()
+            if cleaned is not image:
+                cleaned.close()
+            image.close()
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+        for page in reader.pages:
+            writer.add_page(page)
+    if count == 0:
+        raise ValueError("沒有可整理的頁面。")
+    if progress:
+        progress(count, count, f"掃描件整理完成 {count} 頁")
+    write_pdf(writer, target)
+    return count
+
+
+def compress_pdf_to_size(
+    source: Path,
+    target: Path,
+    max_bytes: int,
+    password: str = "",
+) -> tuple[int, int, str]:
+    """Compress until the file is at or under ``max_bytes`` when possible."""
+
+    if max_bytes < 20_000:
+        raise ValueError("目標大小請至少 20 KB。")
+    old_size = source.stat().st_size
+    if old_size <= max_bytes:
+        _copy_pdf_file(source, target)
+        return old_size, target.stat().st_size, "already-small"
+
+    attempts: list[tuple[str, tuple[int, int] | None]] = [
+        ("basic", None),
+        ("advanced-150-70", (150, 70)),
+        ("advanced-120-55", (120, 55)),
+        ("advanced-100-45", (100, 45)),
+        ("advanced-72-35", (72, 35)),
+        ("advanced-72-22", (72, 22)),
+    ]
+    best_method = "original"
+    best_size = old_size
+    best_data = source.read_bytes()
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for method, params in attempts:
+            candidate = Path(temp_dir) / f"{method}.pdf"
+            try:
+                if params is None:
+                    compress_pdf(source, candidate, password)
+                else:
+                    compress_pdf_advanced(
+                        source,
+                        candidate,
+                        image_dpi=params[0],
+                        jpeg_quality=params[1],
+                        password=password,
+                    )
+            except Exception:
+                continue
+            if not candidate.is_file():
+                continue
+            size = candidate.stat().st_size
+            if size < best_size:
+                best_size = size
+                best_method = method
+                best_data = candidate.read_bytes()
+            if size <= max_bytes:
+                break
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_bytes(best_data)
+    return old_size, best_size, best_method
+
+
+def sanitize_pdf_for_external(source: Path, target: Path, password: str = "") -> dict[str, int]:
+    """Remove JavaScript, embedded files, annotations, and metadata for external send."""
+
+    document = _open_pymupdf_document(source, password)
+    annotation_count = 0
+    try:
+        for page in document:
+            annotation_count += len(list(page.annots() or []))
+        embedded_count = int(document.embfile_count() or 0)
+        scrub = getattr(document, "scrub", None)
+        if callable(scrub):
+            scrub(
+                attached_files=True,
+                clean_pages=True,
+                embedded_files=True,
+                hidden_text=True,
+                javascript=True,
+                metadata=True,
+                redactions=True,
+                redact_images=0,
+                remove_links=False,
+                reset_fields=True,
+                reset_responses=True,
+                thumbnails=True,
+                xml_metadata=True,
+            )
+        else:
+            for page in document:
+                for annot in list(page.annots() or []):
+                    page.delete_annot(annot)
+            while document.embfile_count():
+                document.embfile_del(0)
+            document.set_metadata({})
+            document.del_xml_metadata()
+        for page in document:
+            for annot in list(page.annots() or []):
+                try:
+                    page.delete_annot(annot)
+                except Exception:
+                    continue
+        document.save(str(target), garbage=4, deflate=True, clean=True)
+    finally:
+        document.close()
+    return {"annotations": annotation_count, "embedded_files": embedded_count}
+
+
+def flatten_or_strip_annotations(
+    source: Path,
+    target: Path,
+    mode: str = "flatten",
+    password: str = "",
+) -> int:
+    normalized = (mode or "flatten").strip().lower()
+    if normalized not in {"flatten", "strip"}:
+        raise ValueError("註解處理請選擇壓平或清除。")
+    document = _open_pymupdf_document(source, password)
+    count = 0
+    try:
+        for page in document:
+            count += len(list(page.annots() or []))
+        if normalized == "flatten" and count:
+            document.bake(annots=True, widgets=False)
+        elif normalized == "strip":
+            for page in document:
+                for annot in list(page.annots() or []):
+                    page.delete_annot(annot)
+        document.save(str(target), garbage=4, deflate=True)
+    finally:
+        document.close()
+    return count
+
+
+def _pptx_available() -> bool:
+    try:
+        import pptx  # noqa: F401
+
+        return True
+    except Exception:
+        return False
+
+
+def _pdf_to_pptx_via_images(
+    source: Path,
+    target: Path,
+    password: str = "",
+    pages_spec: str = "",
+    dpi: int = 150,
+    progress=None,
+) -> tuple[int, str]:
+    if not _pptx_available():
+        raise ValueError("PDF 轉 PowerPoint 需要 Python 套件 python-pptx。")
+    from pptx import Presentation
+    from pptx.util import Emu
+
+    pages = list(iter_pdf_page_images(source, password, pages_spec, dpi))
+    if not pages:
+        raise ValueError("沒有可轉換的頁面。")
+    presentation = Presentation()
+    blank = presentation.slide_layouts[6]
+    first_image = pages[0][1]
+    presentation.slide_width = Emu(int(first_image.width / float(dpi) * 914400))
+    presentation.slide_height = Emu(int(first_image.height / float(dpi) * 914400))
+    with tempfile.TemporaryDirectory() as temp_dir:
+        for index, (page_index, image) in enumerate(pages, start=1):
+            if progress:
+                progress(index - 1, len(pages), f"正在匯出第 {page_index + 1} 頁到投影片…")
+            slide = presentation.slides.add_slide(blank)
+            image_path = Path(temp_dir) / f"page-{page_index + 1}.png"
+            image.convert("RGB").save(image_path, format="PNG")
+            slide.shapes.add_picture(
+                str(image_path),
+                0,
+                0,
+                width=presentation.slide_width,
+                height=presentation.slide_height,
+            )
+            image.close()
+    target.parent.mkdir(parents=True, exist_ok=True)
+    presentation.save(str(target))
+    if progress:
+        progress(len(pages), len(pages), f"已轉成 {len(pages)} 張投影片")
+    return len(pages), "images"
+
+
+def pdf_to_pptx(
+    source: Path,
+    target: Path,
+    password: str = "",
+    pages_spec: str = "",
+    dpi: int = 150,
+    progress=None,
+) -> tuple[int, str]:
+    unlocked = _write_unlocked_pdf_copy(source, password)
+    try:
+        if not (pages_spec or "").strip():
+            ok, method = _pdf_to_office_via_libreoffice(unlocked, target, "pptx")
+            if ok:
+                page_count = len(open_reader(source, password).pages)
+                return page_count, method
+        return _pdf_to_pptx_via_images(source, target, password, pages_spec, dpi, progress)
+    finally:
+        if unlocked != source:
+            unlocked.unlink(missing_ok=True)
+
+
+def signature_coverage_is_intact(file_size: int, byte_range: list[int]) -> bool:
+    if len(byte_range) < 4:
+        return False
+    start1, length1, start2, length2 = (int(item) for item in byte_range[:4])
+    if start1 != 0 or length1 < 0 or length2 < 0 or start2 < start1 + length1:
+        return False
+    return start2 + length2 == int(file_size)
+
+
+def _pdf_xref_value_text(value) -> str:
+    if isinstance(value, tuple) and len(value) == 2:
+        return str(value[1] or "")
+    return str(value or "")
+
+
+def _signature_info_from_xref(
+    document,
+    xref: int,
+    raw: bytes,
+    page_index: int,
+    field_name: str,
+) -> SignatureInfo:
+    byte_range_text = _pdf_xref_value_text(document.xref_get_key(xref, "ByteRange"))
+    contents_text = _pdf_xref_value_text(document.xref_get_key(xref, "Contents"))
+    signer = _pdf_xref_value_text(document.xref_get_key(xref, "Name")).strip(" /")
+    signed_at = _pdf_xref_value_text(document.xref_get_key(xref, "M")).strip(" /")
+    numbers = [int(item) for item in re.findall(r"-?\d+", byte_range_text)]
+    has_contents = bool(re.search(r"[0-9A-Fa-f]{16,}", contents_text))
+    if not numbers:
+        return SignatureInfo(
+            field_name=field_name,
+            page_index=page_index,
+            signer=signer,
+            signed_at=signed_at,
+            has_contents=has_contents,
+            intact=False,
+            detail="尚未簽署，或沒有 ByteRange。",
+        )
+    intact = has_contents and signature_coverage_is_intact(len(raw), numbers)
+    if intact:
+        detail = "簽署範圍覆蓋整個檔案，簽完後未再附加內容。"
+    elif has_contents:
+        detail = "有簽章內容，但檔案在簽署範圍之後可能被改過或追加過。"
+    else:
+        detail = "簽章欄位不完整。"
+    return SignatureInfo(
+        field_name=field_name,
+        page_index=page_index,
+        signer=signer,
+        signed_at=signed_at,
+        has_contents=has_contents,
+        intact=intact,
+        detail=detail,
+    )
+
+
+def inspect_pdf_signatures(source: Path, password: str = "") -> list[SignatureInfo]:
+    document = _open_pymupdf_document(source, password)
+    raw = source.read_bytes()
+    infos: list[SignatureInfo] = []
+    seen: set[int] = set()
+    try:
+        for page_index, page in enumerate(document):
+            for widget in page.widgets() or []:
+                if _form_widget_type_name(widget.field_type) != "signature":
+                    continue
+                xref = int(getattr(widget, "xref", 0) or 0)
+                if xref in seen:
+                    continue
+                seen.add(xref)
+                infos.append(
+                    _signature_info_from_xref(
+                        document,
+                        xref,
+                        raw,
+                        page_index,
+                        str(widget.field_name or f"Signature{len(infos) + 1}"),
+                    )
+                )
+        for xref in range(1, document.xref_length()):
+            if xref in seen:
+                continue
+            type_text = _pdf_xref_value_text(document.xref_get_key(xref, "Type"))
+            if type_text != "/Sig":
+                continue
+            seen.add(xref)
+            infos.append(
+                _signature_info_from_xref(
+                    document,
+                    xref,
+                    raw,
+                    -1,
+                    f"Signature{len(infos) + 1}",
+                )
+            )
+    finally:
+        document.close()
+    return infos
+
+
+def verify_pdf_signatures(source: Path, target: Path, password: str = "") -> int:
+    infos = inspect_pdf_signatures(source, password)
+    lines = [
+        "Victor PDF Tools Box - 數位簽章檢查",
+        f"檔案：{source.name}",
+        f"簽章數：{len(infos)}",
+        "",
+    ]
+    if not infos:
+        lines.append("這份 PDF 沒有憑證數位簽章（影像簽名／圖章不算）。")
+    for index, item in enumerate(infos, start=1):
+        page_label = "文件層" if item.page_index < 0 else str(item.page_index + 1)
+        lines.extend(
+            [
+                f"--- 簽章 {index} ---",
+                f"欄位：{item.field_name or '（未命名）'}",
+                f"頁碼：{page_label}",
+                f"簽署人：{item.signer or '（未標示）'}",
+                f"時間：{item.signed_at or '（未標示）'}",
+                f"有簽章內容：{'是' if item.has_contents else '否'}",
+                f"簽署後未被追加修改：{'是' if item.intact else '否'}",
+                f"說明：{item.detail}",
+                "",
+            ]
+        )
+    target.write_text("\n".join(lines), encoding="utf-8")
+    return len(infos)
+
+
+def _unique_attachment_name(name: str, used: set[str]) -> str:
+    stem = Path(name).name.strip() or "attachment.bin"
+    candidate = safe_output_name(stem)
+    if candidate not in used:
+        used.add(candidate)
+        return candidate
+    base = Path(candidate).stem
+    suffix = Path(candidate).suffix or ".bin"
+    index = 2
+    while True:
+        renamed = safe_output_name(f"{base}-{index}{suffix}")
+        if renamed not in used:
+            used.add(renamed)
+            return renamed
+        index += 1
+
+
+def extract_pdf_attachments(source: Path, target_zip: Path, password: str = "") -> int:
+    document = _open_pymupdf_document(source, password)
+    extracted = 0
+    used: set[str] = set()
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            for index in range(int(document.embfile_count() or 0)):
+                info = document.embfile_info(index) or {}
+                name = str(info.get("filename") or info.get("name") or f"embedded-{index + 1}.bin")
+                data = document.embfile_get(index)
+                if not data:
+                    continue
+                path = folder / _unique_attachment_name(name, used)
+                path.write_bytes(bytes(data))
+                extracted += 1
+            for page_index, page in enumerate(document):
+                for annot in list(page.annots() or []):
+                    kind = annot.type[1] if isinstance(annot.type, tuple) else str(annot.type)
+                    if kind != "FileAttachment":
+                        continue
+                    payload = None
+                    getter = getattr(annot, "get_file", None)
+                    if callable(getter):
+                        payload = getter()
+                    data = b""
+                    name = f"attachment-p{page_index + 1}.bin"
+                    if isinstance(payload, dict):
+                        data = bytes(payload.get("file") or payload.get("content") or b"")
+                        name = str(payload.get("filename") or name)
+                    elif isinstance(payload, (bytes, bytearray)):
+                        data = bytes(payload)
+                    if not data:
+                        continue
+                    path = folder / _unique_attachment_name(name, used)
+                    path.write_bytes(data)
+                    extracted += 1
+            if extracted == 0:
+                raise ValueError("這份 PDF 沒有可抽出的內嵌附件。")
+            with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+                for item in sorted(folder.iterdir()):
+                    archive.write(item, item.name)
+    finally:
+        document.close()
+    return extracted
+
+
+def _pdf_page_group_bytes(reader: PdfReader, page_indexes: list[int]) -> bytes:
+    writer = PdfWriter()
+    for index in page_indexes:
+        writer.add_page(reader.pages[index])
+    buffer = io.BytesIO()
+    writer.write(buffer)
+    return buffer.getvalue()
+
+
+def split_pdf_by_size(
+    source: Path,
+    target_zip: Path,
+    max_bytes: int,
+    password: str = "",
+) -> int:
+    if max_bytes < 1:
+        raise ValueError("每份大小必須大於 0。")
+    reader = open_reader(source, password)
+    page_count = len(reader.pages)
+    if page_count == 0:
+        raise ValueError("PDF 沒有頁面可拆分。")
+    groups: list[list[int]] = []
+    current: list[int] = []
+    for index in range(page_count):
+        trial = current + [index]
+        data = _pdf_page_group_bytes(reader, trial)
+        if current and len(data) > max_bytes:
+            groups.append(current)
+            current = [index]
+        else:
+            current = trial
+    if current:
+        groups.append(current)
+    stem = safe_output_name(source.stem)
+    with tempfile.TemporaryDirectory() as temp_dir:
+        generated: list[Path] = []
+        for part_index, pages in enumerate(groups, start=1):
+            part = Path(temp_dir) / f"{stem}-part-{part_index:03d}.pdf"
+            part.write_bytes(_pdf_page_group_bytes(reader, pages))
+            generated.append(part)
+        with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as archive:
+            for item in generated:
+                archive.write(item, item.name)
+    return len(generated)

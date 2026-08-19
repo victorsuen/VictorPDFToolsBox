@@ -71,14 +71,17 @@ from pdf_core import (
     paint_callout_markup,
     callout_layout,
     compress_pdf_advanced,
+    compress_pdf_to_size,
     compare_pdf_text,
     compare_pdf_visual,
     crop_pdf_pages,
     delete_pdf_pages,
     extract_outline,
     extract_page_text_blocks,
+    extract_pdf_attachments,
     fill_form_fields,
     flatten_form_fields,
+    flatten_or_strip_annotations,
     insert_pdf_pages,
     list_form_fields,
     open_reader,
@@ -87,8 +90,10 @@ from pdf_core import (
     replace_text_block_seamless,
     rotate_pdf_pages,
     safe_output_name,
+    sanitize_pdf_for_external,
     secure_redact_query,
     split_pdf_by_bookmarks,
+    verify_pdf_signatures,
 )
 
 PREVIEW_MAX_WIDTH = 760
@@ -902,6 +907,12 @@ class DocumentWorkspace(QWidget):
         self.add_button(layout, "視覺比對 PDF...", self.compare_pdf_pages)
         self.add_button(layout, "依書籤拆分", self.split_by_bookmarks)
         self.add_button(layout, "壓平表單欄位", self.flatten_forms)
+        self.add_button(layout, "對外發送前清理", self.sanitize_for_external)
+        self.add_button(layout, "壓平註解", self.flatten_annotations)
+        self.add_button(layout, "清除註解", self.strip_annotations)
+        self.add_button(layout, "壓縮到 10MB", self.compress_to_10mb)
+        self.add_button(layout, "驗證數位簽章", self.verify_signatures)
+        self.add_button(layout, "抽出內嵌附件", self.extract_attachments)
         layout.addWidget(QLabel("PDF 密碼（如適用）"))
         self.tools_password_input = QLineEdit()
         self.tools_password_input.setEchoMode(QLineEdit.Password)
@@ -2421,6 +2432,107 @@ class DocumentWorkspace(QWidget):
 
         if self._run_job(job, "已壓平表單欄位。", audit_operation="flatten_forms", audit_target=target_path) is not None:
             self._offer_reload_output(target_path)
+
+    def sanitize_for_external(self) -> None:
+        if self.pdf_path is None:
+            return
+        self._push_undo_snapshot()
+        target, _ = QFileDialog.getSaveFileName(
+            self, "另存清理後 PDF", safe_output_name("sanitized.pdf"), "PDF files (*.pdf)"
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        password = self.tools_password_input.text() or self.password
+
+        def job() -> dict:
+            return sanitize_pdf_for_external(self.pdf_path, target_path, password)
+
+        result = self._run_job(job, "已清理對外副本。", audit_operation="sanitize_external", audit_target=target_path)
+        if result is not None:
+            self._offer_reload_output(target_path)
+
+    def flatten_annotations(self) -> None:
+        self._flatten_or_strip_annotations("flatten")
+
+    def strip_annotations(self) -> None:
+        self._flatten_or_strip_annotations("strip")
+
+    def _flatten_or_strip_annotations(self, mode: str) -> None:
+        if self.pdf_path is None:
+            return
+        self._push_undo_snapshot()
+        title = "另存壓平註解 PDF" if mode == "flatten" else "另存清除註解 PDF"
+        name = "flattened-annots.pdf" if mode == "flatten" else "stripped-annots.pdf"
+        target, _ = QFileDialog.getSaveFileName(self, title, safe_output_name(name), "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        password = self.tools_password_input.text() or self.password
+
+        def job() -> int:
+            return flatten_or_strip_annotations(self.pdf_path, target_path, mode, password)
+
+        label = "已壓平註解。" if mode == "flatten" else "已清除註解。"
+        if self._run_job(job, label, audit_operation="flatten_annots", audit_target=target_path) is not None:
+            self._offer_reload_output(target_path)
+
+    def compress_to_10mb(self) -> None:
+        if self.pdf_path is None:
+            return
+        self._push_undo_snapshot()
+        target, _ = QFileDialog.getSaveFileName(
+            self, "另存壓縮 PDF", safe_output_name("compressed-10mb.pdf"), "PDF files (*.pdf)"
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        password = self.tools_password_input.text() or self.password
+
+        def job() -> tuple[int, int, str]:
+            return compress_pdf_to_size(self.pdf_path, target_path, 10 * 1024 * 1024, password)
+
+        result = self._run_job(job, "已壓縮到指定大小。", audit_operation="compress_to_size", audit_target=target_path)
+        if result is not None:
+            old_size, new_size, method = result
+            self._emit_status(f"大小 {old_size} → {new_size} bytes（{method}）")
+            self._offer_reload_output(target_path)
+
+    def verify_signatures(self) -> None:
+        if self.pdf_path is None:
+            return
+        target, _ = QFileDialog.getSaveFileName(
+            self, "另存簽章報告", safe_output_name("signatures.txt"), "Text files (*.txt)"
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        password = self.tools_password_input.text() or self.password
+
+        def job() -> int:
+            return verify_pdf_signatures(self.pdf_path, target_path, password)
+
+        count = self._run_job(job, "已檢查數位簽章。", audit_operation="verify_signatures", audit_target=target_path)
+        if count is not None:
+            self._emit_status(f"共 {count} 個簽章欄位。")
+
+    def extract_attachments(self) -> None:
+        if self.pdf_path is None:
+            return
+        target, _ = QFileDialog.getSaveFileName(
+            self, "另存附件 ZIP", safe_output_name("attachments.zip"), "ZIP files (*.zip)"
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        password = self.tools_password_input.text() or self.password
+
+        def job() -> int:
+            return extract_pdf_attachments(self.pdf_path, target_path, password)
+
+        count = self._run_job(job, "已抽出內嵌附件。", audit_operation="extract_attachments", audit_target=target_path)
+        if count is not None:
+            self._emit_status(f"已抽出 {count} 個附件。")
 
     def search_and_highlight(self) -> None:
         if self.pdf_path is None:

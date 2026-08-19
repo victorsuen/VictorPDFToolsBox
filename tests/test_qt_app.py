@@ -10,10 +10,11 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QEvent, QPoint, QPointF, QRect, Qt
 from PySide6.QtGui import QKeyEvent
-from PySide6.QtWidgets import QApplication, QComboBox, QPushButton, QTabWidget
+from PySide6.QtWidgets import QApplication, QComboBox, QMessageBox, QPushButton, QTabWidget
 
 from pdf_core import MarkupAnnotation, TextBlock
 from document_workspace import DocumentWorkspace
+from runtime_deps import RuntimeDependency
 from qt_app import (
     AuditLogDialog,
     BATCHABLE_OPERATIONS,
@@ -765,6 +766,9 @@ class QtAppTests(unittest.TestCase):
                 "pdf_to_images",
                 "compare_text",
                 "split_bookmarks",
+                "verify_signatures",
+                "extract_attachments",
+                "split_by_size",
             },
         )
 
@@ -1099,6 +1103,13 @@ class QtAppTests(unittest.TestCase):
             "flatten_forms",
             "search_markup",
             "secure_redact",
+            "scan_cleanup",
+            "compress_to_size",
+            "sanitize_external",
+            "flatten_annots",
+            "verify_signatures",
+            "extract_attachments",
+            "split_by_size",
         ):
             self.assertIn(key, slugs)
         self.assertNotIn("office_to_pdf", slugs)
@@ -1131,6 +1142,38 @@ class QtAppTests(unittest.TestCase):
         self.assertNotIn("pdf_to_word", {slug for slug, _title in TOOL_OPERATIONS})
         self.assertEqual(window.pdf_office_progress.format(), "%v / %m")
 
+    def test_ensure_runtime_dependencies_installs_when_user_agrees(self):
+        window = VictorPdfToolsQt()
+        item = RuntimeDependency("tesseract", "Tesseract OCR", "缺少 Tesseract")
+        with patch("qt_app.QMessageBox.question", return_value=QMessageBox.Yes):
+            with patch.object(window, "_install_runtime_dependency_with_progress") as installer:
+                ok = window._ensure_runtime_dependencies([item])
+        self.assertTrue(ok)
+        installer.assert_called_once_with(item)
+
+    def test_ensure_runtime_dependencies_stops_when_user_declines(self):
+        window = VictorPdfToolsQt()
+        item = RuntimeDependency("tesseract", "Tesseract OCR", "缺少 Tesseract")
+        with patch("qt_app.QMessageBox.question", return_value=QMessageBox.No):
+            with patch.object(window, "_install_runtime_dependency_with_progress") as installer:
+                ok = window._ensure_runtime_dependencies([item])
+        self.assertFalse(ok)
+        installer.assert_not_called()
+
+    def test_pdf_to_office_asks_to_install_ocr_for_scan(self):
+        window = VictorPdfToolsQt()
+        window.pdf_office_file_items = [self.source]
+        window.refresh_pdf_office_file_list()
+        item = RuntimeDependency("tesseract", "Tesseract OCR", "缺少 Tesseract")
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(Path(self.temp_dir.name) / "out.docx"), "docx")):
+            with patch("qt_app.pdfs_need_ocr", return_value=True):
+                with patch("qt_app.missing_ocr_dependencies", return_value=[item]):
+                    with patch("qt_app.missing_pdf_office_python_dependencies", return_value=[]):
+                        with patch("qt_app.QMessageBox.question", return_value=QMessageBox.No) as prompt:
+                            window.run_pdf_to_office()
+        prompt.assert_called_once()
+        self.assertIn("Tesseract", window.statusBar().currentMessage())
+
     def test_office_convert_tab_writes_output(self):
         window = VictorPdfToolsQt()
         word = Path(self.temp_dir.name) / "memo.docx"
@@ -1150,8 +1193,9 @@ class QtAppTests(unittest.TestCase):
 
         with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "pdf")):
             with patch("qt_app.office_files_to_pdf", side_effect=fake_convert):
-                with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
-                    window.run_office_convert()
+                with patch("qt_app.missing_office_to_pdf_dependencies", return_value=[]):
+                    with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
+                        window.run_office_convert()
         self.assertTrue(target.exists())
         self.assertIn("轉成 PDF", window._last_tool_status_message)
 
@@ -1178,8 +1222,9 @@ class QtAppTests(unittest.TestCase):
 
         with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "pdf")) as save_dialog:
             with patch("qt_app.office_files_to_pdf", side_effect=fake_convert):
-                with patch("qt_app.open_output_file") as opener:
-                    window.run_office_convert()
+                with patch("qt_app.missing_office_to_pdf_dependencies", return_value=[]):
+                    with patch("qt_app.open_output_file") as opener:
+                        window.run_office_convert()
         self.assertIn("中海宏洋2026年中期业绩简报 v.1.pdf", save_dialog.call_args[0][2])
         opener.assert_called_once_with(target)
         self.assertEqual(window.office_progress.value(), 100)
@@ -2306,20 +2351,58 @@ class QtAppTests(unittest.TestCase):
 
         window.pdf_office_format_combo.setCurrentIndex(window.pdf_office_format_combo.findData("word"))
         with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(word_target), "Word files (*.docx)")):
-            with patch("pdf_core._pdf_to_docx_via_word", return_value=(False, "skip")):
-                with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
-                    with patch("pdf_core._pdf2docx_available", return_value=False):
-                        with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
-                            window.run_pdf_to_office()
+            with patch("qt_app.missing_ocr_dependencies", return_value=[]):
+                with patch("qt_app.missing_pdf_office_python_dependencies", return_value=[]):
+                    with patch("pdf_core._pdf_to_docx_via_word", return_value=(False, "skip")):
+                        with patch("pdf_core._pdf_to_office_via_libreoffice", return_value=(False, "skip")):
+                            with patch("pdf_core._pdf2docx_available", return_value=False):
+                                with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
+                                    window.run_pdf_to_office()
         self.assertTrue(word_target.exists())
         self.assertIn("Word", window._last_tool_status_message)
 
         window.pdf_office_format_combo.setCurrentIndex(window.pdf_office_format_combo.findData("excel"))
         with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(excel_target), "Excel files (*.xlsx)")):
-            with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
-                window.run_pdf_to_office()
+            with patch("qt_app.missing_ocr_dependencies", return_value=[]):
+                with patch("qt_app.missing_pdf_office_python_dependencies", return_value=[]):
+                    with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
+                        window.run_pdf_to_office()
         self.assertTrue(excel_target.exists())
         self.assertIn("Excel", window._last_tool_status_message)
+
+        ppt_target = Path(self.temp_dir.name) / "out.pptx"
+        window.pdf_office_format_combo.setCurrentIndex(window.pdf_office_format_combo.findData("powerpoint"))
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(ppt_target), "PowerPoint files (*.pptx)")):
+            with patch("qt_app.missing_ocr_dependencies", return_value=[]):
+                with patch("qt_app.missing_pdf_office_python_dependencies", return_value=[]):
+                    with patch("qt_app.pdf_to_pptx", return_value=(2, "images")) as converter:
+                        with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
+                            window.run_pdf_to_office()
+        converter.assert_called_once()
+        self.assertIn("PowerPoint", window._last_tool_status_message)
+
+    def test_new_outbound_tools_run_through_qt(self):
+        window = VictorPdfToolsQt()
+        window.tool_file_items = [self.source]
+        window.refresh_tool_file_list()
+        cases = [
+            ("scan_cleanup", "qt_app.cleanup_scanned_pdf", 1, "cleaned.pdf", "整理"),
+            ("compress_to_size", "qt_app.compress_pdf_to_size", (100, 80, "basic"), "small.pdf", "壓縮"),
+            ("sanitize_external", "qt_app.sanitize_pdf_for_external", {"annotations": 1, "embedded_files": 1}, "clean.pdf", "清理"),
+            ("flatten_annots", "qt_app.flatten_or_strip_annotations", 2, "flat.pdf", "註解"),
+            ("verify_signatures", "qt_app.verify_pdf_signatures", 0, "sig.txt", "簽章"),
+            ("extract_attachments", "qt_app.extract_pdf_attachments", 1, "files.zip", "附件"),
+            ("split_by_size", "qt_app.split_pdf_by_size", 2, "parts.zip", "拆分"),
+        ]
+        for slug, patch_name, result, filename, token in cases:
+            target = Path(self.temp_dir.name) / filename
+            window.tool_operation.setCurrentIndex(window.tool_operation.findData(slug))
+            with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), filename)):
+                with patch("qt_app.missing_ocr_dependencies", return_value=[]):
+                    with patch(patch_name, return_value=result):
+                        with patch.object(window, "run_pdf_job", side_effect=lambda job, *_a, **_k: job()):
+                            window.run_tool_operation()
+            self.assertIn(token, window._last_tool_status_message)
 
 
 def _white_image(width: int, height: int):
