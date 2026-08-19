@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QSizePolicy,
     QSlider,
     QSplitter,
+    QStyleFactory,
     QStatusBar,
     QTableWidget,
     QTableWidgetItem,
@@ -319,13 +320,42 @@ def document_tab_title(name: str, max_chars: int = DOCUMENT_TAB_TITLE_MAX) -> st
     return f"{stem[:keep]}…{suffix}"
 
 
-def configure_count_progress_bar(bar: QProgressBar) -> None:
+def configure_count_progress_bar(bar: QProgressBar, *, show_text: bool = False) -> None:
+    fusion = QStyleFactory.create("Fusion")
+    if fusion is not None:
+        bar.setStyle(fusion)
     bar.setAlignment(Qt.AlignCenter)
-    bar.setTextVisible(True)
-    bar.setFormat("%v / %m")
+    bar.setTextVisible(show_text)
+    bar.setFormat("%v / %m" if show_text else "")
     font = QFont("Segoe UI")
     font.setStyleHint(QFont.SansSerif)
     bar.setFont(font)
+    bar.setStyleSheet(
+        "QProgressBar { color: #1f1f1f; background: #ececec; border: 1px solid #cfcfcf; "
+        "border-radius: 4px; text-align: center; } "
+        "QProgressBar::chunk { background-color: #2ea44f; }"
+    )
+
+
+def hide_progress_dialog_bar_text(dialog: QProgressDialog) -> None:
+    bar = dialog.findChild(QProgressBar)
+    if bar is None:
+        return
+    configure_count_progress_bar(bar, show_text=False)
+
+
+def make_progress_dialog(parent: QWidget, window_title: str, label: str) -> QProgressDialog:
+    dialog = QProgressDialog(label, None, 0, 0, parent)
+    dialog.setWindowTitle(window_title)
+    dialog.setWindowModality(Qt.WindowModal)
+    dialog.setMinimumDuration(0)
+    dialog.setAutoClose(False)
+    dialog.setAutoReset(False)
+    dialog.setCancelButton(None)
+    dialog.setMinimumWidth(420)
+    dialog.show()
+    hide_progress_dialog_bar_text(dialog)
+    return dialog
 
 
 def reveal_output(path: Path) -> None:
@@ -6121,19 +6151,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.refresh_office_file_list()
 
     def _office_progress_dialog(self, title: str) -> QProgressDialog:
-        dialog = QProgressDialog(title, None, 0, 0, self)
-        dialog.setWindowTitle("Office 轉 PDF")
-        dialog.setWindowModality(Qt.WindowModal)
-        dialog.setMinimumDuration(0)
-        dialog.setAutoClose(False)
-        dialog.setAutoReset(False)
-        dialog.setCancelButton(None)
-        dialog.setMinimumWidth(420)
-        dialog.show()
-        bar = dialog.findChild(QProgressBar)
-        if bar is not None:
-            configure_count_progress_bar(bar)
-        return dialog
+        return make_progress_dialog(self, "Office 轉 PDF", title)
 
     def _update_office_progress(self, dialog: QProgressDialog, state: dict) -> None:
         text = str(state.get("text") or "正在轉換…")
@@ -6143,26 +6161,25 @@ class VictorPdfToolsQt(QMainWindow):
         dialog.setLabelText(text)
         if total <= 0:
             self.office_progress.setRange(0, 0)
-            self.office_progress.setTextVisible(False)
             dialog.setRange(0, 0)
         else:
-            self.office_progress.setTextVisible(True)
-            self.office_progress.setFormat("%v / %m")
             self.office_progress.setRange(0, total)
             self.office_progress.setValue(min(current, total))
             dialog.setRange(0, total)
             dialog.setValue(min(current, total))
+        configure_count_progress_bar(self.office_progress, show_text=False)
+        hide_progress_dialog_bar_text(dialog)
         QApplication.processEvents()
 
     def _finish_office_progress(self, dialog: QProgressDialog, text: str) -> None:
         self.office_progress.setRange(0, 100)
         self.office_progress.setValue(100)
-        self.office_progress.setTextVisible(True)
-        self.office_progress.setFormat("完成")
+        configure_count_progress_bar(self.office_progress, show_text=False)
         self.office_progress_label.setText(text)
         dialog.setRange(0, 100)
         dialog.setValue(100)
         dialog.setLabelText(text)
+        hide_progress_dialog_bar_text(dialog)
         dialog.hide()
         dialog.deleteLater()
 
@@ -6342,15 +6359,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.refresh_pdf_office_file_list()
 
     def _install_runtime_dependency_with_progress(self, item: RuntimeDependency) -> None:
-        dialog = QProgressDialog(f"正在安裝 {item.title}…", None, 0, 0, self)
-        dialog.setWindowTitle("安裝套件")
-        dialog.setWindowModality(Qt.WindowModal)
-        dialog.setMinimumDuration(0)
-        dialog.setAutoClose(False)
-        dialog.setAutoReset(False)
-        dialog.setCancelButton(None)
-        dialog.setMinimumWidth(420)
-        dialog.show()
+        dialog = make_progress_dialog(self, "安裝套件", f"正在安裝 {item.title}…")
 
         def work(progress_emit):
             install_runtime_dependency(item.key, progress=progress_emit)
@@ -6363,6 +6372,7 @@ class VictorPdfToolsQt(QMainWindow):
                 dialog.setValue(min(current, total))
             else:
                 dialog.setRange(0, 0)
+            hide_progress_dialog_bar_text(dialog)
             QApplication.processEvents()
 
         try:
@@ -6432,45 +6442,32 @@ class VictorPdfToolsQt(QMainWindow):
         return box["value"]
 
     def _pdf_office_progress_dialog(self, title: str) -> QProgressDialog:
-        dialog = QProgressDialog(title, None, 0, 0, self)
-        dialog.setWindowTitle("PDF 轉 Office")
-        dialog.setWindowModality(Qt.WindowModal)
-        dialog.setMinimumDuration(0)
-        dialog.setAutoClose(False)
-        dialog.setAutoReset(False)
-        dialog.setCancelButton(None)
-        dialog.setMinimumWidth(420)
-        dialog.show()
-        bar = dialog.findChild(QProgressBar)
-        if bar is not None:
-            configure_count_progress_bar(bar)
-        return dialog
+        return make_progress_dialog(self, "PDF 轉 Office", title)
 
     def _update_pdf_office_progress(self, dialog: QProgressDialog, current: int, total: int, text: str) -> None:
         self.pdf_office_progress_label.setText(text)
         dialog.setLabelText(text)
         if total <= 0:
             self.pdf_office_progress.setRange(0, 0)
-            self.pdf_office_progress.setTextVisible(False)
             dialog.setRange(0, 0)
         else:
-            self.pdf_office_progress.setTextVisible(True)
-            self.pdf_office_progress.setFormat("%v / %m")
             self.pdf_office_progress.setRange(0, total)
             self.pdf_office_progress.setValue(min(current, total))
             dialog.setRange(0, total)
             dialog.setValue(min(current, total))
+        configure_count_progress_bar(self.pdf_office_progress, show_text=False)
+        hide_progress_dialog_bar_text(dialog)
         QApplication.processEvents()
 
     def _finish_pdf_office_progress(self, dialog: QProgressDialog, text: str) -> None:
         self.pdf_office_progress.setRange(0, 100)
         self.pdf_office_progress.setValue(100)
-        self.pdf_office_progress.setTextVisible(True)
-        self.pdf_office_progress.setFormat("完成")
+        configure_count_progress_bar(self.pdf_office_progress, show_text=False)
         self.pdf_office_progress_label.setText(text)
         dialog.setRange(0, 100)
         dialog.setValue(100)
         dialog.setLabelText(text)
+        hide_progress_dialog_bar_text(dialog)
         dialog.hide()
         dialog.deleteLater()
 

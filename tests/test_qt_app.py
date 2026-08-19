@@ -1140,7 +1140,38 @@ class QtAppTests(unittest.TestCase):
             "PDF 轉 Office",
         )
         self.assertNotIn("pdf_to_word", {slug for slug, _title in TOOL_OPERATIONS})
-        self.assertEqual(window.pdf_office_progress.format(), "%v / %m")
+        self.assertFalse(window.pdf_office_progress.isTextVisible())
+        self.assertFalse(window.office_progress.isTextVisible())
+
+    def test_office_progress_dialog_hides_bar_text(self):
+        from PySide6.QtWidgets import QProgressBar
+
+        window = VictorPdfToolsQt()
+        dialog = window._office_progress_dialog("正在轉換…")
+        bar = dialog.findChild(QProgressBar)
+        self.assertIsNotNone(bar)
+        self.assertFalse(bar.isTextVisible())
+        window._update_office_progress(dialog, {"current": 16, "total": 29, "text": "正在匯出第 16 / 29 頁"})
+        self.assertFalse(bar.isTextVisible())
+        self.assertFalse(window.office_progress.isTextVisible())
+        self.assertEqual(dialog.labelText(), "正在匯出第 16 / 29 頁")
+        dialog.close()
+        dialog.deleteLater()
+
+    def test_pdf_office_progress_dialog_hides_bar_text(self):
+        from PySide6.QtWidgets import QProgressBar
+
+        window = VictorPdfToolsQt()
+        dialog = window._pdf_office_progress_dialog("正在轉換…")
+        bar = dialog.findChild(QProgressBar)
+        self.assertIsNotNone(bar)
+        self.assertFalse(bar.isTextVisible())
+        window._update_pdf_office_progress(dialog, 16, 29, "正在檢查第 16 / 29 頁版面…")
+        self.assertFalse(bar.isTextVisible())
+        self.assertFalse(window.pdf_office_progress.isTextVisible())
+        self.assertEqual(dialog.labelText(), "正在檢查第 16 / 29 頁版面…")
+        dialog.close()
+        dialog.deleteLater()
 
     def test_ensure_runtime_dependencies_installs_when_user_agrees(self):
         window = VictorPdfToolsQt()
