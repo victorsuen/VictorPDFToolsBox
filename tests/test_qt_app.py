@@ -791,6 +791,7 @@ class QtAppTests(unittest.TestCase):
             "文字標註 / 覆蓋",
             "螢光 / 圖形註解",
             "裁切頁面",
+            "抽出內嵌圖片",
             "橡皮擦 / 遮擋",
             "文字編輯 Beta",
             "書籤 / 目錄",
@@ -798,6 +799,33 @@ class QtAppTests(unittest.TestCase):
             self.assertIn(expected, advanced_texts)
         workspace_tab = main_tabs.widget(1)
         self.assertIs(workspace_tab.findChild(DocumentWorkspace), window.document_workspace)
+
+    def test_advanced_extract_images_tab_saves_selected_pages(self):
+        window = VictorPdfToolsQt()
+        self.assertTrue(hasattr(window, "extract_images_quality_combo"))
+        self.assertEqual(window.extract_images_quality_combo.currentData(), "main")
+        window.set_extract_images_pdf(self.source)
+        self.assertEqual(window.extract_images_scope_combo.currentData(), "current")
+        self.assertEqual(window._extract_images_pages_spec(), "1")
+        window.extract_images_scope_combo.setCurrentIndex(window.extract_images_scope_combo.findData("all"))
+        self.assertEqual(window._extract_images_pages_spec(), "")
+        window.extract_images_scope_combo.setCurrentIndex(window.extract_images_scope_combo.findData("spec"))
+        window.extract_images_pages_input.setText("2-4")
+        self.assertEqual(window._extract_images_pages_spec(), "2-4")
+        target = Path(self.temp_dir.name) / "images.zip"
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "zip")) as save_dialog:
+            with patch("qt_app.extract_pdf_images", return_value=3) as extractor:
+                with patch("qt_app.reveal_output"):
+                    with patch.object(
+                        window,
+                        "run_pdf_job",
+                        side_effect=lambda job, *_a, on_success=None, **_k: (job(), on_success() if on_success else None),
+                    ):
+                        window.save_extract_images()
+        extractor.assert_called_once()
+        self.assertEqual(extractor.call_args.kwargs.get("pages_spec"), "2-4")
+        self.assertEqual(extractor.call_args.kwargs.get("quality"), "main")
+        self.assertTrue(str(save_dialog.call_args[0][2]).endswith("-images.zip"))
 
     def test_document_workspace_single_page_preview(self):
         workspace = DocumentWorkspace()
@@ -1112,6 +1140,7 @@ class QtAppTests(unittest.TestCase):
             "split_by_size",
         ):
             self.assertIn(key, slugs)
+        self.assertNotIn("extract_images", slugs)
         self.assertNotIn("office_to_pdf", slugs)
         self.assertNotIn("pdf_to_word", slugs)
         self.assertNotIn("pdf_to_excel", slugs)

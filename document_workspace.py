@@ -79,6 +79,8 @@ from pdf_core import (
     extract_outline,
     extract_page_text_blocks,
     extract_pdf_attachments,
+    extract_pdf_images,
+    suggested_images_zip_path_for_source,
     fill_form_fields,
     flatten_form_fields,
     flatten_or_strip_annotations,
@@ -913,6 +915,7 @@ class DocumentWorkspace(QWidget):
         self.add_button(layout, "壓縮到 10MB", self.compress_to_10mb)
         self.add_button(layout, "驗證數位簽章", self.verify_signatures)
         self.add_button(layout, "抽出內嵌附件", self.extract_attachments)
+        self.add_button(layout, "抽出內嵌圖片", self.extract_images)
         layout.addWidget(QLabel("PDF 密碼（如適用）"))
         self.tools_password_input = QLineEdit()
         self.tools_password_input.setEchoMode(QLineEdit.Password)
@@ -2533,6 +2536,26 @@ class DocumentWorkspace(QWidget):
         count = self._run_job(job, "已抽出內嵌附件。", audit_operation="extract_attachments", audit_target=target_path)
         if count is not None:
             self._emit_status(f"已抽出 {count} 個附件。")
+
+    def extract_images(self) -> None:
+        if self.pdf_path is None:
+            return
+        target, _ = QFileDialog.getSaveFileName(
+            self, "另存圖片 ZIP", str(suggested_images_zip_path_for_source(self.pdf_path)), "ZIP files (*.zip)"
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        if target_path.suffix.lower() != ".zip":
+            target_path = target_path.with_suffix(".zip")
+        password = self.tools_password_input.text() or self.password
+
+        def job() -> int:
+            return extract_pdf_images(self.pdf_path, target_path, password, quality="main")
+
+        count = self._run_job(job, "已抽出內嵌圖片。", audit_operation="extract_images", audit_target=target_path)
+        if count is not None:
+            self._emit_status(f"已抽出 {count} 張圖片。")
 
     def search_and_highlight(self) -> None:
         if self.pdf_path is None:

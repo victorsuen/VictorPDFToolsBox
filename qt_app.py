@@ -141,6 +141,8 @@ from pdf_core import (
     flatten_or_strip_annotations,
     verify_pdf_signatures,
     extract_pdf_attachments,
+    extract_pdf_images,
+    list_pdf_embedded_images,
     split_pdf_by_size,
     open_reader,
     paint_callout_markup,
@@ -159,6 +161,7 @@ from pdf_core import (
     safe_output_name,
     suggested_pdf_name_for_source,
     suggested_pdf_path_for_source,
+    suggested_images_zip_path_for_source,
     split_pdf_advanced,
     split_pdf_to_zip,
     text_matches_query,
@@ -1780,6 +1783,10 @@ class VictorPdfToolsQt(QMainWindow):
         self.crop_page_size = (0.0, 0.0)
         self.crop_preview_image: Image.Image | None = None
         self.crop_rect: tuple[float, float, float, float] | None = None
+        self.extract_images_pdf_path: Path | None = None
+        self.extract_images_page_count = 0
+        self.extract_images_page_size = (0.0, 0.0)
+        self.extract_images_preview_image: Image.Image | None = None
         self.erase_pdf_path: Path | None = None
         self.erase_page_count = 0
         self.erase_page_size = (0.0, 0.0)
@@ -2026,6 +2033,8 @@ class VictorPdfToolsQt(QMainWindow):
         advanced_tabs.addTab(self.build_annotation_tab(), "文字標註 / 覆蓋")
         advanced_tabs.addTab(self.build_markup_tab(), "螢光 / 圖形註解")
         advanced_tabs.addTab(self.build_crop_tab(), "裁切頁面")
+        self._extract_images_tab = self.build_extract_images_tab()
+        advanced_tabs.addTab(self._extract_images_tab, "抽出內嵌圖片")
         advanced_tabs.addTab(self.build_erase_tab(), "橡皮擦 / 遮擋")
         self._text_edit_tab = self.build_text_edit_tab()
         advanced_tabs.addTab(self._text_edit_tab, "文字編輯 Beta")
@@ -2424,6 +2433,7 @@ class VictorPdfToolsQt(QMainWindow):
         hint = QLabel(
             "提示：可把 PDF / 圖片直接拖入左側清單。合併 / 圖片轉 PDF 本身支援多檔；"
             "其餘工具預設用第一個 PDF。勾選「批次處理」後，旋轉／壓縮／浮水印／頁碼／加密等會對清單每個 PDF 各輸出一份到資料夾。"
+            "抽出 PDF 裡嵌的圖請到「進階 → 抽出內嵌圖片」。"
             "Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁；PDF 轉 Word / Excel / PowerPoint 請到「PDF 轉 Office」分頁。"
         )
         hint.setObjectName("muted")
@@ -3962,6 +3972,232 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.addStretch(1)
         layout.addWidget(wrap_side_panel(side, 320))
         return tab
+
+    def build_extract_images_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_extract_images_pdf)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(14)
+
+        left = QVBoxLayout()
+        left.setSpacing(10)
+        top = QHBoxLayout()
+        self.add_button(top, "載入 PDF", self.load_extract_images_pdf)
+        top.addWidget(QLabel("頁碼"))
+        self.extract_images_page_input = QLineEdit("1")
+        self.extract_images_page_input.setFixedWidth(56)
+        self.extract_images_page_validator = QIntValidator(1, 1, self)
+        self.extract_images_page_input.setValidator(self.extract_images_page_validator)
+        self.extract_images_page_input.editingFinished.connect(self.on_advanced_page_input_edited)
+        top.addWidget(self.extract_images_page_input)
+        self.add_button(top, "上一頁", lambda: self.change_extract_images_page(-1))
+        self.add_button(top, "下一頁", lambda: self.change_extract_images_page(1))
+        self.add_button(top, "更新預覽", self.render_extract_images_preview)
+        top.addStretch(1)
+        left.addLayout(top)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(False)
+        scroll.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self.extract_images_preview_label = QLabel()
+        self.extract_images_preview_label.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        scroll.setWidget(self.extract_images_preview_label)
+        left.addWidget(scroll, 1)
+        layout.addLayout(left, 1)
+
+        side = QFrame()
+        side.setObjectName("panel")
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(10)
+
+        intro = QLabel(
+            "把 PDF 裡嵌的照片、圖表另存。預設會略過小圖示、細線和漸層背景；"
+            "綠框是本頁將會抽出的圖。這不是把整頁轉成圖。"
+        )
+        intro.setObjectName("muted")
+        intro.setWordWrap(True)
+        side_layout.addWidget(intro)
+
+        self.extract_images_count_label = QLabel("尚未載入 PDF")
+        self.extract_images_count_label.setWordWrap(True)
+        side_layout.addWidget(self.extract_images_count_label)
+
+        side_layout.addWidget(QLabel("抽出範圍"))
+        self.extract_images_scope_combo = QComboBox()
+        self.extract_images_scope_combo.addItem("目前頁", "current")
+        self.extract_images_scope_combo.addItem("全部頁", "all")
+        self.extract_images_scope_combo.addItem("自訂頁碼", "spec")
+        self.extract_images_scope_combo.currentIndexChanged.connect(self.on_extract_images_scope_changed)
+        side_layout.addWidget(self.extract_images_scope_combo)
+
+        self.extract_images_pages_input = QLineEdit()
+        self.extract_images_pages_input.setPlaceholderText("例如 1-3,5")
+        self.extract_images_pages_input.setEnabled(False)
+        side_layout.addWidget(self.extract_images_pages_input)
+
+        side_layout.addWidget(QLabel("圖片篩選"))
+        self.extract_images_quality_combo = QComboBox()
+        self.extract_images_quality_combo.addItem("主要圖片（略過小圖示／漸層）", "main")
+        self.extract_images_quality_combo.addItem("全部內嵌圖", "all")
+        self.extract_images_quality_combo.currentIndexChanged.connect(self.render_extract_images_preview)
+        side_layout.addWidget(self.extract_images_quality_combo)
+
+        side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.extract_images_password_input = QLineEdit()
+        self.extract_images_password_input.setEchoMode(QLineEdit.Password)
+        side_layout.addWidget(self.extract_images_password_input)
+
+        save_button = self.add_button(side_layout, "抽出圖片並另存 ZIP", self.save_extract_images, "primary")
+        save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+
+        side_layout.addStretch(1)
+        layout.addWidget(wrap_side_panel(side, 320))
+        return tab
+
+    def load_extract_images_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
+        if path:
+            self.load_advanced_pdf_from_path(Path(path), self.extract_images_password_input.text())
+
+    def drop_extract_images_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到抽出圖片分頁。")
+            return
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.extract_images_password_input.text())
+
+    def set_extract_images_pdf(self, path: Path) -> None:
+        try:
+            reader = open_reader(path, self.extract_images_password_input.text())
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.extract_images_pdf_path = path
+        self.extract_images_page_count = len(reader.pages)
+        self.extract_images_page_validator.setRange(1, max(self.extract_images_page_count, 1))
+        self.extract_images_page_input.setText("1")
+        self.render_extract_images_preview()
+        self.set_status(f"已載入 {path.name}，共 {self.extract_images_page_count} 頁。")
+
+    def change_extract_images_page(self, delta: int) -> None:
+        if self.extract_images_pdf_path is None:
+            return
+        current = int(self.extract_images_page_input.text() or "1")
+        target = min(max(current + delta, 1), max(self.extract_images_page_count, 1))
+        if target != current:
+            self.set_advanced_page(target - 1)
+
+    def on_extract_images_scope_changed(self) -> None:
+        custom = self.extract_images_scope_combo.currentData() == "spec"
+        self.extract_images_pages_input.setEnabled(custom)
+
+    def _extract_images_pages_spec(self) -> str | None:
+        scope = self.extract_images_scope_combo.currentData() or "current"
+        if scope == "all":
+            return ""
+        if scope == "spec":
+            spec = self.extract_images_pages_input.text().strip()
+            if not spec:
+                self.set_status("請輸入要抽出的頁碼範圍。")
+                return None
+            return spec
+        return str(int(self.extract_images_page_input.text() or "1"))
+
+    def _extract_images_quality(self) -> str:
+        return self.extract_images_quality_combo.currentData() or "main"
+
+    def render_extract_images_preview(self) -> None:
+        if self.extract_images_pdf_path is None:
+            self.extract_images_preview_label.clear()
+            self.extract_images_count_label.setText("尚未載入 PDF")
+            self.set_status("請先載入 PDF。")
+            return
+        if not PDF_RENDER_AVAILABLE or pdfium is None:
+            self.set_status("PDF 預覽元件未啟用。")
+            return
+        try:
+            page_number = min(
+                max(int(self.extract_images_page_input.text() or "1"), 1),
+                self.extract_images_page_count,
+            )
+            self.extract_images_page_input.setText(str(page_number))
+            password = self.extract_images_password_input.text()
+            document = pdfium.PdfDocument(str(self.extract_images_pdf_path), password=password or None)
+            page = document.get_page(page_number - 1)
+            page_width, page_height = page.get_size()
+            scale = self.advanced_preview_scale(page_width, page_height)
+            image = page.render(scale=scale).to_pil().convert("RGB")
+            page.close()
+            document.close()
+            self.extract_images_page_size = (float(page_width), float(page_height))
+            found = list_pdf_embedded_images(
+                self.extract_images_pdf_path,
+                password,
+                str(page_number),
+                quality=self._extract_images_quality(),
+            )
+            if found:
+                draw = ImageDraw.Draw(image)
+                image_width, image_height = image.size
+                scale_x = image_width / page_width if page_width else 1.0
+                scale_y = image_height / page_height if page_height else 1.0
+                for item in found:
+                    for x0, y0, x1, y1 in item.get("rects") or []:
+                        draw.rectangle(
+                            (x0 * scale_x, y0 * scale_y, x1 * scale_x, y1 * scale_y),
+                            outline="#128576",
+                            width=3,
+                        )
+            self.extract_images_preview_image = image
+            pixmap = QPixmap.fromImage(ImageQt(image))
+            self.extract_images_preview_label.setPixmap(pixmap)
+            self.extract_images_preview_label.resize(pixmap.size())
+            if found:
+                label = "內嵌圖" if self._extract_images_quality() == "all" else "主要圖片"
+                self.extract_images_count_label.setText(f"本頁將抽出 {len(found)} 張{label}（綠框）。")
+            elif self._extract_images_quality() == "all":
+                self.extract_images_count_label.setText("本頁沒有可抽出的內嵌圖。向量圖或整頁掃描請改用「PDF 轉圖片」。")
+            else:
+                self.extract_images_count_label.setText(
+                    "本頁沒有符合的主要圖片。可改選「全部內嵌圖」，或改用「PDF 轉圖片」。"
+                )
+        except Exception as exc:
+            self.show_error(exc)
+
+    def save_extract_images(self) -> None:
+        source = self.extract_images_pdf_path or self._advanced_pdf_path()
+        if source is None:
+            self.set_status("請先載入 PDF。")
+            return
+        pages_spec = self._extract_images_pages_spec()
+        if pages_spec is None:
+            return
+        suggested = str(suggested_images_zip_path_for_source(source))
+        target, _ = QFileDialog.getSaveFileName(self, "另存圖片 ZIP", suggested, "ZIP files (*.zip)")
+        if not target:
+            return
+        target_path = Path(target)
+        if target_path.suffix.lower() != ".zip":
+            target_path = target_path.with_suffix(".zip")
+        password = self.extract_images_password_input.text() or self.advanced_password_text()
+        count = {"value": 0}
+
+        def job() -> None:
+            count["value"] = extract_pdf_images(
+                source,
+                target_path,
+                password,
+                pages_spec=pages_spec,
+                quality=self._extract_images_quality(),
+            )
+
+        def after_save() -> None:
+            reveal_output(target_path)
+            self.set_status(f"已抽出 {count['value']} 張內嵌圖片：{target_path.name}")
+
+        self.run_pdf_job(job, "", on_success=after_save)
 
     def load_crop_pdf(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
@@ -6716,6 +6952,7 @@ class VictorPdfToolsQt(QMainWindow):
             getattr(self, "annotation_password_input", None),
             getattr(self, "markup_password_input", None),
             getattr(self, "crop_password_input", None),
+            getattr(self, "extract_images_password_input", None),
             getattr(self, "erase_password_input", None),
             getattr(self, "text_edit_password_input", None),
             getattr(self, "bookmark_password_input", None),
@@ -6734,6 +6971,7 @@ class VictorPdfToolsQt(QMainWindow):
                     self.annotation_password_input,
                     self.markup_password_input,
                     self.crop_password_input,
+                    self.extract_images_password_input,
                     self.erase_password_input,
                     self.text_edit_password_input,
                     self.bookmark_password_input,
@@ -6742,11 +6980,12 @@ class VictorPdfToolsQt(QMainWindow):
             self.set_annotation_pdf(path)
             self.set_markup_pdf(path)
             self.set_crop_pdf(path)
+            self.set_extract_images_pdf(path)
             self.set_erase_pdf(path)
             self.set_text_edit_pdf(path)
             self.set_bookmark_pdf(path)
             self.rebuild_advanced_thumbnails()
-            self.set_status(f"已載入進階共用 PDF：{path.name}（標註／註解／裁切／橡皮擦／文字編輯／書籤）")
+            self.set_status(f"已載入進階共用 PDF：{path.name}（標註／註解／裁切／抽出圖片／橡皮擦／文字編輯／書籤）")
         finally:
             self._broadcasting_advanced_pdf = False
 
@@ -6755,6 +6994,7 @@ class VictorPdfToolsQt(QMainWindow):
             self.annotation_page_count
             or self.markup_page_count
             or self.crop_page_count
+            or self.extract_images_page_count
             or self.erase_page_count
             or self.text_edit_page_count
             or self.bookmark_page_count
@@ -6766,6 +7006,7 @@ class VictorPdfToolsQt(QMainWindow):
             self.annotation_pdf_path
             or self.markup_pdf_path
             or self.crop_pdf_path
+            or self.extract_images_pdf_path
             or self.erase_pdf_path
             or self.text_edit_pdf_path
             or self.bookmark_pdf_path
@@ -6776,6 +7017,7 @@ class VictorPdfToolsQt(QMainWindow):
             self.annotation_page_input,
             self.markup_page_input,
             self.crop_page_input,
+            self.extract_images_page_input,
             self.erase_page_input,
             self.text_edit_page_input,
         ]
@@ -6832,6 +7074,8 @@ class VictorPdfToolsQt(QMainWindow):
                 self.render_markup_preview()
             if self.crop_pdf_path is not None:
                 self.render_crop_preview()
+            if self.extract_images_pdf_path is not None:
+                self.render_extract_images_preview()
             if self.erase_pdf_path is not None:
                 self.render_erase_preview()
             if self.text_edit_pdf_path is not None:
@@ -6849,6 +7093,8 @@ class VictorPdfToolsQt(QMainWindow):
             self.update_annotation_preview_display()
         if self.erase_preview_image is not None:
             self.update_erase_preview_display()
+        if self.extract_images_pdf_path is not None and self.advanced_tabs.currentWidget() is getattr(self, "_extract_images_tab", None):
+            self.render_extract_images_preview()
 
     def advanced_preview_scale(self, page_width: float, page_height: float) -> float:
         zoom = max(ADVANCED_PREVIEW_ZOOM_MIN, min(self.advanced_preview_zoom, ADVANCED_PREVIEW_ZOOM_MAX))

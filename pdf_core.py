@@ -339,6 +339,20 @@ def suggested_pdf_path_for_source(source: Path) -> Path:
     return source.with_name(suggested_pdf_name_for_source(source))
 
 
+def suggested_images_zip_name_for_source(source: Path) -> str:
+    """Keep the original stem (including CJK) and append -images.zip."""
+
+    stem = _WINDOWS_FORBIDDEN_NAME.sub("_", Path(source).stem).strip(" .") or "output"
+    if stem.lower().endswith("-images"):
+        return f"{stem}.zip"
+    return f"{stem}-images.zip"
+
+
+def suggested_images_zip_path_for_source(source: Path) -> Path:
+    source = Path(source)
+    return source.with_name(suggested_images_zip_name_for_source(source))
+
+
 def _report_office_progress(
     progress: Callable[[int, int, str], None] | None,
     current: int,
@@ -6631,6 +6645,274 @@ def extract_pdf_attachments(source: Path, target_zip: Path, password: str = "") 
             with zipfile.ZipFile(target_zip, "w", zipfile.ZIP_DEFLATED) as archive:
                 for item in sorted(folder.iterdir()):
                     archive.write(item, item.name)
+    finally:
+        document.close()
+    return extracted
+
+
+def _extracted_image_extension(ext: str) -> str:
+    normalized = (ext or "bin").lower().lstrip(".")
+    if normalized in {"jpeg", "jpg", "jpe"}:
+        return "jpg"
+    if normalized in {"png", "jp2", "jpx", "j2k", "tif", "tiff", "bmp", "gif", "webp"}:
+        return "jp2" if normalized in {"jpx", "j2k"} else normalized
+    if normalized in {"jb2", "jbig2"}:
+        return "jb2"
+    return normalized or "bin"
+
+
+def _compose_image_with_smask(image_bytes: bytes, document, smask_xref: int) -> Image.Image | None:
+    try:
+        mask_info = document.extract_image(smask_xref)
+        mask_bytes = bytes((mask_info or {}).get("image") or b"")
+        if not mask_bytes:
+            return None
+        with Image.open(io.BytesIO(image_bytes)) as image, Image.open(io.BytesIO(mask_bytes)) as mask:
+            rgba = image.convert("RGBA")
+            alpha = mask.convert("L")
+            if alpha.size != rgba.size:
+                alpha = alpha.resize(rgba.size, Image.Resampling.BILINEAR)
+            rgba.putalpha(alpha)
+            return rgba.copy()
+    except Exception:
+        return None
+
+
+def _extracted_image_payload(document, xref: int) -> tuple[Image.Image, bytes, str] | None:
+    try:
+        info = document.extract_image(xref)
+    except Exception:
+        return None
+    data = bytes((info or {}).get("image") or b"")
+    if not data:
+        return None
+    smask = int((info or {}).get("smask") or 0)
+    ext = _extracted_image_extension(str((info or {}).get("ext") or ""))
+    if smask:
+        composed = _compose_image_with_smask(data, document, smask)
+        if composed is not None:
+            buffer = io.BytesIO()
+            composed.save(buffer, format="PNG")
+            return composed, buffer.getvalue(), "png"
+    try:
+        image = Image.open(io.BytesIO(data)).convert("RGB")
+        image.load()
+    except Exception:
+        return None
+    return image, data, ext
+
+
+def _image_fingerprint(image: Image.Image) -> bytes:
+    return image.convert("L").resize((12, 12), Image.Resampling.BILINEAR).tobytes()
+
+
+def _luminance_stats(image: Image.Image) -> tuple[float, float, int]:
+    sample = image.convert("RGB").resize((48, 48), Image.Resampling.BILINEAR)
+    pixels = list(sample.getdata())
+    lum = [0.299 * r + 0.587 * g + 0.114 * b for r, g, b in pixels]
+    mean = sum(lum) / len(lum)
+    variance = sum((value - mean) ** 2 for value in lum) / len(lum)
+    stddev = variance ** 0.5
+    edges = 0.0
+    width = 48
+    for y in range(47):
+        for x in range(47):
+            index = y * width + x
+            here = lum[index]
+            edges += abs(here - lum[index + 1]) + abs(here - lum[index + width])
+    edge_mean = edges / (47 * 47 * 2)
+    quantized = {(r // 16, g // 16, b // 16) for r, g, b in pixels}
+    return stddev, edge_mean, len(quantized)
+
+
+def _displayed_page_fraction(
+    rects: list[tuple[float, float, float, float]] | None,
+    page_size: tuple[float, float] | None,
+) -> float:
+    if not rects or not page_size:
+        return 1.0
+    page_w, page_h = page_size
+    page_area = page_w * page_h
+    if page_area <= 0:
+        return 1.0
+    area = 0.0
+    for x0, y0, x1, y1 in rects:
+        area += abs(x1 - x0) * abs(y1 - y0)
+    return area / page_area
+
+
+def embedded_image_is_useful(
+    image: Image.Image,
+    *,
+    quality: str = "main",
+    rects: list[tuple[float, float, float, float]] | None = None,
+    page_size: tuple[float, float] | None = None,
+) -> bool:
+    width, height = image.size
+    if width < 8 or height < 8:
+        return False
+    if quality != "main":
+        return True
+    min_side = min(width, height)
+    max_side = max(width, height)
+    if min_side < 48 or width * height < 80 * 80:
+        return False
+    if max_side / min_side > 10:
+        return False
+    fraction = _displayed_page_fraction(rects, page_size)
+    if fraction < 0.012 and min_side < 140:
+        return False
+    stddev, edge_mean, unique_bins = _luminance_stats(image)
+    if unique_bins <= 3 or (stddev < 12 and unique_bins <= 6):
+        return False
+    if edge_mean < 6.5 and unique_bins <= 28:
+        return False
+    if fraction > 0.55 and edge_mean < 10 and unique_bins <= 20:
+        return False
+    return True
+
+
+def _save_extracted_pdf_image(document, xref: int, dest_without_suffix: Path) -> Path | None:
+    payload = _extracted_image_payload(document, xref)
+    if payload is None:
+        return None
+    _image, data, ext = payload
+    path = dest_without_suffix.with_suffix(f".{ext}")
+    path.write_bytes(data)
+    return path
+
+
+def _iter_embedded_image_xrefs(document, page_indexes: list[int]):
+    seen_xrefs: set[int] = set()
+    for page_index in page_indexes:
+        page = document[page_index]
+        images = list(page.get_images(full=True) or [])
+        smask_xrefs = {int(item[1]) for item in images if len(item) > 1 and item[1]}
+        for item in images:
+            xref = int(item[0])
+            if xref in seen_xrefs or xref in smask_xrefs:
+                continue
+            width = int(item[2]) if len(item) > 2 else 0
+            height = int(item[3]) if len(item) > 3 else 0
+            if width < 8 or height < 8:
+                continue
+            seen_xrefs.add(xref)
+            yield page_index, xref, width, height
+
+
+def _embedded_image_rects(page, xref: int) -> list[tuple[float, float, float, float]]:
+    rects: list[tuple[float, float, float, float]] = []
+    try:
+        for rect in page.get_image_rects(xref) or []:
+            rects.append((float(rect.x0), float(rect.y0), float(rect.x1), float(rect.y1)))
+    except Exception:
+        pass
+    return rects
+
+
+def list_pdf_embedded_images(
+    source: Path,
+    password: str = "",
+    pages_spec: str = "",
+    quality: str = "main",
+) -> list[dict]:
+    page_indexes = selected_page_indexes(source, password, pages_spec)
+    if not page_indexes:
+        return []
+    document = _open_pymupdf_document(source, password)
+    found: list[dict] = []
+    fingerprints: set[bytes] = set()
+    try:
+        for page_index, xref, width, height in _iter_embedded_image_xrefs(document, page_indexes):
+            page = document[page_index]
+            rects = _embedded_image_rects(page, xref)
+            payload = _extracted_image_payload(document, xref)
+            if payload is None:
+                continue
+            image, _data, _ext = payload
+            page_size = (float(page.rect.width), float(page.rect.height))
+            if not embedded_image_is_useful(image, quality=quality, rects=rects, page_size=page_size):
+                continue
+            fingerprint = _image_fingerprint(image)
+            if fingerprint in fingerprints:
+                continue
+            fingerprints.add(fingerprint)
+            found.append(
+                {
+                    "page_index": page_index,
+                    "xref": xref,
+                    "width": width,
+                    "height": height,
+                    "rects": rects,
+                }
+            )
+    finally:
+        document.close()
+    return found
+
+
+def extract_pdf_images(
+    source: Path,
+    target: Path,
+    password: str = "",
+    pages_spec: str = "",
+    quality: str = "main",
+) -> int:
+    """Save embedded PDF image XObjects (not full-page rasterization)."""
+
+    page_indexes = selected_page_indexes(source, password, pages_spec)
+    if not page_indexes:
+        raise ValueError("沒有可處理的頁面。")
+    document = _open_pymupdf_document(source, password)
+    extracted = 0
+    used: set[str] = set()
+    fingerprints: set[bytes] = set()
+    stem = _WINDOWS_FORBIDDEN_NAME.sub("_", source.stem).strip(" .") or "output"
+    page_serial: dict[int, int] = {}
+    try:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            folder = Path(temp_dir)
+            for page_index, xref, _width, _height in _iter_embedded_image_xrefs(document, page_indexes):
+                page = document[page_index]
+                rects = _embedded_image_rects(page, xref)
+                payload = _extracted_image_payload(document, xref)
+                if payload is None:
+                    continue
+                image, data, ext = payload
+                page_size = (float(page.rect.width), float(page.rect.height))
+                if not embedded_image_is_useful(image, quality=quality, rects=rects, page_size=page_size):
+                    continue
+                fingerprint = _image_fingerprint(image)
+                if fingerprint in fingerprints:
+                    continue
+                fingerprints.add(fingerprint)
+                page_serial[page_index] = page_serial.get(page_index, 0) + 1
+                dest = folder / f"{stem}-p{page_index + 1:04d}-{page_serial[page_index]:02d}.{ext}"
+                candidate = dest.name
+                if candidate in used:
+                    candidate = _unique_attachment_name(candidate, used)
+                else:
+                    used.add(candidate)
+                dest = folder / candidate
+                dest.write_bytes(data)
+                extracted += 1
+            if extracted == 0:
+                if quality == "main":
+                    raise ValueError(
+                        "沒有符合的主要圖片（已略過小圖示、細線和漸層背景）。"
+                        "可改選「全部內嵌圖」，或這頁圖是向量／掃描件請用「PDF 轉圖片」。"
+                    )
+                raise ValueError(
+                    "這份 PDF 沒有可抽出的內嵌圖片。若圖是整頁掃描或向量繪製，請改用「PDF 轉圖片」。"
+                )
+            if target.suffix.lower() == ".zip":
+                with zipfile.ZipFile(target, "w", zipfile.ZIP_DEFLATED) as archive:
+                    for item in sorted(folder.iterdir()):
+                        archive.write(item, item.name)
+            else:
+                target.mkdir(parents=True, exist_ok=True)
+                for item in sorted(folder.iterdir()):
+                    shutil.copy2(item, target / item.name)
     finally:
         document.close()
     return extracted

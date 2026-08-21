@@ -97,6 +97,8 @@ from pdf_core import (
     inspect_pdf_signatures,
     verify_pdf_signatures,
     extract_pdf_attachments,
+    extract_pdf_images,
+    embedded_image_is_useful,
     split_pdf_by_size,
     _rotate_image_clockwise,
     _is_useful_table,
@@ -536,6 +538,19 @@ class PdfToolsTests(unittest.TestCase):
         self.assertEqual(
             suggested_pdf_path_for_source(source),
             Path(r"T:\Reporting\中海宏洋2026年中期业绩简报 v.1.pdf"),
+        )
+
+    def test_suggested_images_zip_name_keeps_chinese_stem(self):
+        from pdf_core import suggested_images_zip_name_for_source, suggested_images_zip_path_for_source
+
+        source = Path(r"C:\Users\victor.suen\Desktop\IR推介資料\中海宏洋2010年全年度業績簡報-en.pdf")
+        self.assertEqual(
+            suggested_images_zip_name_for_source(source),
+            "中海宏洋2010年全年度業績簡報-en-images.zip",
+        )
+        self.assertEqual(
+            suggested_images_zip_path_for_source(source),
+            Path(r"C:\Users\victor.suen\Desktop\IR推介資料\中海宏洋2010年全年度業績簡報-en-images.zip"),
         )
 
     def test_hide_com_window_prefers_invisible_app(self):
@@ -2571,6 +2586,118 @@ class PdfToolsTests(unittest.TestCase):
             self.assertTrue(any(name.endswith("memo.txt") for name in names))
             self.assertEqual(archive.read(names[0]), b"board-pack-secret")
 
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_extract_pdf_images_writes_zip(self):
+        import zipfile
+        import fitz
+
+        photo = Path(self.temp_dir.name) / "photo.png"
+        _noisy_photo(photo, 160, 120)
+        source = Path(self.temp_dir.name) / "with-image.pdf"
+        target = Path(self.temp_dir.name) / "images.zip"
+        doc = fitz.open()
+        page = doc.new_page(width=400, height=300)
+        page.insert_image(fitz.Rect(20, 20, 260, 200), filename=str(photo))
+        doc.save(str(source))
+        doc.close()
+        count = extract_pdf_images(source, target)
+        self.assertEqual(count, 1)
+        with zipfile.ZipFile(target) as archive:
+            names = archive.namelist()
+            self.assertEqual(len(names), 1)
+            with archive.open(names[0]) as handle:
+                extracted = Image.open(handle)
+                self.assertEqual(extracted.size, (160, 120))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_extract_pdf_images_respects_page_range_and_folder(self):
+        import fitz
+
+        first = Path(self.temp_dir.name) / "first.png"
+        second = Path(self.temp_dir.name) / "second.png"
+        _noisy_photo(first, 160, 120, seed=1)
+        _noisy_photo(second, 140, 140, seed=9)
+        source = Path(self.temp_dir.name) / "two-images.pdf"
+        folder = Path(self.temp_dir.name) / "out-images"
+        doc = fitz.open()
+        page_one = doc.new_page(width=400, height=300)
+        page_one.insert_image(fitz.Rect(20, 20, 220, 170), filename=str(first))
+        page_two = doc.new_page(width=400, height=300)
+        page_two.insert_image(fitz.Rect(30, 30, 220, 220), filename=str(second))
+        doc.save(str(source))
+        doc.close()
+        count = extract_pdf_images(source, folder, pages_spec="2")
+        self.assertEqual(count, 1)
+        files = list(folder.iterdir())
+        self.assertEqual(len(files), 1)
+        with Image.open(files[0]) as extracted:
+            self.assertEqual(extracted.size, (140, 140))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_extract_pdf_images_skips_icons_and_gradients(self):
+        import zipfile
+        import fitz
+
+        icon = Path(self.temp_dir.name) / "icon.png"
+        Image.new("RGB", (24, 24), "blue").save(icon)
+        gradient = Path(self.temp_dir.name) / "glow.png"
+        _radial_gradient().save(gradient)
+        photo = Path(self.temp_dir.name) / "photo.png"
+        _noisy_photo(photo, 180, 120, seed=4)
+        source = Path(self.temp_dir.name) / "mixed.pdf"
+        target = Path(self.temp_dir.name) / "main.zip"
+        doc = fitz.open()
+        page = doc.new_page(width=500, height=400)
+        page.insert_image(fitz.Rect(10, 10, 34, 34), filename=str(icon))
+        page.insert_image(fitz.Rect(40, 40, 260, 260), filename=str(gradient))
+        page.insert_image(fitz.Rect(270, 40, 470, 180), filename=str(photo))
+        doc.save(str(source))
+        doc.close()
+        count = extract_pdf_images(source, target, quality="main")
+        self.assertEqual(count, 1)
+        with zipfile.ZipFile(target) as archive:
+            names = archive.namelist()
+            self.assertEqual(len(names), 1)
+            with archive.open(names[0]) as handle:
+                extracted = Image.open(handle)
+                self.assertEqual(extracted.size, (180, 120))
+        all_count = extract_pdf_images(source, Path(self.temp_dir.name) / "all.zip", quality="all")
+        self.assertGreaterEqual(all_count, 2)
+
+    def test_embedded_image_is_useful_filters_decorative(self):
+        photo = _noisy_photo(Path(self.temp_dir.name) / "keep.png", 160, 120)
+        with Image.open(photo) as image:
+            self.assertTrue(embedded_image_is_useful(image, quality="main"))
+        solid = Image.new("RGB", (200, 200), "red")
+        self.assertFalse(embedded_image_is_useful(solid, quality="main"))
+        self.assertTrue(embedded_image_is_useful(solid, quality="all"))
+        icon = Image.new("RGB", (24, 24), "blue")
+        self.assertFalse(embedded_image_is_useful(icon, quality="main"))
+        self.assertFalse(embedded_image_is_useful(_radial_gradient(), quality="main"))
+
+    @unittest.skipUnless(
+        __import__("pdf_core").PYMUPDF_AVAILABLE,
+        "PyMuPDF not installed",
+    )
+    def test_extract_pdf_images_rejects_blank_pdf(self):
+        source = Path(self.temp_dir.name) / "blank.pdf"
+        target = Path(self.temp_dir.name) / "none.zip"
+        writer = PdfWriter()
+        writer.add_blank_page(width=200, height=200)
+        with source.open("wb") as stream:
+            writer.write(stream)
+        with self.assertRaisesRegex(ValueError, "沒有符合的主要圖片"):
+            extract_pdf_images(source, target)
+
     def test_split_pdf_by_size_keeps_one_part_when_limit_is_large(self):
         import zipfile
 
@@ -2616,6 +2743,36 @@ class PdfToolsTests(unittest.TestCase):
 
     def tearDown(self):
         self.temp_dir.cleanup()
+
+
+def _noisy_photo(path: Path, width: int = 160, height: int = 120, seed: int = 3) -> Path:
+    image = Image.new("RGB", (width, height))
+    pixels = image.load()
+    for y in range(height):
+        for x in range(width):
+            pixels[x, y] = (
+                (x * 17 + y * 5 + seed) % 256,
+                (x * 3 + y * 11 + seed * 2) % 256,
+                (x * y + seed * 7) % 256,
+            )
+    image.save(path)
+    return path
+
+
+def _radial_gradient(width: int = 220, height: int = 220) -> Image.Image:
+    image = Image.new("RGB", (width, height))
+    pixels = image.load()
+    cx, cy = width / 2, height / 2
+    radius = max(cx, cy) or 1
+    for y in range(height):
+        for x in range(width):
+            t = min((((x - cx) ** 2 + (y - cy) ** 2) ** 0.5) / radius, 1.0)
+            pixels[x, y] = (
+                int(230 + 25 * t),
+                int(210 + 30 * t),
+                int(180 + 75 * t),
+            )
+    return image
 
 
 if __name__ == "__main__":
