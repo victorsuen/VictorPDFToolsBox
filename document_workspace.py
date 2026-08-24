@@ -81,6 +81,8 @@ from pdf_core import (
     extract_pdf_attachments,
     extract_pdf_images,
     suggested_images_zip_path_for_source,
+    suggested_cleaned_pdf_path_for_source,
+    clean_document_info,
     fill_form_fields,
     flatten_form_fields,
     flatten_or_strip_annotations,
@@ -909,6 +911,7 @@ class DocumentWorkspace(QWidget):
         self.add_button(layout, "視覺比對 PDF...", self.compare_pdf_pages)
         self.add_button(layout, "依書籤拆分", self.split_by_bookmarks)
         self.add_button(layout, "壓平表單欄位", self.flatten_forms)
+        self.add_button(layout, "清理文件內容（標題／作者／主旨／關鍵字）", self.clear_document_info)
         self.add_button(layout, "對外發送前清理", self.sanitize_for_external)
         self.add_button(layout, "壓平註解", self.flatten_annotations)
         self.add_button(layout, "清除註解", self.strip_annotations)
@@ -2434,6 +2437,30 @@ class DocumentWorkspace(QWidget):
             return flatten_form_fields(self.pdf_path, target_path, password)
 
         if self._run_job(job, "已壓平表單欄位。", audit_operation="flatten_forms", audit_target=target_path) is not None:
+            self._offer_reload_output(target_path)
+
+    def clear_document_info(self) -> None:
+        if self.pdf_path is None:
+            return
+        self._push_undo_snapshot()
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            "另存清理後 PDF",
+            str(suggested_cleaned_pdf_path_for_source(self.pdf_path)),
+            "PDF files (*.pdf)",
+        )
+        if not target:
+            return
+        target_path = Path(target)
+        if target_path.suffix.lower() != ".pdf":
+            target_path = target_path.with_suffix(".pdf")
+        password = self.tools_password_input.text() or self.password
+
+        def job() -> dict:
+            return clean_document_info(self.pdf_path, target_path, password)
+
+        result = self._run_job(job, "已刪除標題／作者／主旨／關鍵字。", audit_operation="clean_metadata", audit_target=target_path)
+        if result is not None:
             self._offer_reload_output(target_path)
 
     def sanitize_for_external(self) -> None:

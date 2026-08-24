@@ -317,6 +317,7 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(window.erase_pdf_path, self.source)
         self.assertEqual(window.text_edit_pdf_path, self.source)
         self.assertEqual(window.bookmark_pdf_path, self.source)
+        self.assertEqual(window.document_info_pdf_path, self.source)
         self.assertEqual(window.advanced_page_list.count(), 2)
         self.assertEqual(window.advanced_page_list.currentRow(), 0)
 
@@ -792,6 +793,7 @@ class QtAppTests(unittest.TestCase):
             "螢光 / 圖形註解",
             "裁切頁面",
             "抽出內嵌圖片",
+            "文件內容",
             "橡皮擦 / 遮擋",
             "文字編輯 Beta",
             "書籤 / 目錄",
@@ -826,6 +828,39 @@ class QtAppTests(unittest.TestCase):
         self.assertEqual(extractor.call_args.kwargs.get("pages_spec"), "2-4")
         self.assertEqual(extractor.call_args.kwargs.get("quality"), "main")
         self.assertTrue(str(save_dialog.call_args[0][2]).endswith("-images.zip"))
+
+    def test_advanced_document_info_tab_shows_fields_to_delete(self):
+        import fitz
+
+        from pdf_core import DOCUMENT_INFO_FIELDS
+
+        source = Path(self.temp_dir.name) / "titled.pdf"
+        doc = fitz.open()
+        doc.new_page()
+        doc.set_metadata({"title": "Microsoft Word - C_2025 FY PrelimRA v10", "author": "IR"})
+        doc.save(str(source))
+        doc.close()
+
+        window = VictorPdfToolsQt()
+        window.set_document_info_pdf(source)
+        self.assertIn("Microsoft Word - C_2025 FY PrelimRA v10", window.document_info_values["title"].text())
+        self.assertEqual(window.document_info_values["author"].text(), "IR")
+        self.assertEqual(window._selected_document_info_fields(), DOCUMENT_INFO_FIELDS)
+        window.document_info_checks["author"].setChecked(False)
+        window.document_info_checks["subject"].setChecked(False)
+        window.document_info_checks["keywords"].setChecked(False)
+        target = Path(self.temp_dir.name) / "cleaned.pdf"
+        with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "pdf")) as save_dialog:
+            with patch("qt_app.clean_document_info") as cleaner:
+                with patch.object(
+                    window,
+                    "run_pdf_job",
+                    side_effect=lambda job, *_a, on_success=None, **_k: (job(), on_success() if on_success else None),
+                ):
+                    window.save_document_info()
+        cleaner.assert_called_once()
+        self.assertEqual(cleaner.call_args.kwargs.get("fields"), ("title",))
+        self.assertTrue(str(save_dialog.call_args[0][2]).endswith("-cleaned.pdf"))
 
     def test_document_workspace_single_page_preview(self):
         workspace = DocumentWorkspace()

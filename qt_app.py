@@ -100,7 +100,10 @@ from pdf_core import (
     rgb_to_hex,
     text_contains_cjk,
     apply_text_markups_for_query,
+    clean_document_info,
     clean_metadata,
+    DOCUMENT_INFO_FIELD_LABELS,
+    DOCUMENT_INFO_FIELDS,
     compress_pdf,
     compress_pdf_advanced,
     compare_pdf_text,
@@ -143,6 +146,7 @@ from pdf_core import (
     extract_pdf_attachments,
     extract_pdf_images,
     list_pdf_embedded_images,
+    read_pdf_document_info,
     split_pdf_by_size,
     open_reader,
     paint_callout_markup,
@@ -161,6 +165,7 @@ from pdf_core import (
     safe_output_name,
     suggested_pdf_name_for_source,
     suggested_pdf_path_for_source,
+    suggested_cleaned_pdf_path_for_source,
     suggested_images_zip_path_for_source,
     split_pdf_advanced,
     split_pdf_to_zip,
@@ -191,7 +196,7 @@ TOOL_OPERATIONS = [
     ("add_page_numbers", "加頁碼 / Footer"),
     ("watermark", "加水印 / 印章"),
     ("remove_blank_pages", "刪除空白頁"),
-    ("clean_metadata", "清理 Metadata"),
+    ("clean_metadata", "清理 Metadata（刪標題／作者／主旨／關鍵字）"),
     ("insert_pages", "插入頁面"),
     ("replace_pages", "取代頁面"),
     ("compress_advanced", "進階壓縮"),
@@ -205,7 +210,7 @@ TOOL_OPERATIONS = [
     ("secure_redact", "安全塗銷關鍵字"),
     ("scan_cleanup", "掃描件一鍵整理"),
     ("compress_to_size", "壓縮到指定大小"),
-    ("sanitize_external", "對外發送前清理"),
+    ("sanitize_external", "對外發送前清理（含標題／作者／註解／附件）"),
     ("flatten_annots", "註解壓平／清除"),
     ("verify_signatures", "驗證數位簽章"),
     ("extract_attachments", "抽出內嵌附件"),
@@ -1787,6 +1792,8 @@ class VictorPdfToolsQt(QMainWindow):
         self.extract_images_page_count = 0
         self.extract_images_page_size = (0.0, 0.0)
         self.extract_images_preview_image: Image.Image | None = None
+        self.document_info_pdf_path: Path | None = None
+        self.document_info_page_count = 0
         self.erase_pdf_path: Path | None = None
         self.erase_page_count = 0
         self.erase_page_size = (0.0, 0.0)
@@ -2035,6 +2042,8 @@ class VictorPdfToolsQt(QMainWindow):
         advanced_tabs.addTab(self.build_crop_tab(), "裁切頁面")
         self._extract_images_tab = self.build_extract_images_tab()
         advanced_tabs.addTab(self._extract_images_tab, "抽出內嵌圖片")
+        self._document_info_tab = self.build_document_info_tab()
+        advanced_tabs.addTab(self._document_info_tab, "文件內容")
         advanced_tabs.addTab(self.build_erase_tab(), "橡皮擦 / 遮擋")
         self._text_edit_tab = self.build_text_edit_tab()
         advanced_tabs.addTab(self._text_edit_tab, "文字編輯 Beta")
@@ -2434,6 +2443,7 @@ class VictorPdfToolsQt(QMainWindow):
             "提示：可把 PDF / 圖片直接拖入左側清單。合併 / 圖片轉 PDF 本身支援多檔；"
             "其餘工具預設用第一個 PDF。勾選「批次處理」後，旋轉／壓縮／浮水印／頁碼／加密等會對清單每個 PDF 各輸出一份到資料夾。"
             "抽出 PDF 裡嵌的圖請到「進階 → 抽出內嵌圖片」。"
+            "刪 PDF 標題／作者／主旨／關鍵字請到「進階 → 文件內容」。"
             "Word / Excel / PowerPoint 請到「Office 轉 PDF」分頁；PDF 轉 Word / Excel / PowerPoint 請到「PDF 轉 Office」分頁。"
         )
         hint.setObjectName("muted")
@@ -4196,6 +4206,150 @@ class VictorPdfToolsQt(QMainWindow):
         def after_save() -> None:
             reveal_output(target_path)
             self.set_status(f"已抽出 {count['value']} 張內嵌圖片：{target_path.name}")
+
+        self.run_pdf_job(job, "", on_success=after_save)
+
+    def build_document_info_tab(self) -> QWidget:
+        tab = PdfDropPanel()
+        tab.filesDropped.connect(self.drop_document_info_pdf)
+        layout = QHBoxLayout(tab)
+        layout.setContentsMargins(0, 10, 0, 0)
+        layout.setSpacing(14)
+
+        left = QVBoxLayout()
+        top = QHBoxLayout()
+        self.add_button(top, "載入 PDF", self.load_document_info_pdf)
+        self.add_button(top, "重新讀取", self.refresh_document_info_fields)
+        top.addStretch(1)
+        left.addLayout(top)
+
+        intro = QLabel(
+            "這裡對應 Acrobat「檔案 → 內容 → 描述」。瀏覽器顯示的不是檔案名，而是裡面的「標題」。"
+            "勾選要刪的欄位後另存；不會覆寫原檔。"
+        )
+        intro.setWordWrap(True)
+        left.addWidget(intro)
+
+        self.document_info_file_label = QLabel("尚未載入 PDF")
+        self.document_info_file_label.setWordWrap(True)
+        left.addWidget(self.document_info_file_label)
+
+        self.document_info_checks: dict[str, QCheckBox] = {}
+        self.document_info_values: dict[str, QLabel] = {}
+        for key in DOCUMENT_INFO_FIELDS:
+            check = QCheckBox(f"刪除　{DOCUMENT_INFO_FIELD_LABELS[key]}")
+            check.setChecked(True)
+            left.addWidget(check)
+            value = QLabel("尚未載入")
+            value.setObjectName("muted")
+            value.setWordWrap(True)
+            left.addWidget(value)
+            self.document_info_checks[key] = check
+            self.document_info_values[key] = value
+
+        left.addStretch(1)
+        layout.addLayout(left, 1)
+
+        side = QFrame()
+        side.setObjectName("panel")
+        side_layout = QVBoxLayout(side)
+        side_layout.setContentsMargins(14, 14, 14, 14)
+        side_layout.setSpacing(10)
+
+        guide = QLabel(
+            "通常要刪的是：\n"
+            "• 標題 Title（瀏覽器分頁名／下載顯示名）\n"
+            "• 作者 Author\n"
+            "• 主旨 Subject\n"
+            "• 關鍵字 Keywords\n"
+            "四項預設全勾。若只要去掉舊 Word 檔名，只勾「標題」即可。"
+        )
+        guide.setObjectName("muted")
+        guide.setWordWrap(True)
+        side_layout.addWidget(guide)
+
+        side_layout.addWidget(QLabel("PDF 密碼（如適用）"))
+        self.document_info_password_input = QLineEdit()
+        self.document_info_password_input.setEchoMode(QLineEdit.Password)
+        side_layout.addWidget(self.document_info_password_input)
+
+        save_button = self.add_button(
+            side_layout, "刪除勾選欄位並另存", self.save_document_info, "primary"
+        )
+        save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        side_layout.addStretch(1)
+        layout.addWidget(wrap_side_panel(side, 320))
+        return tab
+
+    def load_document_info_pdf(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(self, "載入 PDF", "", "PDF files (*.pdf)")
+        if path:
+            self.load_advanced_pdf_from_path(Path(path), self.document_info_password_input.text())
+
+    def drop_document_info_pdf(self, paths: list[str]) -> None:
+        pdf_paths = [Path(path) for path in paths if Path(path).suffix.lower() in PDF_SUFFIXES]
+        if not pdf_paths:
+            self.set_status("請拖放 PDF 檔案到文件內容分頁。")
+            return
+        self.load_advanced_pdf_from_path(pdf_paths[0], self.document_info_password_input.text())
+
+    def set_document_info_pdf(self, path: Path) -> None:
+        self.document_info_pdf_path = path
+        try:
+            reader = open_reader(path, self.document_info_password_input.text())
+            self.document_info_page_count = len(reader.pages)
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.refresh_document_info_fields()
+
+    def refresh_document_info_fields(self) -> None:
+        source = self.document_info_pdf_path or self._advanced_pdf_path()
+        if source is None:
+            self.document_info_file_label.setText("尚未載入 PDF")
+            for label in self.document_info_values.values():
+                label.setText("尚未載入")
+            return
+        try:
+            info = read_pdf_document_info(source, self.document_info_password_input.text())
+        except Exception as exc:
+            self.show_error(exc)
+            return
+        self.document_info_file_label.setText(f"目前檔案：{source.name}")
+        for key, label in self.document_info_values.items():
+            value = (info.get(key) or "").strip()
+            label.setText(value if value else "（空白）")
+        self.set_status(f"已讀取文件內容：{source.name}")
+
+    def _selected_document_info_fields(self) -> tuple[str, ...]:
+        return tuple(key for key, check in self.document_info_checks.items() if check.isChecked())
+
+    def save_document_info(self) -> None:
+        source = self.document_info_pdf_path or self._advanced_pdf_path()
+        if source is None:
+            self.set_status("請先載入 PDF。")
+            return
+        fields = self._selected_document_info_fields()
+        if not fields:
+            self.set_status("請至少勾選一個要刪除的欄位。")
+            return
+        suggested = str(suggested_cleaned_pdf_path_for_source(source))
+        target, _ = QFileDialog.getSaveFileName(self, "另存清理後 PDF", suggested, "PDF files (*.pdf)")
+        if not target:
+            return
+        target_path = Path(target)
+        if target_path.suffix.lower() != ".pdf":
+            target_path = target_path.with_suffix(".pdf")
+        password = self.document_info_password_input.text() or self.advanced_password_text()
+
+        def job() -> None:
+            clean_document_info(source, target_path, password, fields=fields)
+
+        def after_save() -> None:
+            labels = "、".join(DOCUMENT_INFO_FIELD_LABELS[key] for key in fields)
+            self.set_status(f"已刪除 {labels}：{target_path.name}")
+            if target_path.exists():
+                self.load_advanced_pdf_from_path(target_path, password)
 
         self.run_pdf_job(job, "", on_success=after_save)
 
@@ -6953,6 +7107,7 @@ class VictorPdfToolsQt(QMainWindow):
             getattr(self, "markup_password_input", None),
             getattr(self, "crop_password_input", None),
             getattr(self, "extract_images_password_input", None),
+            getattr(self, "document_info_password_input", None),
             getattr(self, "erase_password_input", None),
             getattr(self, "text_edit_password_input", None),
             getattr(self, "bookmark_password_input", None),
@@ -6972,6 +7127,7 @@ class VictorPdfToolsQt(QMainWindow):
                     self.markup_password_input,
                     self.crop_password_input,
                     self.extract_images_password_input,
+                    self.document_info_password_input,
                     self.erase_password_input,
                     self.text_edit_password_input,
                     self.bookmark_password_input,
@@ -6981,11 +7137,12 @@ class VictorPdfToolsQt(QMainWindow):
             self.set_markup_pdf(path)
             self.set_crop_pdf(path)
             self.set_extract_images_pdf(path)
+            self.set_document_info_pdf(path)
             self.set_erase_pdf(path)
             self.set_text_edit_pdf(path)
             self.set_bookmark_pdf(path)
             self.rebuild_advanced_thumbnails()
-            self.set_status(f"已載入進階共用 PDF：{path.name}（標註／註解／裁切／抽出圖片／橡皮擦／文字編輯／書籤）")
+            self.set_status(f"已載入進階共用 PDF：{path.name}（標註／註解／裁切／抽出圖片／文件內容／橡皮擦／文字編輯／書籤）")
         finally:
             self._broadcasting_advanced_pdf = False
 
@@ -6995,6 +7152,7 @@ class VictorPdfToolsQt(QMainWindow):
             or self.markup_page_count
             or self.crop_page_count
             or self.extract_images_page_count
+            or self.document_info_page_count
             or self.erase_page_count
             or self.text_edit_page_count
             or self.bookmark_page_count
@@ -7007,6 +7165,7 @@ class VictorPdfToolsQt(QMainWindow):
             or self.markup_pdf_path
             or self.crop_pdf_path
             or self.extract_images_pdf_path
+            or self.document_info_pdf_path
             or self.erase_pdf_path
             or self.text_edit_pdf_path
             or self.bookmark_pdf_path
@@ -7095,6 +7254,8 @@ class VictorPdfToolsQt(QMainWindow):
             self.update_erase_preview_display()
         if self.extract_images_pdf_path is not None and self.advanced_tabs.currentWidget() is getattr(self, "_extract_images_tab", None):
             self.render_extract_images_preview()
+        if self.document_info_pdf_path is not None and self.advanced_tabs.currentWidget() is getattr(self, "_document_info_tab", None):
+            self.refresh_document_info_fields()
 
     def advanced_preview_scale(self, page_width: float, page_height: float) -> float:
         zoom = max(ADVANCED_PREVIEW_ZOOM_MIN, min(self.advanced_preview_zoom, ADVANCED_PREVIEW_ZOOM_MAX))

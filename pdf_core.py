@@ -339,6 +339,18 @@ def suggested_pdf_path_for_source(source: Path) -> Path:
     return source.with_name(suggested_pdf_name_for_source(source))
 
 
+def suggested_cleaned_pdf_name_for_source(source: Path) -> str:
+    stem = _WINDOWS_FORBIDDEN_NAME.sub("_", Path(source).stem).strip(" .") or "output"
+    if stem.lower().endswith("-cleaned"):
+        return f"{stem}.pdf"
+    return f"{stem}-cleaned.pdf"
+
+
+def suggested_cleaned_pdf_path_for_source(source: Path) -> Path:
+    source = Path(source)
+    return source.with_name(suggested_cleaned_pdf_name_for_source(source))
+
+
 def suggested_images_zip_name_for_source(source: Path) -> str:
     """Keep the original stem (including CJK) and append -images.zip."""
 
@@ -4542,12 +4554,86 @@ def remove_blank_pages(source: Path, target: Path, threshold: int = 25, password
     return removed
 
 
-def clean_metadata(source: Path, target: Path, password: str = "") -> None:
+DOCUMENT_INFO_FIELDS = ("title", "author", "subject", "keywords")
+DOCUMENT_INFO_FIELD_LABELS = {
+    "title": "標題 Title",
+    "author": "作者 Author",
+    "subject": "主旨 Subject",
+    "keywords": "關鍵字 Keywords",
+}
+_DOCUMENT_INFO_PDF_KEYS = {
+    "title": "/Title",
+    "author": "/Author",
+    "subject": "/Subject",
+    "keywords": "/Keywords",
+}
+
+
+def read_pdf_document_info(source: Path, password: str = "") -> dict[str, str]:
+    """Return Acrobat-style Description fields: Title, Author, Subject, Keywords."""
+
+    info = {key: "" for key in DOCUMENT_INFO_FIELDS}
+    if PYMUPDF_AVAILABLE:
+        document = _open_pymupdf_document(source, password)
+        try:
+            metadata = document.metadata or {}
+            for key in DOCUMENT_INFO_FIELDS:
+                info[key] = str(metadata.get(key) or "").strip()
+        finally:
+            document.close()
+        return info
+    metadata = open_reader(source, password).metadata or {}
+    for key, pdf_key in _DOCUMENT_INFO_PDF_KEYS.items():
+        info[key] = str(metadata.get(pdf_key) or "").strip()
+    return info
+
+
+def clean_document_info(
+    source: Path,
+    target: Path,
+    password: str = "",
+    fields: tuple[str, ...] | list[str] | None = None,
+) -> dict[str, str]:
+    """Clear selected Description fields and XMP so browsers no longer show the old Title."""
+
+    selected = tuple(fields) if fields is not None else DOCUMENT_INFO_FIELDS
+    selected = tuple(key for key in selected if key in DOCUMENT_INFO_FIELDS)
+    if not selected:
+        raise ValueError("請至少勾選一個要刪除的欄位：標題、作者、主旨或關鍵字。")
+    if PYMUPDF_AVAILABLE:
+        document = _open_pymupdf_document(source, password)
+        try:
+            metadata = dict(document.metadata or {})
+            for key in selected:
+                metadata[key] = ""
+            document.set_metadata(metadata)
+            document.del_xml_metadata()
+            document.set_metadata(metadata)
+            document.save(str(target), garbage=4, deflate=True, clean=True)
+        finally:
+            document.close()
+        return read_pdf_document_info(target, password)
     reader = open_reader(source, password)
     writer = PdfWriter()
     writer.append_pages_from_reader(reader)
-    writer.add_metadata({"/Producer": "Victor PDF Tools Box"})
+    remaining = {}
+    metadata = reader.metadata or {}
+    for pdf_key, value in metadata.items():
+        field = next((key for key, mapped in _DOCUMENT_INFO_PDF_KEYS.items() if mapped == pdf_key), None)
+        if field in selected:
+            continue
+        remaining[pdf_key] = value
+    remaining["/Producer"] = "Victor PDF Tools Box"
+    writer.add_metadata(remaining)
+    root = getattr(writer, "_root_object", None)
+    if root is not None and "/Metadata" in root:
+        del root["/Metadata"]
     write_pdf(writer, target)
+    return read_pdf_document_info(target, password)
+
+
+def clean_metadata(source: Path, target: Path, password: str = "") -> None:
+    clean_document_info(source, target, password, fields=DOCUMENT_INFO_FIELDS)
 
 
 @dataclass(frozen=True)

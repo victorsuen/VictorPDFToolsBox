@@ -38,6 +38,9 @@ from pdf_core import (
     _libreoffice_pdf_filter,
     suggested_pdf_name_for_source,
     suggested_pdf_path_for_source,
+    suggested_cleaned_pdf_name_for_source,
+    read_pdf_document_info,
+    clean_document_info,
     _hide_com_window,
     list_form_fields,
     parse_page_groups,
@@ -540,6 +543,13 @@ class PdfToolsTests(unittest.TestCase):
             Path(r"T:\Reporting\中海宏洋2026年中期业绩简报 v.1.pdf"),
         )
 
+    def test_suggested_cleaned_pdf_name_keeps_chinese_stem(self):
+        source = Path(r"C:\IR\中海宏洋2010年全年度業績簡報-en.pdf")
+        self.assertEqual(
+            suggested_cleaned_pdf_name_for_source(source),
+            "中海宏洋2010年全年度業績簡報-en-cleaned.pdf",
+        )
+
     def test_suggested_images_zip_name_keeps_chinese_stem(self):
         from pdf_core import suggested_images_zip_name_for_source, suggested_images_zip_path_for_source
 
@@ -836,8 +846,39 @@ class PdfToolsTests(unittest.TestCase):
 
         clean_metadata(source, target)
 
-        metadata = PdfReader(str(target)).metadata
+        metadata = PdfReader(str(target)).metadata or {}
         self.assertNotEqual(metadata.get("/Author"), "Sensitive User")
+        info = read_pdf_document_info(target)
+        self.assertFalse(info["author"])
+
+    def test_clean_document_info_can_delete_title_only(self):
+        import fitz
+
+        source = Path(self.temp_dir.name) / "titled.pdf"
+        target = Path(self.temp_dir.name) / "cleaned.pdf"
+        doc = fitz.open()
+        doc.new_page()
+        doc.set_metadata(
+            {
+                "title": "Microsoft Word - C_2025 FY PrelimRA v10",
+                "author": "Internal",
+                "subject": "IR",
+                "keywords": "draft",
+            }
+        )
+        doc.save(str(source))
+        doc.close()
+
+        info = read_pdf_document_info(source)
+        self.assertEqual(info["title"], "Microsoft Word - C_2025 FY PrelimRA v10")
+        self.assertEqual(info["author"], "Internal")
+
+        cleaned = clean_document_info(source, target, fields=("title",))
+        self.assertFalse(cleaned["title"])
+        leftover = read_pdf_document_info(target)
+        self.assertEqual(leftover["author"], "Internal")
+        self.assertEqual(leftover["subject"], "IR")
+        self.assertEqual(leftover["keywords"], "draft")
 
     def test_remove_blank_pages_refuses_all_blank_output(self):
         source = Path(self.temp_dir.name) / "source.pdf"
