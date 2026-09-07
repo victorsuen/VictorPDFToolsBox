@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import os
 import queue
+import shutil
 import subprocess
 import sys
+import tempfile
 import threading
 from dataclasses import replace
 from pathlib import Path
@@ -833,6 +835,7 @@ class AnnotationPreviewLabel(PreviewImageLabel):
 class TextEditPreviewLabel(PreviewImageLabel):
     positionClicked = Signal(QPoint)
     inlineEdited = Signal(str)
+    inlineEditFinished = Signal()
 
     def __init__(self) -> None:
         super().__init__()
@@ -845,6 +848,8 @@ class TextEditPreviewLabel(PreviewImageLabel):
         self.inline_edit.setFrame(False)
         self.inline_edit.setPlaceholderText("在此直接輸入新文字")
         self.inline_edit.textEdited.connect(self.inlineEdited.emit)
+        self.inline_edit.editingFinished.connect(self.inlineEditFinished.emit)
+        self.setFocusPolicy(Qt.StrongFocus)
 
     def set_block_rects(self, rects: list[QRect]) -> None:
         self.block_rects = rects
@@ -897,6 +902,12 @@ class TextEditPreviewLabel(PreviewImageLabel):
     def hide_inline_editor(self) -> None:
         self.inline_edit.hide()
         self.inline_edit.clearFocus()
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.Undo):
+            event.accept()
+            return
+        super().keyPressEvent(event)
 
 
 class ErasePreviewLabel(PreviewImageLabel):
@@ -1822,6 +1833,12 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_page_count = 0
         self.text_edit_blocks: list[TextBlock] = []
         self._text_edit_selected_row = -1
+        self._text_edit_active_block: TextBlock | None = None
+        self._text_edit_source_path: Path | None = None
+        self._text_edit_working_path: Path | None = None
+        self._text_edit_dirty = False
+        self._text_edit_committing = False
+        self._text_edit_undo_stack: list[Path] = []
         self.bookmark_pdf_path: Path | None = None
         self.bookmark_page_count = 0
         self.bookmark_items: list[BookmarkItem] = []
@@ -5515,6 +5532,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.add_button(top, "上一頁", lambda: self.change_text_edit_page(-1))
         self.add_button(top, "下一頁", lambda: self.change_text_edit_page(1))
         self.add_button(top, "偵測文字", self.refresh_text_edit_page)
+        self.add_button(top, "復原 Ctrl+Z", self.undo_text_edit_action)
         top.addStretch(1)
         left.addLayout(top)
 
@@ -5524,6 +5542,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_preview_label = TextEditPreviewLabel()
         self.text_edit_preview_label.positionClicked.connect(self.select_text_edit_block_at_point)
         self.text_edit_preview_label.inlineEdited.connect(self.on_text_edit_inline_edited)
+        self.text_edit_preview_label.inlineEditFinished.connect(self.on_text_edit_inline_finished)
         scroll.setWidget(self.text_edit_preview_label)
         left.addWidget(scroll, 1)
         layout.addLayout(left, 1)
@@ -5536,7 +5555,8 @@ class VictorPdfToolsQt(QMainWindow):
 
         click_guide = QLabel(
             "在中間預覽直接點文字即可編輯，像 Adobe Acrobat。"
-            "滑鼠移到文字上會反白，點下去就能打字；不必從右側清單挑亂碼。"
+            "改完後點頁面空白處或按 Enter 就會立刻套用；Ctrl+Z 可復原上一筆。"
+            "完成後再按「更新並儲存 PDF」另存。"
         )
         click_guide.setObjectName("muted")
         click_guide.setWordWrap(True)
@@ -5896,6 +5916,12 @@ class VictorPdfToolsQt(QMainWindow):
             self.show_error(exc)
             return
         self.text_edit_pdf_path = path
+        self._text_edit_source_path = path
+        self._text_edit_working_path = None
+        self._text_edit_dirty = False
+        self._text_edit_active_block = None
+        self._text_edit_selected_row = -1
+        self._clear_text_edit_undo_stack()
         self.text_edit_page_count = len(reader.pages)
         self.text_edit_page_validator.setRange(1, max(self.text_edit_page_count, 1))
         self.text_edit_page_input.setText("1")
@@ -5918,6 +5944,9 @@ class VictorPdfToolsQt(QMainWindow):
         if self.text_edit_pdf_path is None:
             self.set_status("請先載入 PDF。")
             return
+        if not self._text_edit_committing:
+            if self.commit_text_edit_if_changed():
+                return
         page_number = min(max(int(self.text_edit_page_input.text() or "1"), 1), self.text_edit_page_count)
         self.text_edit_page_input.setText(str(page_number))
         try:
@@ -5927,7 +5956,8 @@ class VictorPdfToolsQt(QMainWindow):
                 self.text_edit_password_input.text(),
             )
             self.render_text_edit_preview()
-            self.recover_garbled_text_edit_blocks()
+            if not self._text_edit_committing:
+                self.recover_garbled_text_edit_blocks()
             self.refresh_text_edit_blocks()
         except Exception as exc:
             self.show_error(exc)
@@ -6098,6 +6128,8 @@ class VictorPdfToolsQt(QMainWindow):
     def on_text_edit_block_selected(self, row: int) -> None:
         if row < 0:
             self._text_edit_selected_row = -1
+            if not self._text_edit_committing:
+                self._text_edit_active_block = None
             self.text_edit_block_info.setText("點預覽上的文字即可直接編輯。")
             self.update_text_edit_preview(None)
             return
@@ -6105,10 +6137,12 @@ class VictorPdfToolsQt(QMainWindow):
         if not isinstance(block, TextBlock):
             return
         if row == self._text_edit_selected_row:
+            self._text_edit_active_block = block
             self.update_text_edit_preview(block)
             self.focus_text_edit_inline_editor()
             return
         self._text_edit_selected_row = row
+        self._text_edit_active_block = block
         display_text = block.text
         if text_looks_garbled(display_text):
             display_text = ""
@@ -6269,6 +6303,146 @@ class VictorPdfToolsQt(QMainWindow):
         extra = max(editor.fontMetrics().horizontalAdvance(text) + 18, 48)
         editor.resize(max(extra, editor.width()), editor.height())
 
+    def on_text_edit_inline_finished(self) -> None:
+        self.commit_text_edit_if_changed()
+
+    def pending_text_edit_replacement(self) -> str:
+        editor = self.text_edit_preview_label.inline_edit
+        if not editor.isHidden():
+            return editor.text().strip()
+        return self.text_edit_replacement_input.toPlainText().strip()
+
+    def text_edit_replace_function(self):
+        mode = self.text_edit_mode_combo.currentData() or "seamless"
+        block = self._text_edit_active_block
+        replacement = self.pending_text_edit_replacement()
+        if mode == "content_stream" and block is not None and (
+            text_contains_cjk(block.text) or text_contains_cjk(replacement)
+        ):
+            mode = "seamless"
+            self.text_edit_mode_combo.setCurrentIndex(self.text_edit_mode_combo.findData("seamless"))
+        if mode == "overlay":
+            return replace_text_block_overlay
+        if mode == "content_stream":
+            return replace_text_block_content_stream
+        return lambda source, target, page_index, block, replacement, password="": replace_text_block_seamless(
+            source, target, page_index, block, replacement, password, fast=True
+        )
+
+    def ensure_text_edit_working_copy(self) -> Path:
+        if self.text_edit_pdf_path is None:
+            raise ValueError("請先載入 PDF。")
+        if self._text_edit_working_path is not None and self._text_edit_working_path.exists():
+            self.text_edit_pdf_path = self._text_edit_working_path
+            return self._text_edit_working_path
+        folder = Path(tempfile.gettempdir()) / "VictorPDFToolsBox"
+        folder.mkdir(parents=True, exist_ok=True)
+        working = folder / f"text-edit-{os.getpid()}-{id(self)}.pdf"
+        shutil.copy2(self.text_edit_pdf_path, working)
+        self._text_edit_source_path = self._text_edit_source_path or self.text_edit_pdf_path
+        self._text_edit_working_path = working
+        self.text_edit_pdf_path = working
+        return working
+
+    def _text_edit_temp_dir(self) -> Path:
+        folder = Path(tempfile.gettempdir()) / "VictorPDFToolsBox"
+        folder.mkdir(parents=True, exist_ok=True)
+        return folder
+
+    def _clear_text_edit_undo_stack(self) -> None:
+        for path in getattr(self, "_text_edit_undo_stack", []):
+            try:
+                path.unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._text_edit_undo_stack = []
+
+    def _push_text_edit_undo_snapshot(self, source: Path) -> None:
+        snap = self._text_edit_temp_dir() / f"text-edit-undo-{os.getpid()}-{id(self)}-{len(self._text_edit_undo_stack)}.pdf"
+        shutil.copy2(source, snap)
+        self._text_edit_undo_stack.append(snap)
+        while len(self._text_edit_undo_stack) > 15:
+            old = self._text_edit_undo_stack.pop(0)
+            try:
+                old.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def undo_text_edit_action(self) -> None:
+        focused = QApplication.focusWidget()
+        editor = getattr(getattr(self, "text_edit_preview_label", None), "inline_edit", None)
+        if (
+            isinstance(focused, (QLineEdit, QTextEdit))
+            and focused is not editor
+            and hasattr(focused, "isUndoAvailable")
+            and focused.isUndoAvailable()
+        ):
+            focused.undo()
+            return
+        if editor is not None and not editor.isHidden() and editor.hasFocus() and editor.isUndoAvailable():
+            editor.undo()
+            return
+        if not self._text_edit_undo_stack or self.text_edit_pdf_path is None:
+            self.set_status("沒有可復原的文字修改。")
+            return
+        snap = self._text_edit_undo_stack.pop()
+        try:
+            working = self.ensure_text_edit_working_copy()
+            shutil.copy2(snap, working)
+            self.text_edit_pdf_path = working
+            self._text_edit_dirty = bool(self._text_edit_undo_stack)
+        finally:
+            try:
+                snap.unlink(missing_ok=True)
+            except Exception:
+                pass
+        self._text_edit_committing = True
+        try:
+            self.refresh_text_edit_page()
+        finally:
+            self._text_edit_committing = False
+        self.set_status("已復原上一筆文字修改。")
+
+    def commit_text_edit_if_changed(self, *, from_save: bool = False) -> bool:
+        if self._text_edit_committing or self.text_edit_pdf_path is None:
+            return False
+        editor = self.text_edit_preview_label.inline_edit
+        if not from_save and editor.isHidden():
+            return False
+        block = self._text_edit_active_block
+        if not isinstance(block, TextBlock):
+            return False
+        replacement = self.pending_text_edit_replacement()
+        if not replacement or replacement == (block.text or "").strip():
+            return False
+        self._text_edit_committing = True
+        applied = {"ok": False}
+        page_number = int(self.text_edit_page_input.text() or "1")
+        password = self.text_edit_password_input.text()
+        replace_fn = self.text_edit_replace_function()
+
+        def job() -> None:
+            source = self.ensure_text_edit_working_copy()
+            self._push_text_edit_undo_snapshot(source)
+            output = source.with_name(f"{source.stem}-next{source.suffix}")
+            replace_fn(source, output, page_number - 1, block, replacement, password)
+            if not output.exists():
+                raise ValueError("未能寫入修改後的 PDF。")
+            os.replace(output, source)
+            self.text_edit_pdf_path = source
+            self._text_edit_dirty = True
+            applied["ok"] = True
+
+        try:
+            self.run_pdf_job(
+                job,
+                "已套用文字修改。Ctrl+Z 可復原；完成後按「更新並儲存 PDF」另存。",
+                on_success=self.refresh_text_edit_page,
+            )
+        finally:
+            self._text_edit_committing = False
+        return applied["ok"]
+
     def text_edit_preview_font(
         self,
         block: TextBlock,
@@ -6350,6 +6524,7 @@ class VictorPdfToolsQt(QMainWindow):
     def select_text_edit_block_at_point(self, point: QPoint) -> None:
         if self.text_edit_preview_image is None:
             return
+        self.commit_text_edit_if_changed()
         hits: list[tuple[float, int]] = []
         for index, block in enumerate(self.text_edit_blocks):
             left, top, right, bottom = self.text_block_to_image_rect(block)
@@ -6377,39 +6552,33 @@ class VictorPdfToolsQt(QMainWindow):
         if self.text_edit_pdf_path is None:
             self.set_status("請先載入 PDF。")
             return
-        item = self.text_edit_block_list.currentItem()
-        if item is None:
-            self.set_status("請先在預覽上點要改的文字。")
+        self.commit_text_edit_if_changed(from_save=True)
+        if not self._text_edit_dirty:
+            item = self.text_edit_block_list.currentItem()
+            if item is None:
+                self.set_status("請先在預覽上改文字；改完點頁面空白處即會套用。")
+                return
+            block = item.data(Qt.UserRole)
+            replacement = self.text_edit_replacement_input.toPlainText().strip()
+            if not isinstance(block, TextBlock) or not replacement or replacement == (block.text or "").strip():
+                self.set_status("尚未修改文字。")
+                return
+            self._text_edit_active_block = block
+            self.commit_text_edit_if_changed(from_save=True)
+        if not self._text_edit_dirty:
+            self.set_status("尚未修改文字。")
             return
-        block = item.data(Qt.UserRole)
-        replacement = self.text_edit_replacement_input.toPlainText().strip()
-        target, _ = QFileDialog.getSaveFileName(self, "另存文字編輯 PDF", "edited-text.pdf", "PDF files (*.pdf)")
+        suggested = "edited-text.pdf"
+        if self._text_edit_source_path is not None:
+            suggested = f"{self._text_edit_source_path.stem}-edited.pdf"
+        target, _ = QFileDialog.getSaveFileName(self, "另存文字編輯 PDF", suggested, "PDF files (*.pdf)")
         if not target:
             return
         target_path = Path(target)
-        mode = self.text_edit_mode_combo.currentData() or "seamless"
-        if mode == "content_stream" and (
-            text_contains_cjk(getattr(block, "text", "")) or text_contains_cjk(replacement)
-        ):
-            mode = "seamless"
-            self.text_edit_mode_combo.setCurrentIndex(self.text_edit_mode_combo.findData("seamless"))
-        replacement_job = replace_text_block_seamless
-        if mode == "overlay":
-            replacement_job = replace_text_block_overlay
-        elif mode == "content_stream":
-            replacement_job = replace_text_block_content_stream
         page_number = int(self.text_edit_page_input.text() or "1")
-
         self.run_pdf_job(
-            lambda: replacement_job(
-                self.text_edit_pdf_path,
-                target_path,
-                page_number - 1,
-                block,
-                replacement,
-                self.text_edit_password_input.text(),
-            ),
-            f"已替換文字並更新預覽：{target_path.name}",
+            lambda: shutil.copy2(self.text_edit_pdf_path, target_path),
+            f"已另存文字編輯 PDF：{target_path.name}",
             on_success=lambda: self.show_text_edit_result(target_path, page_number),
         )
 
@@ -7688,6 +7857,14 @@ class VictorPdfToolsQt(QMainWindow):
             and self.advanced_tabs.currentWidget() is self._markup_tab
         )
 
+    def _text_edit_tab_active(self) -> bool:
+        return (
+            hasattr(self, "_text_edit_tab")
+            and hasattr(self, "_advanced_tab")
+            and self.main_tabs.currentWidget() is self._advanced_tab
+            and self.advanced_tabs.currentWidget() is self._text_edit_tab
+        )
+
     def _workspace_tab_active(self) -> bool:
         return hasattr(self, "_workspace_tab") and self.main_tabs.currentWidget() is self._workspace_tab
 
@@ -8861,6 +9038,9 @@ class VictorPdfToolsQt(QMainWindow):
             workspace["undo"].pop(0)
 
     def undo_last_action(self) -> None:
+        if self._text_edit_tab_active():
+            self.undo_text_edit_action()
+            return
         if self._erase_tab_active():
             self.undo_erase_mark()
             return

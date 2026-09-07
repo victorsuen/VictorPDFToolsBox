@@ -2912,6 +2912,8 @@ def replace_text_block_seamless(
     block: TextBlock,
     replacement: str,
     password: str = "",
+    *,
+    fast: bool = False,
 ) -> None:
     """Remove the original text run and rewrite with matched font/size/color."""
 
@@ -2944,9 +2946,12 @@ def replace_text_block_seamless(
         page.apply_redactions()
 
         _insert_text_with_block_style(page, block, replacement_text, rect)
-        if hasattr(document, "subset_fonts"):
+        if not fast and hasattr(document, "subset_fonts"):
             document.subset_fonts()
-        document.save(str(target), garbage=4, deflate=True)
+        if fast:
+            document.save(str(target), garbage=0, deflate=False)
+        else:
+            document.save(str(target), garbage=4, deflate=True)
     finally:
         document.close()
 

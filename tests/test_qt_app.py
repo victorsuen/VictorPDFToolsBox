@@ -550,6 +550,76 @@ class QtAppTests(unittest.TestCase):
         self.assertFalse(window.text_edit_preview_label.inline_edit.isHidden())
         self.assertEqual(window.text_edit_preview_label.inline_edit.text(), "")
 
+    def test_text_edit_click_away_applies_changed_text(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("Hello", 72, 300, 100, 20, 12, bbox=(40.0, 50.0, 160.0, 80.0))
+        ]
+        window.render_text_edit_preview()
+        window.refresh_text_edit_blocks()
+        left, top, right, bottom = window.text_block_to_image_rect(window.text_edit_blocks[0])
+        window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
+        window.text_edit_preview_label.inline_edit.setText("World")
+        window.on_text_edit_inline_edited("World")
+
+        def fake_replace(source, target, *_args, **_kwargs):
+            Path(target).write_bytes(Path(source).read_bytes())
+
+        with patch("qt_app.replace_text_block_seamless", side_effect=fake_replace) as seamless:
+            window.select_text_edit_block_at_point(QPoint(1, 1))
+
+        seamless.assert_called_once()
+        self.assertTrue(window._text_edit_dirty)
+        self.assertTrue(window.text_edit_preview_label.inline_edit.isHidden())
+        self.assertEqual(seamless.call_args.args[4], "World")
+
+    def test_text_edit_click_away_without_change_does_not_rewrite(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("Hello", 72, 300, 100, 20, 12, bbox=(40.0, 50.0, 160.0, 80.0))
+        ]
+        window.render_text_edit_preview()
+        window.refresh_text_edit_blocks()
+        left, top, right, bottom = window.text_block_to_image_rect(window.text_edit_blocks[0])
+        window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
+
+        with patch("qt_app.replace_text_block_seamless") as seamless:
+            window.select_text_edit_block_at_point(QPoint(1, 1))
+
+        seamless.assert_not_called()
+        self.assertFalse(window._text_edit_dirty)
+
+    def test_text_edit_undo_restores_previous_pdf(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("Hello", 72, 300, 100, 20, 12, bbox=(40.0, 50.0, 160.0, 80.0))
+        ]
+        window.render_text_edit_preview()
+        window.refresh_text_edit_blocks()
+        left, top, right, bottom = window.text_block_to_image_rect(window.text_edit_blocks[0])
+        window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
+        window.text_edit_preview_label.inline_edit.setText("World")
+        window.on_text_edit_inline_edited("World")
+
+        def fake_replace(source, target, *_args, **_kwargs):
+            Path(target).write_bytes(Path(source).read_bytes())
+
+        with patch("qt_app.replace_text_block_seamless", side_effect=fake_replace):
+            window.select_text_edit_block_at_point(QPoint(1, 1))
+
+        self.assertTrue(window._text_edit_undo_stack)
+        self.assertTrue(window._text_edit_dirty)
+        working_before = window.text_edit_pdf_path.read_bytes()
+
+        window.undo_text_edit_action()
+
+        self.assertFalse(window._text_edit_undo_stack)
+        self.assertFalse(window._text_edit_dirty)
+        self.assertEqual(window.text_edit_pdf_path.read_bytes(), working_before)
+
     def test_text_edit_search_selects_next_matching_block(self):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)
@@ -2440,12 +2510,16 @@ class QtAppTests(unittest.TestCase):
         window.text_edit_replacement_input.setPlainText("New")
         target = Path(self.temp_dir.name) / "seamless-edited.pdf"
 
+        def fake_replace(source, destination, *_args, **_kwargs):
+            Path(destination).write_bytes(Path(source).read_bytes())
+
         with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
-            with patch("qt_app.replace_text_block_seamless") as seamless:
+            with patch("qt_app.replace_text_block_seamless", side_effect=fake_replace) as seamless:
                 with patch.object(window, "open_pdf_as_new_tab"):
                     window.save_text_edit_pdf()
 
         seamless.assert_called_once()
+        self.assertTrue(target.exists())
 
     def test_text_edit_save_reloads_result_when_output_exists(self):
         window = VictorPdfToolsQt()
@@ -2457,8 +2531,11 @@ class QtAppTests(unittest.TestCase):
         target = Path(self.temp_dir.name) / "reloaded-edited.pdf"
         target.write_bytes(self.source.read_bytes())
 
+        def fake_replace(source, destination, *_args, **_kwargs):
+            Path(destination).write_bytes(Path(source).read_bytes())
+
         with patch("qt_app.QFileDialog.getSaveFileName", return_value=(str(target), "PDF files (*.pdf)")):
-            with patch("qt_app.replace_text_block_seamless"):
+            with patch("qt_app.replace_text_block_seamless", side_effect=fake_replace):
                 with patch.object(window, "open_pdf_as_new_tab"):
                     window.save_text_edit_pdf()
 
