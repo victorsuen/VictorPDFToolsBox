@@ -514,6 +514,42 @@ class QtAppTests(unittest.TestCase):
         window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
         self.assertEqual(window.text_edit_block_list.currentRow(), 0)
 
+    def test_text_edit_preview_click_prefers_larger_block(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("-", 72, 300, 10, 10, 12, bbox=(90.0, 55.0, 100.0, 65.0)),
+            TextBlock("Hello World", 72, 300, 100, 20, 12, bbox=(40.0, 40.0, 200.0, 80.0)),
+        ]
+        window.render_text_edit_preview()
+        window.refresh_text_edit_blocks()
+        left, top, right, bottom = window.text_block_to_image_rect(window.text_edit_blocks[0])
+
+        window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
+
+        self.assertEqual(window.text_edit_block_list.currentRow(), 1)
+        self.assertFalse(window.text_edit_preview_label.inline_edit.isHidden())
+        self.assertEqual(window.text_edit_replacement_input.toPlainText(), "Hello World")
+
+    def test_text_edit_garbled_block_does_not_fill_editor_with_tofu(self):
+        window = VictorPdfToolsQt()
+        window.set_text_edit_pdf(self.source)
+        window.text_edit_blocks = [
+            TextBlock("[]()-%06000000000000000000", 72, 300, 100, 20, 12, bbox=(40.0, 50.0, 160.0, 80.0))
+        ]
+        window.render_text_edit_preview()
+        window.refresh_text_edit_blocks()
+
+        self.assertIn("預覽", window.text_edit_block_list.item(0).text())
+        self.assertNotIn("060000", window.text_edit_block_list.item(0).text())
+
+        left, top, right, bottom = window.text_block_to_image_rect(window.text_edit_blocks[0])
+        window.select_text_edit_block_at_point(QPoint(int((left + right) / 2), int((top + bottom) / 2)))
+
+        self.assertEqual(window.text_edit_replacement_input.toPlainText(), "")
+        self.assertFalse(window.text_edit_preview_label.inline_edit.isHidden())
+        self.assertEqual(window.text_edit_preview_label.inline_edit.text(), "")
+
     def test_text_edit_search_selects_next_matching_block(self):
         window = VictorPdfToolsQt()
         window.set_text_edit_pdf(self.source)

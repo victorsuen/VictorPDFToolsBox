@@ -125,6 +125,9 @@ from pdf_core import (
     apply_edits_and_extract_pages,
     extract_page_text_blocks,
     extract_pdf_text,
+    apply_ocr_words_to_garbled_blocks,
+    ocr_image_words,
+    text_looks_garbled,
     font_key_for_pdf_font,
     images_to_pdf,
     office_files_to_pdf,
@@ -833,10 +836,56 @@ class TextEditPreviewLabel(PreviewImageLabel):
 
     def __init__(self) -> None:
         super().__init__()
+        self.setMouseTracking(True)
+        self.setCursor(Qt.IBeamCursor)
+        self.block_rects: list[QRect] = []
+        self.hover_rect = QRect()
         self.inline_edit = QLineEdit(self)
         self.inline_edit.hide()
         self.inline_edit.setFrame(False)
+        self.inline_edit.setPlaceholderText("在此直接輸入新文字")
         self.inline_edit.textEdited.connect(self.inlineEdited.emit)
+
+    def set_block_rects(self, rects: list[QRect]) -> None:
+        self.block_rects = rects
+
+    def _hit_rect_at(self, point: QPoint) -> QRect:
+        best = QRect()
+        best_area = -1
+        for rect in self.block_rects:
+            if rect.adjusted(-3, -3, 3, 3).contains(point):
+                area = max(rect.width(), 1) * max(rect.height(), 1)
+                if area > best_area:
+                    best = rect
+                    best_area = area
+        return best
+
+    def mouseMoveEvent(self, event) -> None:
+        point = event.position().toPoint()
+        hit = self._hit_rect_at(point)
+        self.setCursor(Qt.IBeamCursor if hit.isValid() else Qt.ArrowCursor)
+        if hit != self.hover_rect:
+            self.hover_rect = QRect(hit)
+            self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event) -> None:
+        if self.hover_rect.isValid():
+            self.hover_rect = QRect()
+            self.update()
+        super().leaveEvent(event)
+
+    def paintEvent(self, event) -> None:
+        super().paintEvent(event)
+        if not self.hover_rect.isValid():
+            return
+        if self.inline_edit.isVisible() and self.inline_edit.geometry().contains(self.hover_rect.center()):
+            return
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing, False)
+        painter.setPen(QPen(QColor(15, 118, 110, 220), 1))
+        painter.setBrush(QColor(15, 118, 110, 45))
+        painter.drawRect(self.hover_rect.adjusted(0, 0, -1, -1))
 
     def mousePressEvent(self, event) -> None:
         if self.inline_edit.isVisible() and self.inline_edit.geometry().contains(event.position().toPoint()):
@@ -1772,6 +1821,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_pdf_path: Path | None = None
         self.text_edit_page_count = 0
         self.text_edit_blocks: list[TextBlock] = []
+        self._text_edit_selected_row = -1
         self.bookmark_pdf_path: Path | None = None
         self.bookmark_page_count = 0
         self.bookmark_items: list[BookmarkItem] = []
@@ -5484,6 +5534,14 @@ class VictorPdfToolsQt(QMainWindow):
         side_layout.setContentsMargins(14, 14, 14, 14)
         side_layout.setSpacing(10)
 
+        click_guide = QLabel(
+            "在中間預覽直接點文字即可編輯，像 Adobe Acrobat。"
+            "滑鼠移到文字上會反白，點下去就能打字；不必從右側清單挑亂碼。"
+        )
+        click_guide.setObjectName("muted")
+        click_guide.setWordWrap(True)
+        side_layout.addWidget(click_guide)
+
         side_layout.addWidget(QLabel("搜尋文字"))
         search_row = QHBoxLayout()
         self.text_edit_search_input = QLineEdit()
@@ -5516,14 +5574,14 @@ class VictorPdfToolsQt(QMainWindow):
         count_all_button = self.add_button(side_layout, "計算整份文件符合數", self.count_all_text_search_matches)
         count_all_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
-        side_layout.addWidget(QLabel("偵測到的文字片段"))
+        side_layout.addWidget(QLabel("文字片段（備援）"))
         self.text_edit_block_list = QListWidget()
-        self.text_edit_block_list.setMinimumHeight(100)
-        self.text_edit_block_list.setMaximumHeight(180)
+        self.text_edit_block_list.setMinimumHeight(72)
+        self.text_edit_block_list.setMaximumHeight(120)
         self.text_edit_block_list.currentRowChanged.connect(self.on_text_edit_block_selected)
         side_layout.addWidget(self.text_edit_block_list)
 
-        self.text_edit_block_info = QLabel("選取文字片段後可替換。")
+        self.text_edit_block_info = QLabel("點預覽上的文字即可直接編輯。")
         self.text_edit_block_info.setObjectName("muted")
         self.text_edit_block_info.setWordWrap(True)
         side_layout.addWidget(self.text_edit_block_info)
@@ -5563,7 +5621,7 @@ class VictorPdfToolsQt(QMainWindow):
         self.text_edit_password_input.setEchoMode(QLineEdit.Password)
         side_layout.addWidget(self.text_edit_password_input)
 
-        save_button = self.add_button(side_layout, "替換並另存 PDF", self.save_text_edit_pdf, "primary")
+        save_button = self.add_button(side_layout, "更新並儲存 PDF", self.save_text_edit_pdf, "primary")
         save_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         redact_button = self.add_button(side_layout, "遮蔽選取文字並另存", self.redact_text_edit_pdf)
         redact_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
@@ -5571,9 +5629,8 @@ class VictorPdfToolsQt(QMainWindow):
         redact_all_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
 
         guide = QLabel(
-            "點預覽上的文字即可直接改，像 Adobe Acrobat；左邊會即時顯示替換效果。"
-            "預設「無痕替換」會先移除原文字再寫回。中文請不要用「直接改內容流」。"
-            "掃描件請先 OCR，或改用橡皮擦。"
+            "預設「無痕替換」會先移除原文字再寫回。編碼異常的 PDF 會改從畫面辨識文字。"
+            "中文請不要用「直接改內容流」。掃描件請先 OCR，或改用橡皮擦。"
         )
         guide.setObjectName("muted")
         guide.setWordWrap(True)
@@ -5870,15 +5927,19 @@ class VictorPdfToolsQt(QMainWindow):
                 self.text_edit_password_input.text(),
             )
             self.render_text_edit_preview()
+            self.recover_garbled_text_edit_blocks()
             self.refresh_text_edit_blocks()
         except Exception as exc:
             self.show_error(exc)
 
     def refresh_text_edit_blocks(self) -> None:
+        self._text_edit_selected_row = -1
         self.text_edit_block_list.clear()
-        for block in self.text_edit_blocks:
-            label = block.text.replace("\n", " ")
-            if len(label) > 80:
+        for index, block in enumerate(self.text_edit_blocks):
+            label = block.text.replace("\n", " ").strip()
+            if text_looks_garbled(label) or not label:
+                label = f"文字區塊 {index + 1}（請點預覽編輯）"
+            elif len(label) > 80:
                 label = f"{label[:77]}..."
             item = QListWidgetItem(label)
             item.setData(Qt.UserRole, block)
@@ -5888,7 +5949,26 @@ class VictorPdfToolsQt(QMainWindow):
                 "此頁沒有偵測到可編輯文字層。掃描件或投影片轉成的圖片 PDF 請先 OCR，"
                 "或改用「橡皮擦 / 遮擋」蓋掉畫面。"
             )
+        else:
+            self.text_edit_block_info.setText("點預覽上的文字即可直接編輯。")
         self.update_text_edit_search_feedback()
+
+    def recover_garbled_text_edit_blocks(self) -> None:
+        if not self.text_edit_blocks or self.text_edit_preview_image is None:
+            return
+        garbled_count = sum(1 for block in self.text_edit_blocks if text_looks_garbled(block.text))
+        if garbled_count == 0:
+            return
+        self.set_status("此頁文字編碼異常，正在從畫面辨識可編輯文字…")
+        rects = [self.text_block_to_image_rect(block) for block in self.text_edit_blocks]
+        words = ocr_image_words(self.text_edit_preview_image)
+        if not words:
+            return
+        recovered = apply_ocr_words_to_garbled_blocks(self.text_edit_blocks, rects, words)
+        if recovered != self.text_edit_blocks:
+            self.text_edit_blocks = recovered
+            readable = sum(1 for block in recovered if block.text.strip() and not text_looks_garbled(block.text))
+            self.set_status(f"已從畫面辨識 {readable} 段文字，請直接在預覽上點選編輯。")
 
     def find_next_text_edit_block(self) -> None:
         self.find_text_edit_block(direction=1)
@@ -6017,20 +6097,36 @@ class VictorPdfToolsQt(QMainWindow):
 
     def on_text_edit_block_selected(self, row: int) -> None:
         if row < 0:
+            self._text_edit_selected_row = -1
+            self.text_edit_block_info.setText("點預覽上的文字即可直接編輯。")
+            self.update_text_edit_preview(None)
             return
         block = self.text_edit_block_list.item(row).data(Qt.UserRole)
         if not isinstance(block, TextBlock):
             return
-        self.text_edit_replacement_input.setPlainText(block.text)
-        if text_contains_cjk(block.text) and (self.text_edit_mode_combo.currentData() or "") == "content_stream":
-            self.text_edit_mode_combo.setCurrentIndex(self.text_edit_mode_combo.findData("seamless"))
-        self.text_edit_block_info.setText(
-            f"位置 X {block.x:.1f}, Y {block.y:.1f}；字體 {block.font_size:.1f}pt；"
-            f"字型 {block.font_name or '未知'}"
-            + (f"；頁面字型 {block.page_font_name}" if block.page_font_name else "")
-        )
+        if row == self._text_edit_selected_row:
+            self.update_text_edit_preview(block)
+            self.focus_text_edit_inline_editor()
+            return
+        self._text_edit_selected_row = row
+        display_text = block.text
+        if text_looks_garbled(display_text):
+            display_text = ""
+            self.text_edit_block_info.setText(
+                "此段 PDF 文字編碼無法直接讀取。已在預覽上蓋住原文，請直接輸入要改成的內容。"
+            )
+        else:
+            if text_contains_cjk(block.text) and (self.text_edit_mode_combo.currentData() or "") == "content_stream":
+                self.text_edit_mode_combo.setCurrentIndex(self.text_edit_mode_combo.findData("seamless"))
+            self.text_edit_block_info.setText(
+                f"位置 X {block.x:.1f}, Y {block.y:.1f}；字體 {block.font_size:.1f}pt；"
+                f"字型 {block.font_name or '未知'}"
+                + (f"；頁面字型 {block.page_font_name}" if block.page_font_name else "")
+            )
+        self.text_edit_replacement_input.setPlainText(display_text)
         self.update_text_edit_replacement_hint()
         self.update_text_edit_preview(block)
+        self.focus_text_edit_inline_editor()
 
     def current_text_edit_block(self) -> TextBlock | None:
         item = self.text_edit_block_list.currentItem()
@@ -6094,8 +6190,17 @@ class VictorPdfToolsQt(QMainWindow):
                     left, top, right, bottom = self.text_block_to_image_rect(block)
                     draw.rectangle((left, top, right, bottom), outline="#f97316", width=2)
 
+        hit_rects: list[QRect] = []
+        for block in self.text_edit_blocks:
+            left, top, right, bottom = self.text_block_to_image_rect(block)
+            hit_rects.append(
+                QRect(int(left), int(top), max(int(right - left), 1), max(int(bottom - top), 1))
+            )
+        self.text_edit_preview_label.set_block_rects(hit_rects)
+
         if selected_block is not None:
-            replacement = self.text_edit_replacement_input.toPlainText().strip()
+            editor_text = self.text_edit_replacement_input.toPlainText()
+            replacement = editor_text.strip()
             left, top, right, bottom = self.text_replacement_preview_rect(
                 selected_block,
                 replacement,
@@ -6103,8 +6208,8 @@ class VictorPdfToolsQt(QMainWindow):
                 scale_y,
                 image.height,
             )
+            draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#e2e8f0", width=1)
             if replacement:
-                draw.rectangle((left, top, right, bottom), fill="#ffffff", outline="#e2e8f0", width=1)
                 preview_font_size = max(selected_block.font_size * scale_y * 0.85, 8)
                 font = self.text_edit_preview_font(selected_block, preview_font_size, replacement)
                 text_color = rgb_to_hex(selected_block.color_rgb)
@@ -6112,7 +6217,7 @@ class VictorPdfToolsQt(QMainWindow):
             draw.rectangle((left, top, right, bottom), outline="#0f766e", width=3)
             pixmap = QPixmap.fromImage(ImageQt(image))
             self.text_edit_preview_label.set_preview_pixmap(pixmap)
-            self.show_text_edit_inline_editor(selected_block, replacement, left, top, right, bottom, scale_y)
+            self.show_text_edit_inline_editor(selected_block, editor_text, left, top, right, bottom, scale_y)
             return
         self.text_edit_preview_label.hide_inline_editor()
         pixmap = QPixmap.fromImage(ImageQt(image))
@@ -6148,6 +6253,12 @@ class VictorPdfToolsQt(QMainWindow):
             editor.blockSignals(False)
         editor.show()
         editor.raise_()
+
+    def focus_text_edit_inline_editor(self) -> None:
+        editor = self.text_edit_preview_label.inline_edit
+        if editor.isHidden():
+            return
+        QTimer.singleShot(0, editor.setFocus)
 
     def on_text_edit_inline_edited(self, text: str) -> None:
         self.text_edit_replacement_input.blockSignals(True)
@@ -6239,23 +6350,28 @@ class VictorPdfToolsQt(QMainWindow):
     def select_text_edit_block_at_point(self, point: QPoint) -> None:
         if self.text_edit_preview_image is None:
             return
-        best_index = -1
-        best_distance = float("inf")
+        hits: list[tuple[float, int]] = []
         for index, block in enumerate(self.text_edit_blocks):
             left, top, right, bottom = self.text_block_to_image_rect(block)
-            margin = 6
+            margin = 4
             if left - margin <= point.x() <= right + margin and top - margin <= point.y() <= bottom + margin:
-                center_x = (left + right) / 2
-                center_y = (top + bottom) / 2
-                distance = abs(point.x() - center_x) + abs(point.y() - center_y)
-                if distance < best_distance:
-                    best_distance = distance
-                    best_index = index
-        if best_index >= 0:
-            self.text_edit_block_list.setCurrentRow(best_index)
-            self.set_status("已從預覽選取文字片段。")
+                area = max(right - left, 1.0) * max(bottom - top, 1.0)
+                hits.append((area, index))
+        if hits:
+            hits.sort(reverse=True)
+            self.text_edit_block_list.setCurrentRow(hits[0][1])
+            self.set_status("已從預覽選取文字，可直接在方塊內編輯。")
+            self.focus_text_edit_inline_editor()
+            return
+        if self.text_edit_block_list.currentRow() >= 0:
+            self.text_edit_block_list.setCurrentRow(-1)
         else:
-            self.set_status("此位置附近沒有偵測到文字片段。")
+            self._text_edit_selected_row = -1
+            self.update_text_edit_preview(None)
+        self.text_edit_replacement_input.blockSignals(True)
+        self.text_edit_replacement_input.clear()
+        self.text_edit_replacement_input.blockSignals(False)
+        self.set_status("請點預覽上的文字來編輯。")
 
     def save_text_edit_pdf(self) -> None:
         if self.text_edit_pdf_path is None:
@@ -6263,7 +6379,7 @@ class VictorPdfToolsQt(QMainWindow):
             return
         item = self.text_edit_block_list.currentItem()
         if item is None:
-            self.set_status("請先選取要替換的文字片段。")
+            self.set_status("請先在預覽上點要改的文字。")
             return
         block = item.data(Qt.UserRole)
         replacement = self.text_edit_replacement_input.toPlainText().strip()

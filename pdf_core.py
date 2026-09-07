@@ -14,7 +14,7 @@ import unicodedata
 import zipfile
 from collections.abc import Callable
 from copy import copy
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 from PIL import Image
@@ -243,6 +243,157 @@ def _merge_block_bbox(
 def text_blocks_on_same_line(left: TextBlock, right: TextBlock) -> bool:
     tolerance = max(left.font_size, right.font_size) * 0.6
     return abs(left.y - right.y) <= tolerance
+
+
+def text_looks_garbled(text: str) -> bool:
+    """True when extracted PDF Unicode looks like CID / encoding garbage."""
+    sample = unicodedata.normalize("NFKC", text or "").strip()
+    if not sample:
+        return False
+    if "\ufffd" in sample:
+        return True
+    if re.search(r"0{8,}", sample):
+        return True
+    private_use = 0
+    meaningful = 0
+    for char in sample:
+        code = ord(char)
+        category = unicodedata.category(char)
+        if _is_cjk_char(char) or (char.isascii() and char.isalpha()) or char.isdigit():
+            meaningful += 1
+        if category in {"Co", "Cn", "Cs"} or 0xE000 <= code <= 0xF8FF:
+            private_use += 1
+        elif category.startswith("C") and char not in "\t\n\r ":
+            private_use += 1
+    length = max(len(sample), 1)
+    if private_use / length >= 0.3:
+        return True
+    return meaningful / length < 0.25 and len(sample) >= 2
+
+
+def is_noise_text_span(text: str) -> bool:
+    sample = (text or "").strip()
+    if not sample:
+        return True
+    compact = re.sub(r"[\s\[\]\(\)\{\}\|■□▪▫￭￮�·•\-–—]+", "", sample)
+    return not compact
+
+
+def _rect_overlap_area(
+    left: tuple[float, float, float, float],
+    right: tuple[float, float, float, float],
+) -> float:
+    x0 = max(left[0], right[0])
+    y0 = max(left[1], right[1])
+    x1 = min(left[2], right[2])
+    y1 = min(left[3], right[3])
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    return (x1 - x0) * (y1 - y0)
+
+
+def _join_recovered_words(parts: list[str]) -> str:
+    cleaned = [normalize_cjk_text(part).strip() for part in parts if (part or "").strip()]
+    if not cleaned:
+        return ""
+    result = cleaned[0]
+    for part in cleaned[1:]:
+        if text_contains_cjk(result[-1:]) and text_contains_cjk(part[:1]):
+            result += part
+        else:
+            result += f" {part}"
+    return normalize_cjk_text(result).strip()
+
+
+def apply_ocr_words_to_garbled_blocks(
+    blocks: list[TextBlock],
+    block_image_rects: list[tuple[float, float, float, float]],
+    ocr_words: list[tuple[float, float, float, float, str]],
+) -> list[TextBlock]:
+    if not blocks or not ocr_words:
+        return blocks
+    assigned: list[list[tuple[float, str]]] = [[] for _ in blocks]
+    for left, top, right, bottom, word in ocr_words:
+        text = (word or "").strip()
+        if not text or text_looks_garbled(text):
+            continue
+        center_x = (left + right) / 2
+        center_y = (top + bottom) / 2
+        word_rect = (left, top, right, bottom)
+        best_index = -1
+        best_area = 0.0
+        for index, block_rect in enumerate(block_image_rects):
+            if index >= len(blocks):
+                break
+            x0, y0, x1, y1 = block_rect
+            pad = 3.0
+            contains = (x0 - pad) <= center_x <= (x1 + pad) and (y0 - pad) <= center_y <= (y1 + pad)
+            overlap = _rect_overlap_area(word_rect, block_rect)
+            if not contains and overlap <= 0:
+                continue
+            area = max((x1 - x0) * (y1 - y0), 1.0)
+            score = overlap / area
+            if contains:
+                score += 1.0
+            if score > best_area:
+                best_area = score
+                best_index = index
+        if best_index >= 0:
+            assigned[best_index].append((left, text))
+
+    recovered: list[TextBlock] = []
+    for index, block in enumerate(blocks):
+        if not text_looks_garbled(block.text):
+            recovered.append(block)
+            continue
+        parts = [text for _x, text in sorted(assigned[index], key=lambda item: item[0])]
+        joined = _join_recovered_words(parts)
+        recovered.append(replace(block, text=joined) if joined else block)
+    return recovered
+
+
+def ocr_image_words(image: Image.Image) -> list[tuple[float, float, float, float, str]]:
+    if image is None or not OCR_AVAILABLE:
+        return []
+    try:
+        if configure_tesseract() is None:
+            return []
+        language = "eng+chi_tra+chi_sim"
+        tess_lang = _tesseract_language(language)
+        tess_config = _tesseract_column_config(_tesseract_config(language))
+        prepared = _prepare_ocr_image(image)
+        try:
+            words = _ocr_image_to_words(prepared, tess_lang, tess_config)
+            scale_x = image.width / float(prepared.width or image.width)
+            scale_y = image.height / float(prepared.height or image.height)
+        finally:
+            if prepared is not image:
+                prepared.close()
+        result: list[tuple[float, float, float, float, str]] = []
+        for left, top, right, bottom, text, *_rest in words:
+            result.append(
+                (
+                    float(left) * scale_x,
+                    float(top) * scale_y,
+                    float(right) * scale_x,
+                    float(bottom) * scale_y,
+                    str(text or ""),
+                )
+            )
+        return result
+    except Exception:
+        return []
+
+
+def ocr_image_text(image: Image.Image) -> str:
+    if image is None or not OCR_AVAILABLE:
+        return ""
+    try:
+        if configure_tesseract() is None:
+            return ""
+        return normalize_cjk_text(_ocr_image_to_string(image, "eng+chi_tra+chi_sim") or "").strip()
+    except Exception:
+        return ""
 
 
 def merge_text_blocks(blocks: list[TextBlock]) -> list[TextBlock]:
@@ -2580,7 +2731,7 @@ def _text_blocks_from_pymupdf_dict(page_data: dict, page_fonts: list[tuple]) -> 
         for line in block.get("lines", []):
             for span in line.get("spans", []):
                 item = span_to_text_block(span, page_fonts)
-                if item.text:
+                if item.text and not is_noise_text_span(item.text):
                     blocks.append(item)
     return blocks
 
@@ -2595,7 +2746,7 @@ def _text_blocks_from_fitz_page(page) -> list[TextBlock]:
         for item in page.get_text("words", flags=flags):
             x0, y0, x1, y1, word, *_rest = item
             text = (word or "").strip()
-            if not text:
+            if not text or is_noise_text_span(text):
                 continue
             height = max(float(y1) - float(y0), 8.0)
             width = max(float(x1) - float(x0), 8.0)

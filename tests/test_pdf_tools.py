@@ -65,6 +65,9 @@ from pdf_core import (
     merge_pdf_files,
     merge_text_blocks,
     ocr_pdf_to_searchable_pdf,
+    apply_ocr_words_to_garbled_blocks,
+    is_noise_text_span,
+    text_looks_garbled,
     ocr_pdf_to_text,
     detect_ocr_language,
     last_ocr_language,
@@ -742,6 +745,33 @@ class PdfToolsTests(unittest.TestCase):
         merged = merge_text_blocks(blocks)
 
         self.assertEqual([block.text for block in merged], ["Hello World", "Next"])
+
+    def test_text_looks_garbled_detects_cid_garbage(self):
+        self.assertTrue(text_looks_garbled("[]()-%06000000000000000000"))
+        self.assertTrue(text_looks_garbled("■■□"))
+        self.assertTrue(is_noise_text_span("[]"))
+        self.assertTrue(is_noise_text_span("()"))
+        self.assertFalse(text_looks_garbled("Suen Hing Fai"))
+        self.assertFalse(text_looks_garbled("車位租約"))
+        self.assertFalse(text_looks_garbled("3700"))
+        self.assertFalse(is_noise_text_span("3700%"))
+
+    def test_apply_ocr_words_to_garbled_blocks_replaces_cid_text(self):
+        blocks = [
+            TextBlock("[]()-%06000000000000000000", 0, 20, 100, 16, 12, bbox=(0, 0, 100, 16)),
+            TextBlock("Landlord", 0, 50, 80, 16, 12, bbox=(0, 40, 80, 56)),
+        ]
+        rects = [(0.0, 0.0, 200.0, 40.0), (0.0, 80.0, 160.0, 112.0)]
+        words = [
+            (10.0, 8.0, 70.0, 28.0, "Suen"),
+            (76.0, 8.0, 140.0, 28.0, "Hing"),
+            (12.0, 86.0, 90.0, 108.0, "Ignored"),
+        ]
+
+        recovered = apply_ocr_words_to_garbled_blocks(blocks, rects, words)
+
+        self.assertEqual(recovered[0].text, "Suen Hing")
+        self.assertEqual(recovered[1].text, "Landlord")
 
     def test_add_page_numbers(self):
         source = Path(self.temp_dir.name) / "source.pdf"
