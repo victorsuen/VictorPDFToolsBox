@@ -1190,6 +1190,43 @@ class PdfToolsTests(unittest.TestCase):
         with patch("runtime_deps.find_libreoffice_executable", return_value=Path("soffice")):
             self.assertEqual(missing_office_to_pdf_dependencies(), [])
 
+    def test_missing_office_to_pdf_dependencies_prompts_on_macos(self):
+        from runtime_deps import missing_office_to_pdf_dependencies
+
+        with patch("runtime_deps.find_libreoffice_executable", return_value=None):
+            with patch("runtime_deps.microsoft_office_available", return_value=False):
+                with patch("runtime_deps._macos", return_value=True):
+                    with patch("runtime_deps._windows", return_value=False):
+                        items = missing_office_to_pdf_dependencies()
+        self.assertEqual([item.key for item in items], ["libreoffice"])
+        self.assertIn("Mac", items[0].prompt)
+
+    def test_tesseract_candidates_include_homebrew_on_mac(self):
+        from pdf_core import _tesseract_exe_candidates
+
+        with patch("pdf_core.sys.platform", "darwin"):
+            names = [str(path).replace("\\", "/") for path in _tesseract_exe_candidates()]
+        self.assertTrue(any("/opt/homebrew/bin/tesseract" in name for name in names))
+        self.assertTrue(all(name.endswith("tesseract") for name in names))
+
+    def test_libreoffice_candidates_include_mac_app(self):
+        from pdf_core import _libreoffice_exe_candidates
+
+        names = [str(path).replace("\\", "/") for path in _libreoffice_exe_candidates()]
+        self.assertTrue(any(name.endswith("LibreOffice.app/Contents/MacOS/soffice") for name in names))
+
+    def test_guess_tesseract_tessdata_dir_homebrew_layout(self):
+        from pdf_core import guess_tesseract_tessdata_dir
+
+        prefix = Path(self.temp_dir.name) / "homebrew"
+        exe = prefix / "bin" / "tesseract"
+        tessdata = prefix / "share" / "tessdata"
+        tessdata.mkdir(parents=True)
+        (tessdata / "eng.traineddata").write_bytes(b"x" * 2048)
+        exe.parent.mkdir(parents=True, exist_ok=True)
+        exe.write_bytes(b"stub")
+        self.assertEqual(guess_tesseract_tessdata_dir(exe), tessdata)
+
     def test_split_pdf_to_zip(self):
         source = Path(self.temp_dir.name) / "source.pdf"
         target = Path(self.temp_dir.name) / "split.zip"
@@ -1516,10 +1553,24 @@ class PdfToolsTests(unittest.TestCase):
     def test_resolve_system_font_file_maps_noto_cjk_away_from_arial(self):
         path = resolve_system_font_file("NotoSansCJKsc-Bold", 16)
         if not path:
-            self.skipTest("Windows CJK fonts not installed")
+            self.skipTest("system CJK fonts not installed")
         name = Path(path).name.lower()
         self.assertNotIn("arial", name)
-        self.assertTrue(any(token in name for token in ("msyh", "msjh", "mingliu", "simsun", "simhei")))
+        self.assertTrue(
+            any(
+                token in name
+                for token in (
+                    "msyh",
+                    "msjh",
+                    "mingliu",
+                    "simsun",
+                    "simhei",
+                    "pingfang",
+                    "stheiti",
+                    "songti",
+                )
+            )
+        )
 
     @unittest.skipUnless(
         __import__("pdf_core").PYMUPDF_AVAILABLE,

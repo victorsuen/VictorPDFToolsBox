@@ -1,5 +1,15 @@
 # Victor PDF Tools Box
 
+## 下載桌面版
+
+請到 [GitHub Releases](https://github.com/victorsuen/VictorPDFToolsBox/releases/latest) 選擇其中一個 zip：
+
+- **Windows**：`VictorPDFToolsBox-windows-x64.zip`（解壓後執行 `VictorPDFToolsBox.exe`，請保留整個資料夾）
+- **Mac（Apple 晶片 / M 系列）**：`VictorPDFToolsBox-macos-arm64.zip`
+- **Mac（Intel）**：`VictorPDFToolsBox-macos-x86_64.zip`（若該次發佈有提供）
+
+Mac 第一次開啟若系統提示無法驗證開發者，請在 Finder 對 `VictorPDFToolsBox.app` 按右鍵 → **打開**。Office 轉 PDF 請安裝 LibreOffice；掃描件 OCR 請安裝 Tesseract（兩者都可用 Homebrew，程式也可代為安裝）。
+
 ## UI 第二代：Qt 桌面版
 
 現在的 `start_desktop_app.bat` 會啟動 PySide6 / Qt 版介面：
@@ -45,6 +55,12 @@
 - 「裁切頁面」分頁：在預覽上拖曳框選要保留的範圍（或直接輸入裁切框數值），可套用到目前頁 / 全部頁 / 自訂頁碼，另存後自動開成新 Tab（類似 Acrobat 的裁切頁面）
 - 「抽出內嵌圖片」分頁：預設只抽照片／圖表，略過小圖示與漸層；可改抽全部內嵌圖，另存 ZIP
 - 「文件內容」分頁：顯示並可刪除標題 Title、作者 Author、主旨 Subject、關鍵字 Keywords（對應 Acrobat「檔案 → 內容」）
+
+### v0.9.7 重點
+
+- **Mac 桌面版**：GitHub Releases 新增 Mac 下載（Apple 晶片；Intel 如有提供）。與 Windows 版同一套 Qt 介面
+- Mac 可找 Homebrew Tesseract／LibreOffice，並用蘋方／黑體顯示中文標註
+- 發佈流程會同時打包 Windows zip 與 Mac zip，方便同事自行選系統下載
 
 ### v0.9.6 重點
 
@@ -197,12 +213,12 @@
 
 ## OCR 功能注意
 
-OCR 使用本機 Tesseract OCR，不會上傳文件到外部服務。若尚未安裝，Qt 版會詢問是否代為安裝（UB Mannheim Tesseract 及 `chi_tra`／`chi_sim` 語言包）；選「是」就在本機下載安裝，不必手動加 PATH。也可自行安裝 [UB Mannheim Tesseract](https://github.com/UB-Mannheim/tesseract/wiki)。程式會自動尋找 `C:\Program Files\Tesseract-OCR\tesseract.exe` 或使用者目錄的安裝位置。Qt 版可在常用工具或「PDF 轉 Office」分頁選擇
+OCR 使用本機 Tesseract OCR，不會上傳文件到外部服務。若尚未安裝，Qt 版會詢問是否代為安裝（UB Mannheim Tesseract 及 `chi_tra`／`chi_sim` 語言包）；選「是」就在本機下載安裝，不必手動加 PATH。也可自行安裝 [UB Mannheim Tesseract](https://github.com/UB-Mannheim/tesseract/wiki)。程式會自動尋找 Windows 的 `C:\Program Files\Tesseract-OCR\tesseract.exe`、使用者目錄安裝位置，以及 Mac 的 Homebrew（`/opt/homebrew/bin/tesseract` 或 `/usr/local/bin/tesseract`）。Qt 版可在常用工具或「PDF 轉 Office」分頁選擇
 `自動偵測`（預設，依第一頁判斷繁中／簡中／英文）、`英文 + 繁中`、`英文 + 簡中`、純英文、純繁中或純簡中。中文掃描件會以中文為主語言、300 DPI、並把 OCR 常見的部首相容字還原成正字。
 
 ## Office 轉 PDF
 
-獨立頂層分頁 **「Office 轉 PDF」** 在本機轉換 Word / Excel / PowerPoint，不會上傳檔案。請先安裝 **Microsoft Office** 或 **LibreOffice**。若兩者都沒有，程式會詢問是否代為安裝 LibreOffice。Word / Excel 走 Office 匯出（列印品質、嵌入字型）；PowerPoint 依投影片畫面以 300 DPI 匯出，以免立體字與細線圖形失真。另存檔名會沿用原檔名，轉換時顯示進度，完成後可自動開啟 PDF。可一次加入多個檔並合併成一份，或每個檔各存一份到資料夾。
+獨立頂層分頁 **「Office 轉 PDF」** 在本機轉換 Word / Excel / PowerPoint，不會上傳檔案。Windows 請先安裝 **Microsoft Office** 或 **LibreOffice**；Mac 請安裝 **LibreOffice**。若還沒安裝，程式會詢問是否代為安裝（Windows 用 winget／安裝包，Mac 用 Homebrew）。Word / Excel 走 Office 匯出（列印品質、嵌入字型）；PowerPoint 依投影片畫面以 300 DPI 匯出，以免立體字與細線圖形失真。另存檔名會沿用原檔名，轉換時顯示進度，完成後可自動開啟 PDF。可一次加入多個檔並合併成一份，或每個檔各存一份到資料夾。
 
 ## PDF 轉 Office
 
@@ -213,7 +229,7 @@ OCR 使用本機 Tesseract OCR，不會上傳文件到外部服務。若尚未�
 PDF 文字不像 Word 段落，很多文件會把文字拆成座標碎片，或只內嵌部分字型。文字編輯 Beta 會先用 PyMuPDF 偵測
 PDF 的文字層（含字型名稱、大小、顏色、位置），將同一行的碎片合併成較完整的文字片段。請直接在預覽上點文字編輯（滑鼠移上去會反白），改完點頁面空白處或按 Enter 即套用，Ctrl+Z 可復原。編碼異常的 PDF 會改從畫面辨識。亦可用上一頁 / 下一頁導覽、跨頁搜尋。
 
-**預設「無痕替換」（最接近 Adobe Pro）**：先移除原文字，再以相同字型 / 大小 / 顏色寫回新文字，不疊白底註解；若 PDF 內已有嵌入字型會優先沿用，否則對應到 Windows 系統字型（含中文微軟雅黑、細明體等）。
+**預設「無痕替換」（最接近 Adobe Pro）**：先移除原文字，再以相同字型 / 大小 / 顏色寫回新文字，不疊白底註解；若 PDF 內已有嵌入字型會優先沿用，否則對應到系統中文字型（Windows 微軟雅黑／細明體，Mac 蘋方／黑體）。
 
 其他模式：「覆蓋替換」用白底 + 標準字（最穩定但較明顯）；「直接改內容流」為實驗功能，只支援半形英文/數字且新舊同長度。遮蔽功能可黑框蓋住或批量遮蔽搜尋結果。掃描 PDF 請先用 OCR 轉成可搜尋 PDF。
 
@@ -226,6 +242,14 @@ PDF 的文字層（含字型名稱、大小、顏色、位置），將同一行�
 ```powershell
 start_desktop_app.bat
 ```
+
+Mac：
+
+```bash
+./start_desktop_app.sh
+```
+
+或在 Finder 雙擊 `start_desktop_app.command`。
 
 桌面版支援：
 
@@ -243,7 +267,7 @@ start_desktop_app.bat
 - 常用工具頁內拖曳/上下載入順序處理合併、抽頁、刪頁、旋轉、加密、解密、壓縮、抽文字、圖片轉 PDF
 - 第二階段工具：加頁碼 / Footer、加水印 / 印章、刪除空白頁、清理 Metadata
 
-打包成 EXE：
+打包成 EXE（Windows）：
 
 ```powershell
 build_exe.bat
@@ -256,8 +280,16 @@ C:\tmp\victor_pdf_dist\VictorPDFToolsBox\VictorPDFToolsBox.exe
 ```
 
 請保留整個 `C:\tmp\victor_pdf_dist\VictorPDFToolsBox` 資料夾一起移動，因為 `_internal`
-內含 EXE 所需的 Python/Tkinter/PDF library。這種 onedir 模式較適合公司 Windows
+內含 EXE 所需的 Python/PDF library。這種 onedir 模式較適合公司 Windows
 安全策略；單檔 EXE 在部分電腦會被防毒或受控資料夾阻止生成。
+
+打包成 Mac App（需在 Mac 上執行，或等 GitHub Actions 產生下載檔）：
+
+```bash
+./build_macos.sh
+```
+
+完成後 `.app` 和 zip 會在 `dist/`。GitHub 在推送 `v*` 標籤時會自動打包 Windows 與 Mac，放到該次 Release 給同事下載。
 
 ## 本地網頁版啟動
 

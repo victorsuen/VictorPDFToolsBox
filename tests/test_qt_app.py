@@ -1533,6 +1533,15 @@ class QtAppTests(unittest.TestCase):
             popen.assert_called_once()
             self.assertEqual(popen.call_args.args[0], ["explorer", "/select,", str(target.resolve())])
 
+    @patch("qt_app.sys.platform", "darwin")
+    def test_reveal_output_selects_existing_file_on_mac(self):
+        target = Path(self.temp_dir.name) / "output.txt"
+        target.write_text("demo", encoding="utf-8")
+        with patch("qt_app.subprocess.Popen") as popen:
+            reveal_output(target)
+            popen.assert_called_once()
+            self.assertEqual(popen.call_args.args[0], ["open", "-R", str(target.resolve())])
+
     def test_annotation_preview_draws_overlay_text(self):
         window = VictorPdfToolsQt()
         window.set_annotation_pdf(self.source)
@@ -1552,7 +1561,10 @@ class QtAppTests(unittest.TestCase):
         if font_path.exists():
             self.assertNotIn("cour", font_path.name.lower())
             self.assertTrue(
-                any(token in font_path.name.lower() for token in ("msjh", "msyh", "mingliu", "simsun", "arial"))
+                any(
+                    token in font_path.name.lower()
+                    for token in ("msjh", "msyh", "mingliu", "simsun", "arial", "pingfang", "stheiti", "songti")
+                )
             )
 
     def test_annotation_tab_has_text_frame_choices(self):

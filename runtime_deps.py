@@ -19,6 +19,7 @@ from pdf_core import (
     _xlsx_available,
     configure_tesseract,
     find_libreoffice_executable,
+    guess_tesseract_tessdata_dir,
     pdf_has_usable_text_layer,
 )
 
@@ -39,6 +40,10 @@ class RuntimeDependency:
 
 def _windows() -> bool:
     return sys.platform == "win32"
+
+
+def _macos() -> bool:
+    return sys.platform == "darwin"
 
 
 def _frozen() -> bool:
@@ -97,8 +102,10 @@ def tesseract_tessdata_dir(exe: Path | None = None) -> Path | None:
         nested = folder / "tessdata"
         if nested.is_dir():
             return nested
-    sibling = Path(exe).parent / "tessdata"
-    return sibling
+    guessed = guess_tesseract_tessdata_dir(exe)
+    if guessed is not None:
+        return guessed
+    return Path(exe).parent / "tessdata"
 
 
 def missing_traineddata_langs(tessdata: Path | None = None) -> list[str]:
@@ -177,6 +184,16 @@ def microsoft_office_available() -> bool:
 def missing_office_to_pdf_dependencies() -> list[RuntimeDependency]:
     if find_libreoffice_executable() is not None or microsoft_office_available():
         return []
+    if _macos():
+        return [
+            RuntimeDependency(
+                "libreoffice",
+                "LibreOffice",
+                "找不到 LibreOffice，無法把 Word／Excel／PowerPoint 轉成 PDF。\n"
+                "Mac 版請安裝免費的 LibreOffice（約數百 MB）。若本機已有 Homebrew，程式可以代為安裝。"
+                "安裝過程不會上傳你的檔案。",
+            )
+        ]
     if not _windows():
         return []
     return [
@@ -292,6 +309,14 @@ def _latest_tesseract_installer_url() -> str:
     raise ValueError("找不到 Tesseract Windows 安裝包。請改到 UB Mannheim 網站手動安裝。")
 
 
+def _user_tessdata_dir() -> Path:
+    if _macos():
+        return Path.home() / "Library" / "Application Support" / "Tesseract-OCR" / "tessdata"
+    if _windows():
+        return Path.home() / "AppData" / "Local" / "Tesseract-OCR" / "tessdata"
+    return Path.home() / ".local" / "share" / "tessdata"
+
+
 def _writable_tessdata_dir(folder: Path) -> Path:
     try:
         folder.mkdir(parents=True, exist_ok=True)
@@ -301,7 +326,7 @@ def _writable_tessdata_dir(folder: Path) -> Path:
         return folder
     except OSError:
         pass
-    user_dir = Path.home() / "AppData" / "Local" / "Tesseract-OCR" / "tessdata"
+    user_dir = _user_tessdata_dir()
     user_dir.mkdir(parents=True, exist_ok=True)
     for lang in TESSDATA_LANGS:
         source = folder / f"{lang}.traineddata"
@@ -334,15 +359,50 @@ def install_tesseract_languages(progress=None) -> None:
             raise ValueError(f"語言包 {lang} 下載失敗。")
 
 
+def _brew_executable() -> str | None:
+    for candidate in (Path("/opt/homebrew/bin/brew"), Path("/usr/local/bin/brew")):
+        if candidate.is_file():
+            return str(candidate)
+    return shutil.which("brew")
+
+
+def _brew_install(packages: list[str], progress=None, label: str = "") -> bool:
+    brew = _brew_executable()
+    if not brew:
+        return False
+    if progress:
+        progress(0, 0, label or "正在用 Homebrew 安裝…")
+    env = os.environ.copy()
+    env["HOMEBREW_NO_AUTO_UPDATE"] = "1"
+    env["NONINTERACTIVE"] = "1"
+    completed = _run_hidden(
+        [brew, "install", *packages],
+        capture_output=True,
+        timeout=1800,
+        env=env,
+    )
+    return completed.returncode == 0
+
+
 def install_tesseract(progress=None) -> Path:
     if progress:
         progress(0, 0, "正在安裝 Tesseract OCR…")
+    if _macos() and _brew_install(["tesseract"], progress, "正在用 Homebrew 安裝 Tesseract…"):
+        found = find_tesseract_executable()
+        if found is not None:
+            install_tesseract_languages(progress)
+            return found
     if _winget_install(TESSERACT_WINGET_ID, progress, "正在用 Windows 套件管理員安裝 Tesseract…"):
         found = find_tesseract_executable()
         if found is not None:
             install_tesseract_languages(progress)
             return found
     if not _windows():
+        if _macos() and not _brew_executable():
+            raise ValueError(
+                "這個 Mac 沒有 Homebrew，無法代為安裝 Tesseract。"
+                "請先到 https://brew.sh 安裝 Homebrew，再執行 brew install tesseract。"
+            )
         raise ValueError("這個系統無法自動安裝 Tesseract，請先自行安裝 tesseract。")
     url = _latest_tesseract_installer_url()
     dest_dir = Path.home() / "AppData" / "Local" / "Programs" / "Tesseract-OCR"
@@ -388,11 +448,24 @@ def _latest_libreoffice_msi_url() -> str:
 def install_libreoffice(progress=None) -> Path:
     if progress:
         progress(0, 0, "正在安裝 LibreOffice…")
+    if _macos() and _brew_install(
+        ["--cask", "libreoffice"],
+        progress,
+        "正在用 Homebrew 安裝 LibreOffice…",
+    ):
+        found = find_libreoffice_executable()
+        if found is not None:
+            return found
     if _winget_install(LIBREOFFICE_WINGET_ID, progress, "正在用 Windows 套件管理員安裝 LibreOffice…"):
         found = find_libreoffice_executable()
         if found is not None:
             return found
     if not _windows():
+        if _macos() and not _brew_executable():
+            raise ValueError(
+                "這個 Mac 沒有 Homebrew，無法代為安裝 LibreOffice。"
+                "請到 https://www.libreoffice.org/download/ 下載安裝，或先安裝 Homebrew 後再試。"
+            )
         raise ValueError("這個系統無法自動安裝 LibreOffice，請先自行安裝。")
     url = _latest_libreoffice_msi_url()
     with tempfile.TemporaryDirectory() as temp_dir:

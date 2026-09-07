@@ -1005,8 +1005,10 @@ class DocumentWorkspace(QWidget):
             os.startfile(str(path))
         else:
             import subprocess
+            import sys
 
-            subprocess.run(["xdg-open", str(path)], check=False)
+            command = ["open", str(path)] if sys.platform == "darwin" else ["xdg-open", str(path)]
+            subprocess.run(command, check=False)
 
     def add_button(self, layout, text: str, callback, kind: str | None = None) -> QPushButton:
         button = QPushButton(text)

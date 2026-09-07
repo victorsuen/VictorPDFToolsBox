@@ -98,6 +98,7 @@ from pdf_core import (
     comment_polyline,
     crop_pdf_pages,
     extract_outline,
+    iter_system_font_files,
     resolve_annotation_fill,
     rgb_to_hex,
     text_contains_cjk,
@@ -2795,7 +2796,10 @@ class VictorPdfToolsQt(QMainWindow):
 
         side_layout.addWidget(QLabel("字體"))
         self.annotation_font_combo = QComboBox()
-        self.annotation_font_combo.addItem("中文（微軟雅黑／正黑體）", "cjk")
+        self.annotation_font_combo.addItem(
+            "中文（蘋方／黑體）" if sys.platform == "darwin" else "中文（微軟雅黑／正黑體）",
+            "cjk",
+        )
         self.annotation_font_combo.addItem("Helvetica", "helvetica")
         self.annotation_font_combo.addItem("Times New Roman", "times")
         self.annotation_font_combo.addItem("Courier", "courier")
@@ -3255,34 +3259,39 @@ class VictorPdfToolsQt(QMainWindow):
         font_key: str,
         text: str = "",
     ) -> ImageFont.FreeTypeFont | ImageFont.ImageFont:
-        windows_fonts = Path("C:/Windows/Fonts")
         latin_files = {
-            "helvetica": ("arialbd.ttf", "arial.ttf"),
-            "times": ("timesbd.ttf", "times.ttf"),
-            "courier": ("courbd.ttf", "cour.ttf"),
+            "helvetica": ("arialbd.ttf", "arial.ttf", "Arial Bold.ttf", "Arial.ttf", "Helvetica.ttc"),
+            "times": ("timesbd.ttf", "times.ttf", "Times New Roman Bold.ttf", "Times New Roman.ttf"),
+            "courier": ("courbd.ttf", "cour.ttf", "Courier New Bold.ttf", "Courier New.ttf"),
         }
         cjk_names = (
-            ("msjhbd.ttc", "msjh.ttc") if bold else ("msjh.ttc", "msjhbd.ttc")
-        ) + (("msyhbd.ttc", "msyh.ttc") if bold else ("msyh.ttc", "msyhbd.ttc")) + (
-            "mingliu.ttc",
-            "simsun.ttc",
+            (("msjhbd.ttc", "msjh.ttc") if bold else ("msjh.ttc", "msjhbd.ttc"))
+            + (("msyhbd.ttc", "msyh.ttc") if bold else ("msyh.ttc", "msyhbd.ttc"))
+            + (
+                "mingliu.ttc",
+                "simsun.ttc",
+                "PingFang.ttc",
+                "STHeiti Medium.ttc",
+                "Songti.ttc",
+            )
         )
         need_cjk = font_key in {"cjk", "yahei", "mingliu"} or text_contains_cjk(text)
-        candidates: list[Path] = []
+        names: list[str] = []
         if need_cjk:
-            candidates.extend(windows_fonts / name for name in cjk_names)
-        bold_name, regular_name = latin_files.get(font_key, latin_files["helvetica"])
-        candidates.append(windows_fonts / (bold_name if bold else regular_name))
+            names.extend(cjk_names)
+        bold_name, regular_name, *extra_latin = latin_files.get(font_key, latin_files["helvetica"])
+        names.append(bold_name if bold else regular_name)
+        names.extend(extra_latin)
         if not need_cjk:
-            candidates.extend(windows_fonts / name for name in cjk_names)
-        candidates.append(windows_fonts / ("arialbd.ttf" if bold else "arial.ttf"))
+            names.extend(cjk_names)
+        names.append("arialbd.ttf" if bold else "arial.ttf")
+        names.append("Arial Bold.ttf" if bold else "Arial.ttf")
         size = max(int(font_size_pt), 8)
-        for path in candidates:
-            if path.exists():
-                try:
-                    return ImageFont.truetype(str(path), size=size, index=0)
-                except Exception:
-                    continue
+        for path in iter_system_font_files(names):
+            try:
+                return ImageFont.truetype(str(path), size=size, index=0)
+            except Exception:
+                continue
         return ImageFont.load_default()
 
     def draw_annotation_overlay_on_image(
@@ -4721,7 +4730,10 @@ class VictorPdfToolsQt(QMainWindow):
         font_row = QHBoxLayout()
         font_row.addWidget(QLabel("字型"))
         self.erase_text_font_combo = QComboBox()
-        self.erase_text_font_combo.addItem("中文（微軟雅黑／正黑體）", "cjk")
+        self.erase_text_font_combo.addItem(
+            "中文（蘋方／黑體）" if sys.platform == "darwin" else "中文（微軟雅黑／正黑體）",
+            "cjk",
+        )
         self.erase_text_font_combo.addItem("Helvetica", "helvetica")
         self.erase_text_font_combo.currentIndexChanged.connect(self.on_erase_text_style_changed)
         font_row.addWidget(self.erase_text_font_combo, 1)

@@ -2602,6 +2602,82 @@ WINDOWS_FONT_CANDIDATES: dict[str, tuple[str, ...]] = {
     "verdana": ("verdana.ttf", "verdanab.ttf", "verdanai.ttf", "verdanaz.ttf"),
 }
 
+MAC_FONT_CANDIDATES: dict[str, tuple[str, ...]] = {
+    "arial": ("Arial.ttf", "Arial Bold.ttf", "Arial Italic.ttf", "Arial Bold Italic.ttf", "Helvetica.ttc"),
+    "helvetica": ("Helvetica.ttc", "Arial.ttf", "Arial Bold.ttf"),
+    "timesnewroman": ("Times New Roman.ttf", "Times New Roman Bold.ttf", "Times.ttc"),
+    "timesroman": ("Times New Roman.ttf", "Times.ttc"),
+    "courier": ("Courier New.ttf", "Courier New Bold.ttf", "Courier.ttc"),
+    "couriernew": ("Courier New.ttf", "Courier New Bold.ttf"),
+    "microsoftyahei": ("PingFang.ttc", "STHeiti Medium.ttc", "Songti.ttc"),
+    "yahei": ("PingFang.ttc", "STHeiti Medium.ttc"),
+    "mingliu": ("Songti.ttc", "PingFang.ttc"),
+    "pmingliu": ("Songti.ttc",),
+    "simsun": ("Songti.ttc", "STHeiti Light.ttc"),
+    "nsimsun": ("Songti.ttc",),
+    "simhei": ("STHeiti Medium.ttc", "PingFang.ttc"),
+}
+
+MAC_CJK_FONT_FILES = (
+    "PingFang.ttc",
+    "STHeiti Medium.ttc",
+    "STHeiti Light.ttc",
+    "Songti.ttc",
+    "Hiragino Sans GB.ttc",
+    "Arial Unicode.ttf",
+)
+
+WINDOWS_CJK_FONT_FILES = (
+    "msjh.ttc",
+    "msyh.ttc",
+    "msjhbd.ttc",
+    "msyhbd.ttc",
+    "mingliu.ttc",
+    "simsun.ttc",
+    "simhei.ttf",
+)
+
+
+def system_font_directories() -> list[Path]:
+    folders: list[Path] = []
+    if sys.platform == "win32":
+        folders.append(Path("C:/Windows/Fonts"))
+    elif sys.platform == "darwin":
+        folders.extend(
+            [
+                Path("/System/Library/Fonts"),
+                Path("/System/Library/Fonts/Supplemental"),
+                Path("/Library/Fonts"),
+                Path.home() / "Library" / "Fonts",
+            ]
+        )
+    else:
+        folders.extend(
+            [
+                Path("/usr/share/fonts"),
+                Path("/usr/local/share/fonts"),
+                Path.home() / ".fonts",
+                Path.home() / ".local" / "share" / "fonts",
+            ]
+        )
+    windows_fonts = Path("C:/Windows/Fonts")
+    if windows_fonts not in folders:
+        folders.append(windows_fonts)
+    return folders
+
+
+def iter_system_font_files(filenames: tuple[str, ...] | list[str]):
+    seen: set[str] = set()
+    for folder in system_font_directories():
+        for name in filenames:
+            path = folder / name
+            key = str(path).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            if path.is_file():
+                yield path
+
 
 def _font_file_variant_index(bold: bool, italic: bool) -> int:
     if bold and italic:
@@ -2615,12 +2691,16 @@ def _font_file_variant_index(bold: bool, italic: bool) -> int:
 
 def resolve_system_font_file(font_name: str, font_flags: int = 0) -> str:
     key = normalize_font_key(font_name)
-    candidates = None
+    candidates: list[str] = []
     for pattern, files in WINDOWS_FONT_CANDIDATES.items():
         if pattern in key or key in pattern:
-            candidates = files
+            candidates.extend(files)
             break
-    if candidates is None:
+    for pattern, files in MAC_FONT_CANDIDATES.items():
+        if pattern in key or key in pattern:
+            candidates.extend(files)
+            break
+    if not candidates:
         if any(
             token in key
             for token in (
@@ -2640,21 +2720,20 @@ def resolve_system_font_file(font_name: str, font_flags: int = 0) -> str:
                 "simsun",
             )
         ):
-            candidates = ("msjh.ttc", "msyh.ttc", "msjhbd.ttc", "msyhbd.ttc", "mingliu.ttc", "simsun.ttc")
+            candidates.extend(WINDOWS_CJK_FONT_FILES)
+            candidates.extend(MAC_CJK_FONT_FILES)
         else:
-            candidates = WINDOWS_FONT_CANDIDATES["arial"]
+            candidates.extend(WINDOWS_FONT_CANDIDATES["arial"])
+            candidates.extend(MAC_FONT_CANDIDATES["arial"])
     bold = bool(font_flags & 16)
     italic = bool(font_flags & 2)
     index = _font_file_variant_index(bold, italic)
-    fonts_dir = Path("C:/Windows/Fonts")
-    for offset in (0, 1, 2, 3):
-        candidate_index = min(index + offset, len(candidates) - 1)
-        path = fonts_dir / candidates[candidate_index]
-        if path.exists():
-            return str(path)
-    fallback = fonts_dir / candidates[0]
-    if fallback.exists():
-        return str(fallback)
+    ordered = []
+    if candidates:
+        ordered.append(candidates[min(index, len(candidates) - 1)])
+        ordered.extend(candidates)
+    for path in iter_system_font_files(ordered):
+        return str(path)
     return ""
 
 
@@ -3348,6 +3427,15 @@ def _tesseract_exe_candidates() -> list[Path]:
                 Path.home() / "scoop" / "apps" / "tesseract" / "current",
             ]
         )
+    elif sys.platform == "darwin":
+        folders.extend(
+            [
+                Path("/opt/homebrew/bin"),
+                Path("/usr/local/bin"),
+                Path("/opt/local/bin"),
+                Path("/usr/bin"),
+            ]
+        )
     found: list[Path] = []
     for folder in folders:
         for name in names:
@@ -3355,6 +3443,30 @@ def _tesseract_exe_candidates() -> list[Path]:
             if candidate not in found:
                 found.append(candidate)
     return found
+
+
+def guess_tesseract_tessdata_dir(exe: Path | None) -> Path | None:
+    if exe is None:
+        return None
+    folders = [
+        exe.parent / "tessdata",
+        exe.parent.parent / "share" / "tessdata",
+        Path("/opt/homebrew/share/tessdata"),
+        Path("/usr/local/share/tessdata"),
+        Path("/opt/local/share/tessdata"),
+        Path("/usr/share/tesseract-ocr/5/tessdata"),
+        Path("/usr/share/tessdata"),
+    ]
+    seen: set[Path] = set()
+    for folder in folders:
+        if folder in seen:
+            continue
+        seen.add(folder)
+        if (folder / "eng.traineddata").is_file() or (folder / "chi_sim.traineddata").is_file():
+            return folder
+        if folder.is_dir() and any(folder.glob("*.traineddata")):
+            return folder
+    return None
 
 
 def configure_tesseract() -> Path | None:
@@ -3372,8 +3484,8 @@ def configure_tesseract() -> Path | None:
         if not candidate.is_file():
             continue
         pytesseract.pytesseract.tesseract_cmd = str(candidate)
-        tessdata = candidate.parent / "tessdata"
-        if tessdata.is_dir():
+        tessdata = guess_tesseract_tessdata_dir(candidate)
+        if tessdata is not None:
             os.environ["TESSDATA_PREFIX"] = str(tessdata)
         try:
             pytesseract.get_tesseract_version()
@@ -3665,21 +3777,29 @@ def office_app_for_path(path: Path) -> str:
     raise ValueError(f"不支援的 Office 格式：{path.suffix or path.name}")
 
 
-def find_libreoffice_executable() -> Path | None:
-    for name in ("soffice", "soffice.exe", "libreoffice"):
-        found = shutil.which(name)
-        if found:
-            return Path(found)
+def _libreoffice_exe_candidates() -> list[Path]:
     home = Path.home()
-    for candidate in (
+    return [
         Path(r"C:\Program Files\LibreOffice\program\soffice.exe"),
         Path(r"C:\Program Files (x86)\LibreOffice\program\soffice.exe"),
         Path(r"C:\Program Files\LibreOffice 24\program\soffice.exe"),
         Path(r"C:\Program Files\LibreOffice 25\program\soffice.exe"),
         home / r"AppData\Local\Programs\LibreOffice\program\soffice.exe",
+        Path("/Applications/LibreOffice.app/Contents/MacOS/soffice"),
+        Path("/opt/homebrew/bin/soffice"),
+        Path("/usr/local/bin/soffice"),
+        Path("/opt/homebrew/opt/libreoffice/lib/libreoffice/program/soffice"),
         Path("/usr/bin/soffice"),
         Path("/usr/bin/libreoffice"),
-    ):
+    ]
+
+
+def find_libreoffice_executable() -> Path | None:
+    for name in ("soffice", "soffice.exe", "libreoffice"):
+        found = shutil.which(name)
+        if found:
+            return Path(found)
+    for candidate in _libreoffice_exe_candidates():
         if candidate.exists():
             return candidate
     return None
@@ -4151,15 +4271,13 @@ def overlay_needs_embedded_font(text: str, font_key: str = "") -> bool:
 
 
 def resolve_cjk_font_file(bold: bool = False) -> str | None:
-    fonts_dir = Path("C:/Windows/Fonts")
     names: list[str] = []
     if bold:
         names.extend(["msjhbd.ttc", "msyhbd.ttc"])
     names.extend(["msjh.ttc", "msyh.ttc", "mingliu.ttc", "simsun.ttc"])
-    for name in names:
-        path = fonts_dir / name
-        if path.is_file():
-            return str(path)
+    names.extend(MAC_CJK_FONT_FILES)
+    for path in iter_system_font_files(names):
+        return str(path)
     return None
 
 
